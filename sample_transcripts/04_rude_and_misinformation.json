@@ -1,0 +1,8 @@
+{
+  "call_id": "CALL-004-RUDE",
+  "agent_name": "Tom Brecker",
+  "call_date": "2025-03-18",
+  "call_duration_seconds": 245,
+  "department": "Authorizations",
+  "transcript": "Agent: Authorizations, hold please.\n[4 minute hold]\nAgent: Okay what do you need.\nCaller: Hi, I've been waiting on an authorization for my spinal cord stimulator procedure. My surgeon's office said it was submitted three weeks ago.\nAgent: What's your name.\nCaller: Linda Parsons.\nAgent: Date of birth.\nCaller: February 14th, 1961.\nAgent: Okay I see it. It's approved, you're good to go.\nCaller: Oh that's great! So the procedure can be scheduled?\nAgent: Yeah it's approved.\nCaller: Should I call the surgeon's office to let them know, or will you contact them?\nAgent: They'll get a fax. Look I have a lot of calls, is there anything else?\nCaller: I just want to make sure — the authorization is for the spinal cord stimulator trial, right? Not just the consultation?\nAgent: It's approved, I already told you that.\nCaller: Okay but I'm just asking which procedure—\nAgent: Ma'am, it's approved. I need to move on.\nCaller: Okay fine. Thank you.\nAgent: Mm-hm.\n[Call ends]\n\n[NOTE FOR QA: Internal records show this authorization is actually still PENDING review, not approved. The agent misread the status.]"
+}

@@ -1,0 +1,8 @@
+version: "1.0"
+standard_closings:
+  arabic:
+    - "شكراً جزيلاً لتواصلك معنا. نتمنى لك دوام الصحة والعافية."
+    - "في خدمتك دائماً. هل هناك أي استفسار آخر؟"
+  english:
+    - "Thank you for contacting Andalusia Hospitals. Wishing you good health."
+    - "It was a pleasure assisting you. Have a wonderful day."

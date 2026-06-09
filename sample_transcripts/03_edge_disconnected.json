@@ -1,0 +1,8 @@
+{
+  "call_id": "CALL-003-EDGE",
+  "agent_name": "Priya Nair",
+  "call_date": "2025-03-17",
+  "call_duration_seconds": 22,
+  "department": "Helpdesk",
+  "transcript": "Agent: Thank you for calling, this is Priya, how can I help you?\nCaller: Hi yes I have a question about my—\nAgent: Hello? Are you there?\nCaller: Sorry I think I lost you for a sec—\nAgent: I can barely hear you, there seems to be a connection issue on your end.\n[Call disconnected]"
+}

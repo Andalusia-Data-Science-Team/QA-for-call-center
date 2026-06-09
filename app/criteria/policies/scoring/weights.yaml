@@ -1,0 +1,10 @@
+version: "1.0"
+overall_weights:
+  behavioral:
+    script_compliance: 0.25
+    professionalism: 0.20
+    empathy: 0.20
+    active_listening: 0.15
+    compliance: 0.20
+  minimum_passing_score: 85.0
+  critical_violation_deduction: 30.0

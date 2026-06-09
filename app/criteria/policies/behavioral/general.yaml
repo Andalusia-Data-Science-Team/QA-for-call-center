@@ -1,0 +1,90 @@
+version: "1.0"
+department: "general"
+category: "behavioral"
+last_updated: "2026-04-28"
+
+# ====================== MANDATORY SCRIPT COMPLIANCE ======================
+script_compliance:
+  greeting:
+    required: true
+    must_include:
+      - "مرحبا بك في مستشفيات أندلسية"
+      - "أهلاً وسهلاً بك"
+      - "Hello, Andalusia Hospitals"
+      - "Good morning/afternoon"
+    preferred_phrases:
+      - "كيف يمكنني مساعدتك اليوم؟"
+      - "كيف أقدر أساعدك؟"
+    prohibited:
+      - "ايه؟"
+      - "قول تاني"
+
+  closing:
+    required: true
+    must_include:
+      - "شكراً لتواصلك معنا"
+      - "نتمنى لك دوام الصحة والعافية"
+      - "Thank you for calling Andalusia Hospitals"
+    preferred_phrases:
+      - "هل هناك أي شيء آخر يمكنني مساعدتك به؟"
+
+# ====================== PROFESSIONALISM & TONE ======================
+professionalism:
+  tone:
+    required_qualities: ["calm", "polite", "confident", "clear"]
+    prohibited_tone: ["aggressive", "impatient", "dismissive", "sarcastic"]
+  language:
+    formal_arabic: true
+    avoid_colloquial: true
+    prohibited_phrases:
+      - "يا عم"
+      - "خلاص"
+      - "ما أعرفش"
+      - "ده مش شغلي"
+      - "اتفضل اتصل بـ..."
+
+# ====================== EMPATHY & ACTIVE LISTENING ======================
+empathy:
+  must_demonstrate:
+    - Acknowledge patient's concern or pain
+    - Express understanding and care
+    - Use patient's name when appropriate
+    - Offer reassurance
+  active_listening:
+    techniques:
+      - Paraphrasing / Confirmation
+      - Asking clarifying questions
+      - Summarizing key points
+    prohibited:
+      - Interrupting the patient
+      - Rushing the conversation
+
+# ====================== PROHIBITED BEHAVIORS & RED FLAGS ======================
+prohibited_behaviors:
+  high_severity:
+    - Using threatening or rude language
+    - Sharing confidential information improperly
+    - Giving medical advice beyond scope
+    - Discriminating or showing bias
+  medium_severity:
+    - Being dismissive ("Calm down", "It's not a big deal")
+    - Making false promises
+    - Avoiding responsibility
+  low_severity:
+    - Using filler words excessively ("um", "ah", "يعني")
+    - Speaking too fast
+
+red_flag_phrases:
+  - "مش عارف"
+  - "ده مش ممكن"
+  - "اتصل بغيري"
+  - "أنا مش هعمل كده"
+
+# ====================== COMPLIANCE & REGULATORY ======================
+compliance:
+  required_disclosures:
+    - Patient rights
+    - Privacy policy mention when collecting data
+    - Escalation process when needed
+  documentation:
+    must_record: ["patient name", "phone", "complaint summary"]

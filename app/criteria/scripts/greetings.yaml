@@ -1,0 +1,12 @@
+version: "1.0"
+category: "scripts"
+
+standard_greetings:
+  arabic:
+    - "مرحبا بك في مستشفيات أندلسية، أنا [Agent Name]. كيف يمكنني مساعدتك اليوم؟"
+    - "أهلاً وسهلاً بك مع مستشفيات أندلسية. تفضل، كيف أقدر أخدمك؟"
+  english:
+    - "Welcome to Andalusia Hospitals. This is [Agent Name]. How may I assist you today?"
+    - "Good [morning/afternoon], Andalusia Hospitals. How can I help you?"
+
+bilingual_option: true

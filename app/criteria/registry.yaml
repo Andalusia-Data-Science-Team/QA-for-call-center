@@ -1,0 +1,27 @@
+version: "1.0"
+effective_date: "2026-04-26"
+last_updated: "2026-04-28"
+departments:
+  - general
+  - pain_management
+  - neurology
+
+default_department: "general"
+
+# Behavioral Criteria Files
+behavioral_criteria:
+  general: "policies/behavioral/general.yaml"
+  pain_management: "policies/behavioral/pain_management.yaml"
+  neurology: "policies/behavioral/neurology.yaml"
+
+script_templates:
+  greetings: "scripts/greetings.yaml"
+  closings: "scripts/closings.yaml"
+  disclosures: "scripts/disclosures.yaml"
+  escalation: "scripts/escalation.yaml"
+
+compliance:
+  regulatory: "policies/compliance/regulatory.yaml"
+
+scoring_weights:
+  file: "policies/scoring/weights.yaml"

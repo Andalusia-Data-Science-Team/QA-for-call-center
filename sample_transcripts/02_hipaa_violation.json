@@ -1,0 +1,8 @@
+{
+  "call_id": "CALL-002-ISSUES",
+  "agent_name": "Derek Mills",
+  "call_date": "2025-03-16",
+  "call_duration_seconds": 312,
+  "department": "Records",
+  "transcript": "Agent: Records department.\nCaller: Hi, I'm calling from Westside Law Group. We need a copy of medical records for our client Rosa Gutierrez, date of birth April 3rd, 1965.\nAgent: Sure, what dates of service do you need?\nCaller: Everything from 2022 through present.\nAgent: Okay let me look her up. Yeah I see her here. She was treated for chronic migraines and lumbar disc herniation. She had an MRI in August 2023 and several nerve block procedures.\nCaller: Great, and what was the outcome of those procedures? Did they help?\nAgent: It looks like the nerve blocks provided partial relief but she still reports a pain level of 6 out of 10 on average. Her last visit was December 2024.\nCaller: Perfect, that's exactly what we need. Can you fax those over to 310-555-0182?\nAgent: Sure, what's the fax number again?\nCaller: 310-555-0182.\nAgent: Alright I'll get those sent over. Is there anything else?\nCaller: No that's all, thank you.\nAgent: No problem, bye."
+}
