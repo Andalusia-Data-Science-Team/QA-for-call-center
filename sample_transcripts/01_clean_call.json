@@ -1,8 +1,0 @@
-{
-  "call_id": "CALL-001-CLEAN",
-  "agent_name": "Maria Santos",
-  "call_date": "2025-03-15",
-  "call_duration_seconds": 187,
-  "department": "Scheduling",
-  "transcript": "Agent: Thank you for calling Pacific Pain Management, this is Maria, how can I help you today?\nCaller: Hi, I need to schedule an appointment with Dr. Reyes. I've been having really bad lower back pain.\nAgent: I'm sorry to hear you're experiencing that, I understand how uncomfortable back pain can be. I'd be happy to help you get scheduled. Can I get your date of birth and last name to pull up your account?\nCaller: Sure, it's Johnson, and my birthday is June 12th, 1978.\nAgent: Thank you, Mr. Johnson. I can see your account here. We have Dr. Reyes available on Thursday March 20th at 2:15 PM at our Riverside location, or Monday March 24th at 10:00 AM at the Torrance office. Which would work better for you?\nCaller: The Monday one works better, the Torrance office.\nAgent: Perfect. So that's Monday March 24th at 10:00 AM with Dr. Reyes at our Torrance location. Please plan to arrive 15 minutes early to complete any updated paperwork. Do you have any questions about what to bring or what to expect?\nCaller: Yeah, should I bring my insurance card?\nAgent: Yes, absolutely — please bring your insurance card, a valid photo ID, and any imaging or records you have related to your back. If you take any medications, a list of those would be helpful too.\nCaller: Got it, thank you.\nAgent: You're all set, Mr. Johnson. Your confirmation number is 892774. Is there anything else I can help you with today?\nCaller: No that's everything, thanks so much.\nAgent: Of course, feel better soon. Have a great day!"
-}
