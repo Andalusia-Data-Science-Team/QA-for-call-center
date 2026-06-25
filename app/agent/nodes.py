@@ -31,7 +31,14 @@ from pydantic import ValidationError
 
 from app.agent.state import AgentState
 from app.models.output import QAAnalysisResult
-from app.prompts.qa_prompt import SYSTEM_PROMPT, build_user_prompt
+from app.prompts.qa_prompt import (
+    SYSTEM_PROMPT,
+    build_behavioral_prompt,
+    build_compliance_prompt,
+    build_script_prompt,
+    build_scoring_prompt,
+    build_user_prompt,   # kept for legacy path
+)
 from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
 
@@ -182,152 +189,305 @@ async def load_scoring_weights(state: AgentState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node 3 – build_prompt
-#   Assembles the final system + user prompts from the call transcript AND
-#   all four criteria blocks loaded by the preceding nodes.
-#   Each criteria section is injected as a clearly labelled block so the LLM
-#   can locate any specific policy without re-reading the whole prompt.
+# ── FOCUSED INFERENCE NODES ─────────────────────────────────────────────────
+#
+# The original single build_prompt → llm_inference → parse_response →
+# validate_output chain has been REPLACED by four focused inference nodes:
+#
+#   infer_behavioral_evaluation  – tone, empathy, professionalism, red flags
+#   infer_compliance_evaluation  – 15 compliance pillars (C2Com/C2C/C2B/NC)
+#   infer_script_matching        – greeting / closing script adherence
+#   infer_overall_scoring        – synthesises the three above + scoring weights
+#
+# Each node calls the LLM with a narrow prompt, parses the response, and
+# stores its result in a dedicated state key.  aggregate_results merges all
+# four into the final QAAnalysisResult (schema unchanged).
 # ---------------------------------------------------------------------------
 
-async def build_prompt(state: AgentState) -> dict:
+
+async def _focused_llm_call(
+    node_name: str,
+    call_id: str,
+    user_prompt: str,
+    llm_client: LLMClient,
+    state: AgentState,
+) -> tuple[dict | None, dict | None]:
     """
-    Assemble the full prompt from the transcript + the 4 loaded criteria blocks.
-
-    Prompt structure (user message):
-      [CALL METADATA]
-      [BEHAVIORAL STANDARDS]    ← from load_behavioral_criteria
-      [COMPLIANCE PILLARS]      ← from load_compliance_pillars
-      [SCRIPT TEMPLATES]        ← from load_script_templates
-      [SCORING WEIGHTS]         ← from load_scoring_weights
-      [TRANSCRIPT]
-      [OUTPUT SCHEMA]
+    Internal helper: call the LLM, log usage, parse JSON.
+    Returns (parsed_dict, error_dict).  Exactly one of the two will be None.
     """
-    call = state["call"]
-    system = SYSTEM_PROMPT
-    user = build_user_prompt(
-        call,
-        behavioral_criteria=state.get("behavioral_criteria", ""),
-        compliance_pillars=state.get("compliance_pillars", ""),
-        script_templates=state.get("script_templates", ""),
-        scoring_weights=state.get("scoring_weights", ""),
-    )
-
-    logger.debug(
-        "build_prompt | call_id=%s system_len=%d user_len=%d",
-        call.call_id, len(system), len(user),
-    )
-    return {
-        "system_prompt": system,
-        "user_prompt": user,
-        "node_trace": _trace(state, "build_prompt"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Node 3 – llm_inference
-#   Sends the prompts to the LLM and stores the raw response + usage stats.
-# ---------------------------------------------------------------------------
-
-async def llm_inference(state: AgentState, llm_client: LLMClient) -> dict:
-    """
-    Call the LLM.  The LLMClient already handles retry + exponential backoff.
-    Stores raw_llm_text and usage metadata for downstream nodes.
-    """
-    call_id = state["call"].call_id
     try:
-        raw_text, usage = await llm_client.complete(
-            state["system_prompt"],
-            state["user_prompt"],
-        )
+        raw_text, usage = await llm_client.complete(SYSTEM_PROMPT, user_prompt)
     except Exception as exc:
-        logger.error("llm_inference failed | call_id=%s | %s", call_id, exc)
-        return {
-            "error": f"LLM call failed: {exc}",
-            "error_node": "llm_inference",
-            "node_trace": _trace(state, "llm_inference"),
+        logger.error("%s LLM call failed | call_id=%s | %s", node_name, call_id, exc)
+        return None, {
+            "error": f"{node_name}: LLM call failed: {exc}",
+            "error_node": node_name,
+            "node_trace": _trace(state, node_name),
         }
 
     logger.debug(
-        "llm_inference | call_id=%s latency=%.0fms tokens_in=%s tokens_out=%s",
+        "%s | call_id=%s latency=%.0fms tokens_in=%s tokens_out=%s",
+        node_name,
         call_id,
         usage.get("latency_ms", 0),
         usage.get("input_tokens") or usage.get("prompt_tokens"),
         usage.get("output_tokens") or usage.get("completion_tokens"),
     )
-    return {
-        "raw_llm_text": raw_text,
-        "usage": usage,
-        "node_trace": _trace(state, "llm_inference"),
-    }
 
-
-# ---------------------------------------------------------------------------
-# Node 4 – parse_response
-#   Strips markdown fences and JSON-parses the raw LLM text.
-# ---------------------------------------------------------------------------
-
-async def parse_response(state: AgentState) -> dict:
-    """
-    Strip ```json ... ``` wrappers and parse to a plain dict.
-    Extend here to handle other output formats (YAML, partial JSON repair,
-    structured extraction fallback, etc.).
-    """
-    call_id = state["call"].call_id
-    raw = state["raw_llm_text"]
-    clean = _strip_markdown_fences(raw)
-
+    clean = _strip_markdown_fences(raw_text)
     try:
         data: dict = json.loads(clean)
     except json.JSONDecodeError as exc:
         logger.error(
-            "parse_response JSON error | call_id=%s snippet=%s | %s",
-            call_id,
-            raw[:300],
-            exc,
+            "%s JSON parse error | call_id=%s snippet=%s | %s",
+            node_name, call_id, raw_text[:300], exc,
         )
-        return {
-            "error": f"LLM returned invalid JSON: {exc}",
-            "error_node": "parse_response",
-            "node_trace": _trace(state, "parse_response"),
+        return None, {
+            "error": f"{node_name}: LLM returned invalid JSON: {exc}",
+            "error_node": node_name,
+            "node_trace": _trace(state, node_name),
         }
 
+    return data, None
+
+
+# ---------------------------------------------------------------------------
+# Node A – infer_behavioral_evaluation
+#   Focused LLM call: professionalism, tone, empathy, red flags.
+#   Runs in PARALLEL with infer_compliance_evaluation & infer_script_matching.
+# ---------------------------------------------------------------------------
+
+async def infer_behavioral_evaluation(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    Call the LLM with a behavioral-only prompt.
+    Produces: professionalism_score, behavioral_flags, strengths, improvements.
+    Result stored in state["behavioral_eval"].
+    """
+    call = state["call"]
+    user_prompt = build_behavioral_prompt(
+        call,
+        behavioral_criteria=state.get("behavioral_criteria", ""),
+    )
+    logger.debug(
+        "infer_behavioral_evaluation | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_behavioral_evaluation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
     return {
-        "parsed_data": data,
-        "node_trace": _trace(state, "parse_response"),
+        "behavioral_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_behavioral_evaluation"),
     }
 
 
 # ---------------------------------------------------------------------------
-# Node 5 – validate_output
-#   Runs Pydantic validation on the parsed dict → QAAnalysisResult.
+# Node B – infer_compliance_evaluation
+#   Focused LLM call: 15 compliance pillars (C2Com / C2C / C2B / NC).
+#   Runs in PARALLEL with infer_behavioral_evaluation & infer_script_matching.
 # ---------------------------------------------------------------------------
 
-async def validate_output(state: AgentState) -> dict:
+async def infer_compliance_evaluation(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
     """
-    Validate the parsed dict against the QAAnalysisResult Pydantic schema.
-    Always overrides call_id with the one from the request (never trust the LLM).
-    Extend here to add cross-field business-rule validation.
+    Call the LLM with a compliance-pillars-only prompt.
+    Produces: compliance_flags, escalation_required, escalation_reason.
+    Result stored in state["compliance_eval"].
+    """
+    call = state["call"]
+    user_prompt = build_compliance_prompt(
+        call,
+        compliance_pillars=state.get("compliance_pillars", ""),
+    )
+    logger.debug(
+        "infer_compliance_evaluation | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_compliance_evaluation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
+    return {
+        "compliance_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_compliance_evaluation"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node C – infer_script_matching
+#   Focused LLM call: greeting / closing script adherence.
+#   Runs in PARALLEL with infer_behavioral_evaluation & infer_compliance_evaluation.
+# ---------------------------------------------------------------------------
+
+async def infer_script_matching(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    Call the LLM with a script-adherence-only prompt.
+    Produces: accuracy_score, script_flags.
+    Result stored in state["script_eval"].
+    """
+    call = state["call"]
+    user_prompt = build_script_prompt(
+        call,
+        script_templates=state.get("script_templates", ""),
+    )
+    logger.debug(
+        "infer_script_matching | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_script_matching", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
+    return {
+        "script_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_script_matching"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node D – infer_overall_scoring
+#   Focused LLM call: synthesise behavioral + compliance + script results
+#   into the final overall_assessment + scores.
+#   Runs AFTER the three parallel nodes complete (fan-in barrier).
+# ---------------------------------------------------------------------------
+
+async def infer_overall_scoring(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    Call the LLM with a scoring-only prompt that receives the three sub-results
+    as context.  Produces: overall_assessment, assessment_reasoning,
+    resolution_score, escalation_required, escalation_reason.
+    Result stored in state["scoring_eval"].
+    """
+    call = state["call"]
+
+    # Serialise the three sub-results as compact JSON strings for injection
+    behavioral_summary = json.dumps(state.get("behavioral_eval") or {}, ensure_ascii=False)
+    compliance_summary = json.dumps(state.get("compliance_eval") or {}, ensure_ascii=False)
+    script_summary     = json.dumps(state.get("script_eval") or {},     ensure_ascii=False)
+
+    user_prompt = build_scoring_prompt(
+        call,
+        scoring_weights=state.get("scoring_weights", ""),
+        behavioral_summary=behavioral_summary,
+        compliance_summary=compliance_summary,
+        script_summary=script_summary,
+    )
+    logger.debug(
+        "infer_overall_scoring | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_overall_scoring", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
+    return {
+        "scoring_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_overall_scoring"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node E – aggregate_results
+#   Fan-in barrier: merges the four sub-evaluation dicts into one
+#   parsed_data dict that matches the QAAnalysisResult schema, then runs
+#   Pydantic validation.  No LLM call — pure Python merge.
+# ---------------------------------------------------------------------------
+
+async def aggregate_results(state: AgentState) -> dict:
+    """
+    Merge sub-evaluation results into a single QAAnalysisResult-compatible dict.
+
+    Merge strategy
+    ──────────────
+    • compliance_flags  = behavioral_flags  (Node A)
+                        + compliance_flags  (Node B)
+                        + script_flags      (Node C)
+    • agent_performance = professionalism_score (A)
+                        + accuracy_score        (C)
+                        + resolution_score      (D)
+                        + strengths             (A)
+                        + improvements          (A)
+    • overall_assessment, assessment_reasoning,
+      escalation_required, escalation_reason     ← Node D (scoring)
     """
     call_id = state["call"].call_id
-    data = {**state["parsed_data"], "call_id": call_id}   # trust request call_id
+
+    behavioral = state.get("behavioral_eval") or {}
+    compliance = state.get("compliance_eval") or {}
+    script     = state.get("script_eval")     or {}
+    scoring    = state.get("scoring_eval")    or {}
+
+    # Merge all compliance flag lists from the three focused evaluations
+    all_flags: list[dict] = (
+        behavioral.get("behavioral_flags", [])
+        + compliance.get("compliance_flags", [])
+        + script.get("script_flags", [])
+    )
+
+    merged: dict = {
+        "call_id": call_id,
+        "agent_name": state["call"].agent_name,
+        "overall_assessment": scoring.get("overall_assessment", "needs_review"),
+        "assessment_reasoning": scoring.get("assessment_reasoning", ""),
+        "compliance_flags": all_flags,
+        "agent_performance": {
+            "professionalism_score": behavioral.get("professionalism_score", 0.5),
+            "accuracy_score":        script.get("accuracy_score", 0.5),
+            "resolution_score":      scoring.get("resolution_score", 0.5),
+            "strengths":    behavioral.get("strengths", []),
+            "improvements": behavioral.get("improvements", []),
+        },
+        "escalation_required": scoring.get("escalation_required", False),
+        "escalation_reason":   scoring.get("escalation_reason"),
+    }
+
+    logger.debug(
+        "aggregate_results | call_id=%s flags=%d assessment=%s",
+        call_id, len(all_flags), merged["overall_assessment"],
+    )
 
     try:
-        result = QAAnalysisResult.model_validate(data)
+        result = QAAnalysisResult.model_validate(merged)
     except ValidationError as exc:
         logger.error(
-            "validate_output Pydantic error | call_id=%s errors=%s",
-            call_id,
-            exc.errors(),
+            "aggregate_results Pydantic error | call_id=%s errors=%s",
+            call_id, exc.errors(),
         )
         return {
-            "error": f"LLM response failed schema validation: {exc}",
-            "error_node": "validate_output",
-            "node_trace": _trace(state, "validate_output"),
+            "error": f"Aggregated result failed schema validation: {exc}",
+            "error_node": "aggregate_results",
+            "node_trace": _trace(state, "aggregate_results"),
         }
 
     return {
+        "parsed_data": merged,
         "result": result,
-        "node_trace": _trace(state, "validate_output"),
+        "node_trace": _trace(state, "aggregate_results"),
     }
 
 

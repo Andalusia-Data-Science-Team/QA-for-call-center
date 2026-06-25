@@ -32,9 +32,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import arabic_reshaper
+from bidi.algorithm import get_display
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+def _fix_arabic(text: str) -> str:
+    """Reshape and apply bidi algorithm to fix reversed Arabic rendering."""
+    reshaped = arabic_reshaper.reshape(text)
+    return get_display(reshaped)
 
 _CRITERIA_ROOT = Path(__file__).parent.parent / "criteria"
 
@@ -171,7 +179,7 @@ class CriteriaLoader:
                 groups.setdefault(ptype, []).append((pillar.get("original_name", pillar_key), violations))
 
         labels = {
-            "C2Com": "C2Com — Critical to Compliance (highest priority)",
+            "C2Com": "C2Com — Critical to Compliance",
             "C2C":   "C2C   — Critical to Client / End-User",
             "C2B":   "C2B   — Critical to Business",
             "NC":    "NC    — Non-Critical",
@@ -184,7 +192,7 @@ class CriteriaLoader:
             for pillar_name, violations in group:
                 lines.append(f"\n### {pillar_name}")
                 lines.append(_list_bullets(violations))
-
+        print("lines: ",lines)
         return "\n".join(lines)
 
     # ── 3. Script templates ───────────────────────────────────────────────
@@ -206,10 +214,12 @@ class CriteriaLoader:
             for lang, phrases in std.items():
                 lines.append(f"  [{lang.upper()}]")
                 for p in phrases:
-                    lines.append(f"    • {p}")
+                    formatted = _fix_arabic(p) if lang.lower() == "arabic" else p
+                    lines.append(f"    • {formatted}")
 
         _render_scripts(greetings, "greeting")
         _render_scripts(closings, "closing")
+        print("scripts",lines)
         return "\n".join(lines)
 
     # ── 4. Scoring weights ────────────────────────────────────────────────
@@ -227,7 +237,7 @@ class CriteriaLoader:
         lines: list[str] = [
             "# SCORING WEIGHTS",
             f"  Minimum passing score: {ow.get('minimum_passing_score', 85.0)}%",
-            f"  Critical violation deduction: -{ow.get('critical_violation_deduction', 30.0)}pts",
+            f"  Critical violation deduction: -{ow.get('critical_violation_deduction', 10.0)}pts",
             "\n  Dimension weights:",
         ]
         for dim, w in beh.items():

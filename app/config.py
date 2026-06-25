@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # Anthropic default: claude-sonnet-4-20250514
     # OpenAI default:    gpt-4o
     # HuggingFace default: Qwen/Qwen2.5-7B-Instruct
-    llm_model: str = "openai/gpt-oss-120b:free"
+    llm_model: str = "google/gemma-4-31b-it:free"
 
     anthropic_api_key: str = ""
     openai_api_key: str = ""
