@@ -203,7 +203,6 @@ class CriteriaLoader:
         """
         greetings = _load_yaml("scripts/greetings.yaml")
         closings  = _load_yaml("scripts/closings.yaml")
-
         lines: list[str] = ["# SCRIPT TEMPLATES"]
 
         def _render_scripts(data: dict, label: str) -> None:

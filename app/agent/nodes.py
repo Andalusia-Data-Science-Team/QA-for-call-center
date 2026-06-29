@@ -340,7 +340,8 @@ async def infer_script_matching(
     Produces: accuracy_score, script_flags.
     Result stored in state["script_eval"].
     """
-    call = state["call"]
+    pass
+    """ call = state["call"]
     user_prompt = build_script_prompt(
         call,
         script_templates=state.get("script_templates", ""),
@@ -360,7 +361,7 @@ async def infer_script_matching(
         "script_eval": data,
         "usage_list": [data.get("_usage", {})],
         "node_trace": _trace(state, "infer_script_matching"),
-    }
+    } """
 
 
 # ---------------------------------------------------------------------------

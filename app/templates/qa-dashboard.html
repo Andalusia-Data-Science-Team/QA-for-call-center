@@ -28,6 +28,21 @@
         .header h1 { color: #2d3748; font-size: 2rem; margin-bottom: 10px; }
         .header p  { color: #718096; font-size: 1rem; }
 
+        /* ── Header nav button (links to other dashboards) ── */
+        .header-nav-btn {
+            display: inline-block;
+            margin-top: 18px;
+            padding: 10px 22px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-decoration: none;
+            border-radius: 25px;
+            font-weight: 600;
+            font-size: .95rem;
+            transition: opacity .2s, transform .15s;
+        }
+        .header-nav-btn:hover { opacity: .9; transform: translateY(-2px); }
+
         /* ── Upload card ── */
         .upload-card {
             background: white;
@@ -235,6 +250,7 @@
     <div class="header">
         <h1>🏥 Andalusia Call Center QA System</h1>
         <p>AI-Powered Quality Assurance Dashboard</p>
+        <a href="agents-dashboard.html" class="header-nav-btn">👥 View All Agents Dashboard</a>
     </div>
 
     <!-- ── Upload section ── -->

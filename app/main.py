@@ -176,3 +176,14 @@ async def batch_analyze(payload: BatchCallTranscripts) -> BatchQAAnalysisResult:
     }
     logger.info("batch-analyze done | summary=%s", summary)
     return BatchQAAnalysisResult(results=list(results), summary=summary)
+
+@app.get("/qa-dashboard.html", response_class=HTMLResponse)
+async def qa_dashboard_page(request: Request):
+    """Same page as '/', exposed here so relative links between dashboards resolve."""
+    return templates.TemplateResponse(request=request, name="qa-dashboard.html")
+
+
+@app.get("/agents-dashboard.html", response_class=HTMLResponse)
+async def agents_dashboard_page(request: Request):
+    """Serve the agents-overview dashboard UI."""
+    return templates.TemplateResponse(request=request, name="agents-dashboard.html")
