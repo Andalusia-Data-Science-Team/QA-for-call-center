@@ -192,10 +192,52 @@ class CriteriaLoader:
             for pillar_name, violations in group:
                 lines.append(f"\n### {pillar_name}")
                 lines.append(_list_bullets(violations))
-        print("lines: ",lines)
+        return "\n".join(lines)
+    
+    # ── 3. Reservation pillars ─────────────────────────────────────────────
+
+    def reservation_pillars(self) -> str:
+        """
+        Return a compact reservation-pillar checklist from regulations.yaml.
+        Strips all ids, type repetitions, and 'Other' items.
+        """
+        data = _load_yaml("policies/regulations/reservation_regulations.yaml")
+        pillars = data.get("pillars", {})
+        if not pillars:
+            return "# RESERVATION PILLARS\n(none loaded)"
+
+        lines: list[str] = ["# RESERVATION PILLARS (Andalusia Hospitals)"]
+        # Group by severity type for a compact layout
+        groups: dict[str, list[tuple[str, list[str]]]] = {
+            "C2Com": [], "C2C": [], "C2B": [], "NC": []
+        }
+        for pillar_key, pillar in pillars.items():
+            ptype = pillar.get("severity", "NC")
+            violations = [
+                item["violation"]
+                for item in pillar.get("items", [])
+                if item.get("violation", "Other") != "Other"
+            ]
+            if violations:
+                groups.setdefault(ptype, []).append((pillar.get("original_name", pillar_key), violations))
+
+        labels = {
+            "C2Com": "C2Com — Critical to Compliance",
+            "C2C":   "C2C   — Critical to Client / End-User",
+            "C2B":   "C2B   — Critical to Business",
+            "NC":    "NC    — Non-Critical",
+        }
+        for ptype, label in labels.items():
+            group = groups.get(ptype, [])
+            if not group:
+                continue
+            lines.append(f"\n## {label}")
+            for pillar_name, violations in group:
+                lines.append(f"\n### {pillar_name}")
+                lines.append(_list_bullets(violations))
         return "\n".join(lines)
 
-    # ── 3. Script templates ───────────────────────────────────────────────
+    # ── 4. Script templates ───────────────────────────────────────────────
 
     def script_templates(self) -> str:
         """
@@ -218,10 +260,9 @@ class CriteriaLoader:
 
         _render_scripts(greetings, "greeting")
         _render_scripts(closings, "closing")
-        print("scripts",lines)
         return "\n".join(lines)
 
-    # ── 4. Scoring weights ────────────────────────────────────────────────
+    # ── 5. Scoring weights ────────────────────────────────────────────────
 
     def scoring_weights(self) -> str:
         """

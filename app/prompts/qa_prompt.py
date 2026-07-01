@@ -76,6 +76,7 @@ def build_behavioral_prompt(
 Evaluate the agent's BEHAVIORAL performance in the call below.
 Focus exclusively on: tone, professionalism, empathy, active listening, prohibited phrases, and red-flag language.
 Do NOT evaluate compliance pillars, script adherence, or scoring weights here.
+Only retrieve violations from the compliance pillars section and neglect any positive feedback.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -133,6 +134,7 @@ def build_compliance_prompt(
 Evaluate the call below against the official COMPLIANCE PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
+Only retrieve violations from the compliance pillars section and neglect any positive feedback.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -168,6 +170,65 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 }}
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE C — Compliance Pillars Evaluation Prompt
+#   Focus: the 15 official compliance pillars grouped C2Com → C2C → C2B → NC.
+#   Output fields: compliance_flags (all pillar violations), escalation signals.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_reservation_prompt(
+    call: CallTranscript,
+    appointment_verification: str,
+    reservation_pillars: str = "",
+) -> str:
+    """
+    Prompt focused SOLELY on the 6 reservation pillars.
+    Returns a JSON fragment with all pillar violations and an escalation signal.
+    """
+    return f"""\
+Evaluate the call below against the official RESERVATION PILLARS only.
+Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
+Check the appointment details extracted from the transcript against the hospital's reservation database.
+Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Department: {call.department}
+
+════════════════════════════════════════════════════════════
+RESERVATION PILLARS  (flag violations by pillar name + type + id)
+════════════════════════════════════════════════════════════
+{reservation_pillars or "(not loaded)"}
+
+════════════════════════════════════════════════════════════
+TRANSCRIPT
+════════════════════════════════════════════════════════════
+{call.transcript}
+
+════════════════════════════════════════════════════════════
+APPOINTMENT VERIFICATION
+════════════════════════════════════════════════════════════
+{appointment_verification or "(not loaded)"}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "compliance_flags": [
+    {{
+      "type": "<C2Com | C2C | C2B | NC>",
+      "severity": "<critical | moderate | minor | positive>",
+      "description": "<1-2 sentences referencing the exact pillar name>",
+      "transcript_excerpt": "<verbatim excerpt>"
+    }}
+  ]
+}}
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NODE C — Script Template Matching Prompt
@@ -239,6 +300,7 @@ def build_scoring_prompt(
     scoring_weights: str = "",
     behavioral_summary: str = "",
     compliance_summary: str = "",
+    reservation_summary: str = "",
     script_summary: str = "",
 ) -> str:
     """
@@ -280,7 +342,17 @@ SUB-EVALUATION 2 — COMPLIANCE PILLARS
 {compliance_summary or "(not available)"}
 
 ════════════════════════════════════════════════════════════
-SUB-EVALUATION 3 — SCRIPT MATCHING  
+SUB-EVALUATION 3 — COMPLIANCE PILLARS 
+════════════════════════════════════════════════════════════
+{reservation_summary or "(not available)"}
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 4 — RESERVATION PILLARS  
+════════════════════════════════════════════════════════════
+{reservation_summary or "(not available)"}
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 5 — SCRIPT MATCHING  
 ════════════════════════════════════════════════════════════
 {script_summary or "(not available)"}
 
@@ -380,4 +452,29 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "escalation_required": <true | false>,
   "escalation_reason": "<reason string or null>"
 }}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE E — Appointment Details Extraction Prompt
+#   Focus: extract appointment date, doctor name, and medical specialty from transcript.
+#   Output fields: appointment_details (date, doctor_name, specialty_name).
+# ─────────────────────────────────────────────────────────────────────────────
+
+APPOINTMENT_EXTRACTION_PROMPT = """
+You are a medical-call data extractor. Given the following call transcript, extract:
+1. The requested appointment date (as an ISO-8601 string 2026-MM-DD if determinable, otherwise the exact phrase used, or null if not mentioned).
+2. The doctor's full name (exactly as mentioned, or null if not mentioned).
+3. The medical specialty name (e.g. "cardiology", "dermatology", or null if not mentioned).
+4. Patient Name for the reservation (exactly as mentioned, or null if not mentioned).
+
+Do not guess or infer information that is not explicitly stated in the transcript.
+Do not refine any information
+Do Not include any additional commentary or explanation.
+If there is not a clear date provided map between the call date :{date} and the nearest date of the week day mentioned for reservation from the call date in 2026. If the date is not mentioned, return null.
+
+Respond ONLY with a valid JSON object with keys:"appointment_date", "doctor_name", "specialty_name","Patient_name".
+
+Transcript:
+{transcript}
 """

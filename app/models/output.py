@@ -22,8 +22,8 @@ class AgentPerformance(BaseModel):
     professionalism_score: float = Field(..., ge=0.0, le=1.0)
     accuracy_score: float = Field(..., ge=0.0, le=1.0)
     resolution_score: float = Field(..., ge=0.0, le=1.0)
-    strengths: list[str] = Field(..., min_length=1, max_length=3)
-    improvements: list[str] = Field(..., min_length=1, max_length=3)
+    strengths: list[str] = Field(..., min_length=0, max_length=3)
+    improvements: list[str] = Field(..., min_length=0, max_length=3)
 
 class QAAnalysisResult(BaseModel):
     call_id: str

@@ -26,21 +26,37 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
+import urllib.parse
+from datetime import date as DateType
+from pathlib import Path
+from typing import Optional
 
 from pydantic import ValidationError
+from sqlalchemy import create_engine, text as sa_text
+
+from arabic_reshaper import reshape
 
 from app.agent.state import AgentState
 from app.models.output import QAAnalysisResult
 from app.prompts.qa_prompt import (
     SYSTEM_PROMPT,
+    APPOINTMENT_EXTRACTION_PROMPT,
     build_behavioral_prompt,
     build_compliance_prompt,
+    build_reservation_prompt,
     build_script_prompt,
     build_scoring_prompt,
     build_user_prompt,   # kept for legacy path
 )
 from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
+from app.services.text_helpers import (
+    _normalize_arabic,
+    _arabic_like_pattern, 
+    _strip_markdown_fences,
+    _norm_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +157,32 @@ async def load_compliance_pillars(state: AgentState) -> dict:
         "node_trace": _trace(state, "load_compliance_pillars"),
     }
 
+# ---------------------------------------------------------------------------
+# Node 2c – load_reservation_pillars
+#   Loads the 15 official reservation pillars from regulations.yaml, grouped
+#   by severity tier (C2Com → C2C → C2B → NC) in compact form.
+#   Isolated so the pillar set can be versioned or department-filtered
+#   independently of behavioral criteria.
+# ---------------------------------------------------------------------------
+
+async def load_reservation_pillars(state: AgentState) -> dict:
+    """
+    Fetch and compact the full reservation pillar checklist.
+    Strips ids, type-repetitions, and 'Other' catch-all items to minimise
+    token count while preserving all actionable violation descriptions.
+    """
+    block = _criteria.reservation_pillars()
+    logger.debug(
+        "load_reservation_pillars | call_id=%s chars=%d",
+        state["call"].call_id, len(block),
+    )
+    return {
+        "reservation_pillars": block,
+        "node_trace": _trace(state, "load_reservation_pillars"),
+    }
 
 # ---------------------------------------------------------------------------
-# Node 2c – load_script_templates
+# Node 2d – load_script_templates
 #   Loads approved greeting and closing scripts.
 #   Isolated so scripts can be updated per-campaign or per-language without
 #   touching behavioral or compliance nodes.
@@ -325,6 +364,42 @@ async def infer_compliance_evaluation(
         "node_trace": _trace(state, "infer_compliance_evaluation"),
     }
 
+# ---------------------------------------------------------------------------
+# Node C – infer_reservation_evaluation
+#   Focused LLM call: 6 reservation pillars (C2Com / C2C / C2B / NC).
+#   Runs in PARALLEL with infer_behavioral_evaluation & infer_script_matching.
+# ---------------------------------------------------------------------------
+
+async def infer_reservation_evaluation(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    Call the LLM with a reservation-pillars-only prompt.
+    Produces: reservation_flags, escalation_required, escalation_reason.
+    Result stored in state["reservation_eval"].
+    """
+    call = state["call"]
+    user_prompt = build_reservation_prompt(
+        call,
+        appointment_verification=state.get("appointment_verification", ""),
+        reservation_pillars=state.get("reservation_pillars", ""),
+    )
+    logger.debug(
+        "infer_reservation_evaluation | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_reservation_evaluation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
+    return {
+        "reservation_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_reservation_evaluation"),
+    }
 
 # ---------------------------------------------------------------------------
 # Node C – infer_script_matching
@@ -384,7 +459,8 @@ async def infer_overall_scoring(
 
     # Serialise the three sub-results as compact JSON strings for injection
     behavioral_summary = json.dumps(state.get("behavioral_eval") or {}, ensure_ascii=False)
-    compliance_summary = json.dumps(state.get("compliance_eval") or {}, ensure_ascii=False)
+    compliance_summary = json.dumps(state.get("compliance_eval") or {}, ensure_ascii=False)    
+    reservation_summary = json.dumps(state.get("reservation_eval") or {}, ensure_ascii=False)
     script_summary     = json.dumps(state.get("script_eval") or {},     ensure_ascii=False)
 
     user_prompt = build_scoring_prompt(
@@ -392,6 +468,7 @@ async def infer_overall_scoring(
         scoring_weights=state.get("scoring_weights", ""),
         behavioral_summary=behavioral_summary,
         compliance_summary=compliance_summary,
+        reservation_summary=reservation_summary,
         script_summary=script_summary,
     )
     logger.debug(
@@ -457,9 +534,9 @@ async def aggregate_results(state: AgentState) -> dict:
         "assessment_reasoning": scoring.get("assessment_reasoning", ""),
         "compliance_flags": all_flags,
         "agent_performance": {
-            "professionalism_score": behavioral.get("professionalism_score", 0.5),
-            "accuracy_score":        script.get("accuracy_score", 0.5),
-            "resolution_score":      scoring.get("resolution_score", 0.5),
+            "professionalism_score": _norm_score(behavioral.get("professionalism_score", 0.5)),
+            "accuracy_score":        _norm_score(script.get("accuracy_score", 0.5)),
+            "resolution_score":      _norm_score(scoring.get("resolution_score", 0.5)),
             "strengths":    behavioral.get("strengths", []),
             "improvements": behavioral.get("improvements", []),
         },
@@ -584,16 +661,383 @@ async def handle_error(state: AgentState) -> dict:
         "node_trace": _trace(state, f"handle_error[{error_node}]"),
     }
 
+# ---------------------------------------------------------------------------
+# Node – detect_intent
+#   Inspects the call transcript for booking / appointment-related intent by
+#   scanning for Arabic keywords such as "احجز", "حجز", "معاد" (and common
+#   variants).  Stores two keys in state:
+#     • is_booking_intent  (bool)  – True when any keyword is matched
+#     • intent_label       (str)   – human-readable label for the intent
+# ---------------------------------------------------------------------------
+
+# Keywords that signal a booking or appointment-checking intent
+_BOOKING_KEYWORDS: list[str] = [
+    "احجز",    # "book" (imperative)
+    "احجزلي",  # "book for me"
+    "حجز",     # "booking / reservation"
+    "حجزي",    # "my booking"
+    "حجزك",    # "your booking"
+    "حجزه",    # "his/her booking"
+    "الحجز",   # "the booking"
+    "معاد",    # "appointment"
+    "المعاد",  # "the appointment"
+    "معادي",   # "my appointment"
+    "موعد",    # "appointment / time-slot"
+    "المواعيد", # "the appointments"
+    "مواعيد",  # "appointments"
+    "تأكيد الحجز",
+    "الموعد",
+    "تم تأكيد الحجز"
+]
+
+
+async def detect_intent(state: AgentState) -> dict:
+    """
+    Keyword-based intent detection node.
+
+    Scans the full transcript text for Arabic booking / appointment keywords.
+    Sets:
+      - ``is_booking_intent``: True when at least one keyword is found.
+      - ``intent_label``: A short descriptive string ("booking_or_appointment"
+        or "other").
+
+    This node never raises — on any error it logs and defaults to
+    ``is_booking_intent=False`` so the rest of the pipeline continues
+    unaffected.
+    """
+    call = state.get("call")
+    if call is None:
+        logger.warning("detect_intent | call is None — skipping intent detection")
+        return {
+            "is_booking_intent": False,
+            "intent_label": "other",
+            "node_trace": _trace(state, "detect_intent"),
+        }
+
+    # Concatenate all transcript turns into one searchable string.
+    # Turns may be plain strings or objects that carry a .text attribute.
+    try:
+        raw_turns = state.get("call").transcript or []
+        joined = "".join(
+            (turn if isinstance(turn, str) else turn.text)
+            for turn in raw_turns
+            if (turn if isinstance(turn, str) else getattr(turn, "text", None))
+        )
+        # reshape operates on the full joined string so Arabic ligatures are
+        # normalised correctly — it does NOT split the text.
+        transcript_text = joined       #reshape(joined)
+        print(transcript_text)
+        logger.debug("detect_intent | transcript_text=%s", transcript_text[:200])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("detect_intent | failed to read transcript | %s", exc)
+        return {
+            "is_booking_intent": False,
+            "intent_label": "other",
+            "node_trace": _trace(state, "detect_intent"),
+        }
+
+    matched_keywords = [kw for kw in _BOOKING_KEYWORDS if kw in transcript_text]
+    is_booking = bool(matched_keywords)
+    intent_label = "booking_or_appointment" if is_booking else "other"
+
+    logger.info(
+        "detect_intent | call_id=%s is_booking=%s matched=%s",
+        call.call_id,
+        is_booking,
+        matched_keywords or "none",
+    )
+
+    return {
+        "is_booking_intent": is_booking,
+        "intent_label": intent_label,
+        "node_trace": _trace(state, "detect_intent"),
+    }
+
 
 # ---------------------------------------------------------------------------
-# Private helpers
+# Node – extract_appointment_details
+#   Uses the LLM to extract the three appointment attributes from the call
+#   transcript:
+#     • appointment_date   (str | None) – e.g. "2024-08-15" or a descriptive
+#                                         phrase when no ISO date is spoken
+#     • doctor_name        (str | None) – full name of the doctor mentioned
+#     • specialty_name     (str | None) – medical specialty (e.g. "cardiology")
+#
+#   Stores them under the key ``appointment_details`` in state.
+#   This node is a no-op (returns None for all three fields) when
+#   ``is_booking_intent`` is False.
 # ---------------------------------------------------------------------------
 
-def _strip_markdown_fences(text: str) -> str:
-    """Remove ```json ... ``` wrappers that some LLMs insert despite instructions."""
-    text = text.strip()
-    pattern = r"^```(?:json)?\s*\n?(.*?)\n?```$"
-    match = re.match(pattern, text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text
+
+async def extract_appointment_details(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    LLM-based extraction node for appointment attributes.
+
+    Reads the call transcript and extracts:
+      - ``appointment_date``  (str | None)
+      - ``doctor_name``       (str | None)
+      - ``specialty_name``    (str | None)
+
+    These are stored together in ``state["appointment_details"]``.
+    When ``is_booking_intent`` is False the node skips the LLM call and
+    stores ``None`` for every field.
+    """
+    if not state.get("is_booking_intent", False):
+        logger.info(
+            "extract_appointment_details | is_booking_intent=False — skipping"
+        )
+        return {
+            "appointment_details": {
+                "appointment_date": None,
+                "doctor_name": None,
+                "specialty_name": None,
+            },
+            "node_trace": _trace(state, "extract_appointment_details"),
+        }
+
+    call = state.get("call")
+    if call is None:
+        logger.warning(
+            "extract_appointment_details | call is None — skipping"
+        )
+        return {
+            "appointment_details": {
+                "appointment_date": None,
+                "doctor_name": None,
+                "specialty_name": None,
+            },
+            "node_trace": _trace(state, "extract_appointment_details"),
+        }
+
+    try:
+        transcript_text = " ".join(
+            (turn if isinstance(turn, str) else turn.text)
+            for turn in (call.transcript or [])
+            if (turn if isinstance(turn, str) else getattr(turn, "text", None))
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "extract_appointment_details | failed to read transcript | %s", exc
+        )
+        return {
+            "appointment_details": {
+                "appointment_date": None,
+                "doctor_name": None,
+                "specialty_name": None,
+            },
+            "node_trace": _trace(state, "extract_appointment_details"),
+        }
+
+    user_prompt = APPOINTMENT_EXTRACTION_PROMPT.format(transcript=call.transcript,date=call.call_date)
+
+    data, err = await _focused_llm_call(
+        "extract_appointment_details",
+        call.call_id,
+        user_prompt,
+        llm_client,
+        state,
+    )
+    if err:
+        return err
+    print(data)
+    # Normalise keys to lowercase so we tolerate Patient_name / patient_name
+    # variants returned by different LLMs.
+    data_lower = {k.lower(): v for k, v in data.items()}
+    details = {
+        "appointment_date": data_lower.get("appointment_date"),
+        "doctor_name":      data_lower.get("doctor_name"),
+        "specialty_name":   data_lower.get("specialty_name"),
+        "patient_name":     data_lower.get("patient_name"),
+    }
+
+    logger.info(
+        "extract_appointment_details | call_id=%s date=%s doctor=%s specialty=%s patient=%s",
+        call.call_id,
+        details["appointment_date"],
+        details["doctor_name"],
+        details["specialty_name"],
+        details["patient_name"],
+    )
+
+    return {
+        "appointment_details": details,
+        "node_trace": _trace(state, "extract_appointment_details"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node – verify_appointment_in_db
+#   Takes the three appointment attributes produced by
+#   ``extract_appointment_details`` and queries the database to check whether
+#   a matching reservation record exists.
+#
+#   Stores the lookup outcome in ``state["appointment_verification"]``:
+#     • found      (bool)            – True when a matching record exists
+#     • record     (dict | None)     – the raw DB row as a dict, or None
+#     • message    (str)             – human-readable summary
+# ---------------------------------------------------------------------------
+
+
+async def verify_appointment_in_db(state: AgentState) -> dict:
+    """
+    Database-lookup node for appointment verification.
+
+    Uses ``appointment_details`` from state to search for a reservation that
+    matches ALL three criteria (doctor name, specialty, date).  Any missing
+    attribute is treated as a wildcard (not applied as a filter).
+
+    The node expects a ``db_session`` key in state that holds an async
+    SQLAlchemy ``AsyncSession`` (or any object with an ``execute`` coroutine
+    compatible with SQLAlchemy's async API).  When no session is present the
+    node logs a warning and returns ``found=False``.
+
+    Stores result under ``state["appointment_verification"]``.
+    """
+    details: dict = state.get("appointment_details") or {}
+    appointment_date: Optional[str] = details.get("appointment_date")
+    doctor_name: Optional[str] = details.get("doctor_name")
+    specialty_name: Optional[str] = details.get("specialty_name")
+    patient_name: Optional[str] = details.get("patient_name")
+    patient_phone: Optional[str] = state.get("call").Patient_Phone
+
+    call = state.get("call")
+    call_id = call.call_id if call else "UNKNOWN"
+
+    # Guard: nothing to look up when all three attributes are absent
+    if not any([appointment_date, doctor_name, specialty_name, patient_name]):
+        logger.info(
+            "verify_appointment_in_db | call_id=%s — no attributes to filter on",
+            call_id,
+        )
+        return {
+            "appointment_verification": {
+                "found": False,
+                "record": None,
+                "message": "No appointment attributes were extracted — cannot verify.",
+            },
+            "node_trace": _trace(state, "verify_appointment_in_db"),
+        }
+
+    try:
+        app_dir = Path(__file__).resolve().parent.parent
+        passcodes_path = app_dir / "Passcode.json"
+        sql_path = app_dir / "SQL" / "Slots.sql"
+
+        if not passcodes_path.exists():
+            raise FileNotFoundError(f"Passcode file not found: {passcodes_path}")
+
+        business_unit: str = (state.get("call").business_unit or "LIVE")
+        print("business_unit",business_unit)
+        with passcodes_path.open("r", encoding="utf-8") as handle:
+            db_config = json.load(handle)["DB_NAMES"]
+            if business_unit not in db_config:
+                logger.warning(
+                    "verify_appointment_in_db | call_id=%s — unknown business_unit=%s, "
+                    "falling back to LIVE",
+                    call_id, business_unit,
+                )
+                business_unit = "LIVE"
+            passcodes = db_config[business_unit]
+
+        server = passcodes["Server"]
+        db_name = passcodes["Database"]
+        uid = passcodes["UID"]
+        pwd = passcodes["PWD"]
+        driver = passcodes["driver"]
+
+        params = urllib.parse.quote_plus(
+            f"DRIVER={driver};"
+            f"SERVER={server};"
+            f"DATABASE={db_name};"
+            f"UID={uid};"
+            f"PWD={pwd};"
+            f"Connection Timeout=300;"
+        )
+        engine = create_engine("mssql+pyodbc:///?odbc_connect={}".format(params))
+        logger.debug(
+            "verify_appointment_in_db | call_id=%s — using DB engine for %s/%s",
+            call_id,
+            server,
+            db_name,
+        )
+
+        query_text = (sql_path.read_text(encoding="utf-8"))
+        query = sa_text(query_text)
+
+        # Build fuzzy-match LIKE patterns that tolerate Arabic spelling
+        # variants (alef forms, teh-marbuta, yeh forms, diacritics).
+        doctor_pattern   = _arabic_like_pattern(doctor_name,  first_word_only=True)
+        patient_pattern  = _arabic_like_pattern(patient_name, first_word_only=False)
+        specialty_norm   = _normalize_arabic(specialty_name)
+
+        bind_params: dict[str, object] = {
+            "ReportDate":   appointment_date or None,
+            "Specialty":    specialty_norm,
+            "Doctor":       (doctor_pattern.strip().split()[0]) if doctor_pattern else None,
+            "PatientPhone": ("0" + patient_phone) if patient_phone else None,
+            "PatientName":  patient_pattern,
+        }
+        print("params",bind_params)
+
+        logger.debug(
+            "verify_appointment_in_db | call_id=%s bind_params=%s",
+            call_id, bind_params,
+        )
+
+        with engine.connect() as connection:
+            result = connection.execute(query, bind_params)
+            row = result.mappings().first()
+
+        if row:
+            record = dict(row)
+            logger.info(
+                "verify_appointment_in_db | call_id=%s — reservation FOUND | record_id=%s",
+                call_id,
+                record.get("PatientArName", "N/A"),
+            )
+            return {
+                "appointment_verification": {
+                    "found": True,
+                    "record": record,
+                    "message": "Reservation found in the database.",
+                },
+                "node_trace": _trace(state, "verify_appointment_in_db"),
+            }
+        else:
+            logger.info(
+                "verify_appointment_in_db | call_id=%s — reservation NOT FOUND "
+                "(date=%s, doctor=%s, specialty=%s)",
+                call_id,
+                appointment_date,
+                doctor_name,
+                specialty_name,
+            )
+            return {
+                "appointment_verification": {
+                    "found": False,
+                    "record": None,
+                    "message": (
+                        f"No reservation found for doctor='{doctor_name}', "
+                        f"specialty='{specialty_name}', date='{appointment_date}'."
+                    ),
+                },
+                "node_trace": _trace(state, "verify_appointment_in_db"),
+            }
+
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "verify_appointment_in_db | call_id=%s — DB query failed | %s",
+            call_id,
+            exc,
+        )
+        return {
+            "appointment_verification": {
+                "found": False,
+                "record": None,
+                "message": f"Database error during verification: {exc}",
+            },
+            "node_trace": _trace(state, "verify_appointment_in_db"),
+        }
+

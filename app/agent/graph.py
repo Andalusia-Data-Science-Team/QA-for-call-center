@@ -6,33 +6,49 @@ Graph topology (happy path):
   START
     │
     ▼
-  load_call ──(error)─────────────────────────────────────────────────────┐
-    │                                                                      │
-    │  fan-out: 4 parallel criteria loaders                                │
-    ├──→ load_behavioral_criteria ──┐                                      │
-    ├──→ load_compliance_pillars  ──┤                                      │
-    ├──→ load_script_templates    ──┤                                      │
-    └──→ load_scoring_weights     ──┘                                      │
-                 (all 4 loaders fan-in into the 3 focused inference nodes) │
-                                                                           │
-    fan-out: 3 parallel focused LLM calls                                  │
-    ├──→ infer_behavioral_evaluation ──(error)────────────────────────────┤│
-    ├──→ infer_compliance_evaluation ──(error)────────────────────────────┤│
-    └──→ infer_script_matching       ──(error)────────────────────────────┤│
-                                │ (fan-in)                                 ││
-                                ▼                                          ││
-                   infer_overall_scoring ──(error)────────────────────────┤│
-                                │                                          ││
-                                ▼                                          ││
-                       aggregate_results ──(error)────────────────────────┤│
-                                │                                          ││
-                                ▼                                          ││
-                       integrity_check                                     ││
-                                │                                          ││
-                                ▼                                          ││
-                             finalize                                      ││
-                                │                            ┌─────────────┘│
-                               END ◄─── handle_error ◄──────┘               │
+  load_call ──(error)──────────────────────────────────────────────────────┐
+    │                                                                       │
+    │  fan-out: 5 parallel criteria loaders                                 │
+    ├──→ load_behavioral_criteria ──┐                                       │
+    ├──→ load_compliance_pillars  ──┤                                       │
+    ├──→ load_script_templates    ──┤ fan-in                                │
+    ├──→ load_reservation_pillars ──┤                                       │
+    └──→ load_scoring_weights     ──┘                                       │
+                                   │                                        │
+                            criteria_ready  (barrier / no-op)               │
+                                   │                                        │
+    └──→ detect_intent                                                        │
+              │                                                               │
+              ├──(booking)──→ extract_appointment_details                     │
+              │                        │                                      │
+              │               verify_appointment_in_db                       │
+              │                        │                                      │
+              │               infer_reservation_evaluation ──(error)─────────┤
+              │                        │                                      │
+              └──(skip_booking)────────┘                                      │
+                               │  (sequential — completes before LLM calls)  │
+                               ▼                                              │
+    fan-out: 2 parallel LLM calls (after booking branch fully done)           │
+    ├──→ infer_behavioral_evaluation ──(error)──────────────────────────┐    │
+    └──→ infer_compliance_evaluation ──(error)──────────────────────────┤    │
+                                                    │ fan-in (2 edges)  │    │
+                                                    ▼                   │    │
+                                            inference_ready             │    │
+                                     (barrier — waits for exactly 2)    │    │
+                                                    │                   │    │
+                                                    ▼                   │    │
+                  infer_overall_scoring ──(error)───────────────────────┘    │
+                               │                                         │  │
+                               ▼                                         │  │
+                      aggregate_results ──(error)────────────────────────┤  │
+                               │                                         │  │
+                               ▼                                         │  │
+                      integrity_check                                    │  │
+                               │                                         │  │
+                               ▼                                         │  │
+                            finalize                          ┌───────────┘  │
+                               │                             │               │
+                              END ◄─── handle_error ◄────────┘               │
                                             ▲                                │
                                             └────────────────────────────────┘
 ─────────────────────────────────────────────────────────────────────────────
@@ -87,16 +103,21 @@ from app.agent.nodes import (
     load_call,
     load_behavioral_criteria,
     load_compliance_pillars,
+    load_reservation_pillars,
     load_script_templates,
     load_scoring_weights,
     infer_behavioral_evaluation,
     infer_compliance_evaluation,
+    infer_reservation_evaluation,
     infer_script_matching,
     infer_overall_scoring,
     aggregate_results,
     integrity_check,
     finalize,
     handle_error,
+    detect_intent,
+    extract_appointment_details,
+    verify_appointment_in_db,
 )
 from app.services.llm_client import LLMClient
 
@@ -112,6 +133,13 @@ def _error_router(state: AgentState) -> Literal["continue", "handle_error"]:
     if state.get("error"):
         return "handle_error"
     return "continue"
+
+
+def _booking_router(state: AgentState) -> Literal["booking", "skip_booking"]:
+    """Route to the booking sub-flow when a booking intent was detected."""
+    if state.get("is_booking_intent"):
+        return "booking"
+    return "skip_booking"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +163,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Stage 2: criteria loaders (run in parallel after load_call)
     builder.add_node("load_behavioral_criteria", load_behavioral_criteria)
     builder.add_node("load_compliance_pillars",  load_compliance_pillars)
+    builder.add_node("load_reservation_pillars", load_reservation_pillars)
     builder.add_node("load_script_templates",    load_script_templates)
     builder.add_node("load_scoring_weights",     load_scoring_weights)
 
@@ -147,16 +176,31 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         "infer_compliance_evaluation",
         functools.partial(infer_compliance_evaluation, llm_client=llm_client),
     )
+    # infer_script_matching is currently disabled (returns pass) — excluded
+    # from the graph so it does not corrupt the inference_ready barrier count.
+    # Re-add it here + wire it when the script-matching LLM call is enabled.
+
     builder.add_node(
-        "infer_script_matching",
-        functools.partial(infer_script_matching, llm_client=llm_client),
+        "infer_reservation_evaluation",
+        functools.partial(infer_reservation_evaluation, llm_client=llm_client),
     )
 
-    # Stage 4: scoring synthesis (fan-in barrier — waits for all 3 focused nodes)
+    # Stage 4: scoring synthesis (fan-in barrier — waits for all 4 focused nodes)
     builder.add_node(
         "infer_overall_scoring",
         functools.partial(infer_overall_scoring, llm_client=llm_client),
     )
+
+    # Barrier node 1 — fan-in for all criteria loaders, fan-out to inference.
+    builder.add_node("criteria_ready", lambda state: {})
+
+    # Barrier node 2 — fan-in that waits for:
+    #   • infer_behavioral_evaluation
+    #   • infer_compliance_evaluation
+    # These two are the only unconditional predecessors. The booking branch
+    # runs sequentially BEFORE these two start (detect_intent is gated by
+    # criteria_ready too, but wired separately — see edge section below).
+    builder.add_node("inference_ready", lambda state: {})
 
     # Stage 5: aggregate + validate merged result
     builder.add_node("aggregate_results", aggregate_results)
@@ -168,64 +212,97 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Error sink
     builder.add_node("handle_error", handle_error)
 
+    # ── Booking intent sub-flow (inserted after infer_behavioral_evaluation) ──
+    builder.add_node("detect_intent", detect_intent)
+    builder.add_node(
+        "extract_appointment_details",
+        functools.partial(extract_appointment_details, llm_client=llm_client),
+    )
+    builder.add_node("verify_appointment_in_db", verify_appointment_in_db)
+
     # ── Edges ─────────────────────────────────────────────────────────────
 
     # Entry
     builder.add_edge(START, "load_call")
 
-    # load_call → error check (conditional) then fan-out to all 4 criteria loaders.
+    # load_call → error check (conditional) then fan-out to all 5 criteria loaders.
     builder.add_conditional_edges(
         "load_call",
         _error_router,
         {"continue": "load_behavioral_criteria", "handle_error": "handle_error"},
     )
     builder.add_edge("load_call", "load_compliance_pillars")
-    builder.add_edge("load_call", "load_script_templates")
+    #builder.add_edge("load_call", "load_script_templates")
+    builder.add_edge("load_call", "load_reservation_pillars")
     builder.add_edge("load_call", "load_scoring_weights")
 
-    # ── Fan-in from criteria loaders → 3 focused inference nodes ─────────
+    # ── All 5 loaders fan-in to the barrier node ──────────────────────────
     #
-    # Each focused node needs only a subset of criteria, but we wire ALL four
-    # loaders to ALL three inference nodes so LangGraph's barrier waits for
-    # every loader to finish before any inference node starts.  The extra
-    # criteria keys are simply ignored by each focused prompt builder.
+    # criteria_ready is a no-op that LangGraph uses as a synchronisation
+    # point: it fires only after every loader has written its state key.
+    # From there we fan-out to the 4 parallel inference nodes + detect_intent.
+    # This replaces the previous 5×5 = 25 repeated edges with 5 + 5 = 10.
+    builder.add_edge("load_behavioral_criteria", "criteria_ready")
+    builder.add_edge("load_compliance_pillars",  "criteria_ready")
+    #builder.add_edge("load_script_templates",    "criteria_ready")
+    builder.add_edge("load_reservation_pillars", "criteria_ready")
+    builder.add_edge("load_scoring_weights",     "criteria_ready")
+
+    # ── Step 1: detect_intent runs first (sequential, after all loaders) ──
     #
-    # Behavioral inference needs: behavioral_criteria
-    builder.add_edge("load_behavioral_criteria", "infer_behavioral_evaluation")
-    builder.add_edge("load_compliance_pillars",  "infer_behavioral_evaluation")
-    builder.add_edge("load_script_templates",    "infer_behavioral_evaluation")
-    builder.add_edge("load_scoring_weights",     "infer_behavioral_evaluation")
+    # detect_intent is the first thing that fires after criteria_ready.
+    # Its result (is_booking_intent) determines which branch runs next.
+    builder.add_edge("criteria_ready", "detect_intent")
 
-    # Compliance inference needs: compliance_pillars
-    builder.add_edge("load_behavioral_criteria", "infer_compliance_evaluation")
-    builder.add_edge("load_compliance_pillars",  "infer_compliance_evaluation")
-    builder.add_edge("load_script_templates",    "infer_compliance_evaluation")
-    builder.add_edge("load_scoring_weights",     "infer_compliance_evaluation")
+    # ── Step 2: booking sub-flow OR skip — both end at infer_behavioral ───
+    #
+    # BOOKING:    detect_intent → extract → verify → infer_reservation_evaluation
+    #             → infer_behavioral_evaluation (fan-in start)
+    # SKIP:       detect_intent → infer_behavioral_evaluation directly
+    #
+    # This ensures infer_reservation_evaluation ALWAYS completes (or is
+    # skipped) BEFORE the parallel behavioral+compliance LLM calls begin.
+    builder.add_conditional_edges(
+        "detect_intent",
+        _booking_router,
+        {
+            "booking":      "extract_appointment_details",
+            "skip_booking": "infer_behavioral_evaluation",
+        },
+    )
+    builder.add_edge("extract_appointment_details", "verify_appointment_in_db")
+    builder.add_edge("verify_appointment_in_db",    "infer_reservation_evaluation")
+    builder.add_conditional_edges(
+        "infer_reservation_evaluation",
+        _error_router,
+        {"continue": "infer_behavioral_evaluation", "handle_error": "handle_error"},
+    )
 
-    # Script inference needs: script_templates
-    builder.add_edge("load_behavioral_criteria", "infer_script_matching")
-    builder.add_edge("load_compliance_pillars",  "infer_script_matching")
-    builder.add_edge("load_script_templates",    "infer_script_matching")
-    builder.add_edge("load_scoring_weights",     "infer_script_matching")
+    # ── Step 3: behavioral + compliance run in parallel ────────────────────
+    #
+    # Both receive a single incoming edge from detect_intent/reservation branch.
+    # criteria_ready also fans into them so they wait for all loaders.
+    builder.add_edge("criteria_ready", "infer_behavioral_evaluation")
+    builder.add_edge("criteria_ready", "infer_compliance_evaluation")
+    # infer_script_matching excluded (disabled) — add back here when re-enabled
 
-    # ── Focused inference nodes → error check → infer_overall_scoring ────
+    # ── Step 4: behavioral + compliance fan-in → inference_ready ──────────
+    #
+    # Exactly 2 unconditional predecessors: behavioral + compliance.
+    # LangGraph fires inference_ready only after both complete.
     builder.add_conditional_edges(
         "infer_behavioral_evaluation",
         _error_router,
-        {"continue": "infer_overall_scoring", "handle_error": "handle_error"},
+        {"continue": "inference_ready", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
         "infer_compliance_evaluation",
         _error_router,
-        {"continue": "infer_overall_scoring", "handle_error": "handle_error"},
-    )
-    builder.add_conditional_edges(
-        "infer_script_matching",
-        _error_router,
-        {"continue": "infer_overall_scoring", "handle_error": "handle_error"},
+        {"continue": "inference_ready", "handle_error": "handle_error"},
     )
 
-    # ── infer_overall_scoring → aggregate_results → integrity_check ───────
+    # ── Step 5: inference_ready → infer_overall_scoring ───────────────────
+    builder.add_edge("inference_ready", "infer_overall_scoring")
     builder.add_conditional_edges(
         "infer_overall_scoring",
         _error_router,
