@@ -51,6 +51,7 @@ from app.prompts.qa_prompt import (
 )
 from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
+from app.services.sql_helpers import insert_qa_result
 from app.services.text_helpers import (
     _normalize_arabic,
     _arabic_like_pattern, 
@@ -606,7 +607,56 @@ async def integrity_check(state: AgentState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node 7 – finalize
+# Node 7 – save_to_database
+#   Persists the final QAAnalysisResult to [Service_Hub].[AI].[Call_QA_Results].
+#   Runs after integrity_check and before finalize so the DB write is
+#   confirmed before the pipeline terminates.
+#   Errors are logged but do NOT abort the pipeline (non-fatal).
+# ---------------------------------------------------------------------------
+
+async def save_to_database(state: AgentState) -> dict:
+    """
+    Persist the validated QAAnalysisResult to the SQL Server database.
+
+    Uses ``insert_qa_result`` from ``app.services.sql_helpers``.  Any
+    database error is caught, logged, and surfaced as a warning in the
+    node trace rather than crashing the pipeline — the caller already has
+    the in-memory result and should not lose it due to a transient DB issue.
+    """
+    result = state.get("result")
+    call   = state.get("call")
+
+    if result is None or call is None:
+        logger.warning(
+            "save_to_database | result or call is None — skipping DB write"
+        )
+        return {"node_trace": _trace(state, "save_to_database")}
+
+    if result.overall_assessment == "error":
+        logger.warning(
+            "save_to_database | call_id=%s — skipping DB write for error result",
+            call.call_id,
+        )
+        return {"node_trace": _trace(state, "save_to_database")}
+
+    try:
+        insert_qa_result(result, call, channel_name="Whatsapp")
+        logger.info(
+            "save_to_database | call_id=%s — result persisted to DB",
+            call.call_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "save_to_database | call_id=%s — DB insert failed (non-fatal): %s",
+            call.call_id,
+            exc,
+        )
+
+    return {"node_trace": _trace(state, "save_to_database")}
+
+
+# ---------------------------------------------------------------------------
+# Node 8 – finalize
 #   Logs the outcome summary and closes out the node trace.
 # ---------------------------------------------------------------------------
 

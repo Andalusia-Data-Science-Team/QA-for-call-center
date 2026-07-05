@@ -62,6 +62,13 @@
       "PWD": "BI@user123!",
       "Server": "10.110.111.52",
       "driver": "{ODBC Driver 17 for SQL Server}"
+    },
+    "DWH": {
+      "Database": "DWH",
+      "UID": "AI_Read",
+      "PWD": "AI_Pass",
+      "Server": "172.31.8.178",
+      "driver": "{ODBC Driver 17 for SQL Server}"
     }
   }
 }

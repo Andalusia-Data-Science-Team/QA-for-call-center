@@ -26,9 +26,11 @@ Graph topology (happy path):
               │               infer_reservation_evaluation ──(error)─────────┤
               │                        │                                      │
               └──(skip_booking)────────┘                                      │
-                               │  (sequential — completes before LLM calls)  │
+                               │  (both paths converge here)                  │
                                ▼                                              │
-    fan-out: 2 parallel LLM calls (after booking branch fully done)           │
+                        inference_gate  (barrier — single fan-out point)      │
+                               │                                              │
+    fan-out: 2 parallel LLM calls                                             │
     ├──→ infer_behavioral_evaluation ──(error)──────────────────────────┐    │
     └──→ infer_compliance_evaluation ──(error)──────────────────────────┤    │
                                                     │ fan-in (2 edges)  │    │
@@ -113,6 +115,7 @@ from app.agent.nodes import (
     infer_overall_scoring,
     aggregate_results,
     integrity_check,
+    save_to_database,
     finalize,
     handle_error,
     detect_intent,
@@ -194,12 +197,16 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Barrier node 1 — fan-in for all criteria loaders, fan-out to inference.
     builder.add_node("criteria_ready", lambda state: {})
 
+    # Barrier node 1b — fan-in that waits for the booking/skip branch to
+    # fully complete before the two parallel LLM calls start.  This is the
+    # SINGLE entry point into behavioral + compliance, preventing any second
+    # trigger from arriving via a different path.
+    builder.add_node("inference_gate", lambda state: {})
+
     # Barrier node 2 — fan-in that waits for:
     #   • infer_behavioral_evaluation
     #   • infer_compliance_evaluation
-    # These two are the only unconditional predecessors. The booking branch
-    # runs sequentially BEFORE these two start (detect_intent is gated by
-    # criteria_ready too, but wired separately — see edge section below).
+    # Exactly 2 unconditional predecessors — both come from inference_gate.
     builder.add_node("inference_ready", lambda state: {})
 
     # Stage 5: aggregate + validate merged result
@@ -207,6 +214,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
 
     # Stage 6: post-processing chain
     builder.add_node("integrity_check", integrity_check)
+    builder.add_node("save_to_database", save_to_database)
     builder.add_node("finalize", finalize)
 
     # Error sink
@@ -262,12 +270,19 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     #
     # This ensures infer_reservation_evaluation ALWAYS completes (or is
     # skipped) BEFORE the parallel behavioral+compliance LLM calls begin.
+    # BOOKING:  detect_intent → extract → verify → infer_reservation → inference_gate
+    # SKIP:     detect_intent → inference_gate
+    #
+    # inference_gate is the SINGLE fan-out point for both parallel LLM calls.
+    # Nothing else feeds into infer_behavioral_evaluation or
+    # infer_compliance_evaluation — this guarantees inference_ready receives
+    # exactly 2 triggers per run, preventing duplicate tail execution.
     builder.add_conditional_edges(
         "detect_intent",
         _booking_router,
         {
             "booking":      "extract_appointment_details",
-            "skip_booking": "infer_behavioral_evaluation",
+            "skip_booking": "inference_gate",
         },
     )
     builder.add_edge("extract_appointment_details", "verify_appointment_in_db")
@@ -275,15 +290,15 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_conditional_edges(
         "infer_reservation_evaluation",
         _error_router,
-        {"continue": "infer_behavioral_evaluation", "handle_error": "handle_error"},
+        {"continue": "inference_gate", "handle_error": "handle_error"},
     )
 
-    # ── Step 3: behavioral + compliance run in parallel ────────────────────
+    # ── Step 3: inference_gate → behavioral + compliance (parallel) ────────
     #
-    # Both receive a single incoming edge from detect_intent/reservation branch.
-    # criteria_ready also fans into them so they wait for all loaders.
-    builder.add_edge("criteria_ready", "infer_behavioral_evaluation")
-    builder.add_edge("criteria_ready", "infer_compliance_evaluation")
+    # Both nodes have exactly ONE incoming edge: from inference_gate.
+    # No other node feeds them, so inference_ready can only fire once.
+    builder.add_edge("inference_gate", "infer_behavioral_evaluation")
+    builder.add_edge("inference_gate", "infer_compliance_evaluation")
     # infer_script_matching excluded (disabled) — add back here when re-enabled
 
     # ── Step 4: behavioral + compliance fan-in → inference_ready ──────────
@@ -315,7 +330,8 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     )
 
     # Safe tail nodes (no error conditions possible)
-    builder.add_edge("integrity_check", "finalize")
+    builder.add_edge("integrity_check", "save_to_database")
+    builder.add_edge("save_to_database", "finalize")
     builder.add_edge("finalize", END)
     builder.add_edge("handle_error", END)
 

@@ -1,0 +1,18 @@
+graph TD
+    A[load_call] --> B[load_behavioral_criteria]
+    A --> C[load_compliance_pillars]
+    A --> D[load_script_templates]
+    A --> E[load_scoring_weights]
+
+    B & C & D & E --> F["infer_behavioral_evaluation
+LLM Call A"]
+    B & C & D & E --> G["infer_compliance_evaluation
+LLM Call B"]
+    B & C & D & E --> H["infer_script_matching
+LLM Call C"]
+
+    F & G & H --> I["infer_overall_scoring
+LLM Call D"]
+    I --> J[aggregate_results]
+    J --> K[integrity_check]
+    K --> L[finalize]
