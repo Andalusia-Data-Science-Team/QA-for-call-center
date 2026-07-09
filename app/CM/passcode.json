@@ -1,0 +1,11 @@
+{
+    "DB_NAMES": {
+        "ROBINDWH": {
+            "Server": "ROBINDWH.ROBINHQ.COM",
+            "Database": "RHQ_Andalusia_Group",
+            "UID": "your_username",
+            "PWD": "your_password",
+            "driver": "{ODBC Driver 17 for SQL Server}"
+        }
+    }
+}
