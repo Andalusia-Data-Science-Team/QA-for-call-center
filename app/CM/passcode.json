@@ -1,11 +1,11 @@
 {
     "DB_NAMES": {
-        "ROBINDWH": {
-            "Server": "ROBINDWH.ROBINHQ.COM",
-            "Database": "RHQ_Andalusia_Group",
-            "UID": "your_username",
-            "PWD": "your_password",
-            "driver": "{ODBC Driver 17 for SQL Server}"
+        "CM": {
+          "Database": "master",
+          "UID": "Robin_ReadOnly_User",
+          "PWD": "CM@123",
+          "Server": "ksa-booking-01",
+          "driver": "{ODBC Driver 17 for SQL Server}"
         }
     }
 }

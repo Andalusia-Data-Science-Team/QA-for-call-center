@@ -19,8 +19,8 @@ DB_KEY = "CM"  # Key in passcode.json DB_NAMES section
 # Fallback configuration (if passcode.json not found)
 DB_SERVER = "ROBINDWH.ROBINHQ.COM"
 DB_NAME = "RHQ_Andalusia_Group"
-SQL_FILE = "SQL/CM_users.sql"
-OUTPUT_FILE = f"CM_Users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+SQL_FILE = "/home/ai/Workspace/Rafik/QA_System-main/app/SQL/CM_users.sql"
+OUTPUT_FILE = f"CM_Users.xlsx"
 
 # Optional: Override with environment variables
 DB_USERNAME = os.getenv("DB_USERNAME")

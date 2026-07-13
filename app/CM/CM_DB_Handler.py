@@ -3,6 +3,7 @@ import pandas as pd
 import json
 from pathlib import Path
 import os
+import re
 from datetime import datetime
 
 class CMDatabaseHandler:
@@ -98,12 +99,13 @@ class CMDatabaseHandler:
             print(f"✗ Connection failed: {e}")
             return False
     
-    def execute_query_from_file(self, query_file):
+    def execute_query_from_file(self, query_file, params=None):
         """
         Execute SQL query from a file and return results as DataFrame
         
         Args:
             query_file: Path to SQL file
+            params: Dictionary of parameters for query substitution
             
         Returns:
             pandas DataFrame with query results
@@ -116,6 +118,24 @@ class CMDatabaseHandler:
                 query = f.read()
             
             print(f"Executing query from: {query_file}")
+            
+            # Substitute parameters if provided
+            if params:
+                for key, value in params.items():
+                    # Convert None to NULL string for SQL, otherwise wrap in quotes
+                    if value is None:
+                        sql_value = "NULL"
+                    elif isinstance(value, (int, float)):
+                        sql_value = str(value)
+                    else:
+                        # Escape single quotes in string values
+                        sql_value = f"'{str(value).replace(chr(39), chr(39)+chr(39))}'"
+                    
+                    # Replace only :ParameterName patterns (not @ParameterName which are variable names)
+                    query = re.sub(rf':\s*{re.escape(key)}\b', sql_value, query, flags=re.IGNORECASE)
+                
+                print(f"Parameters substituted: {list(params.keys())}")
+            
             df = pd.read_sql(query, self.connection)
             print(f"✓ Query executed successfully. Retrieved {len(df)} rows.")
             return df
@@ -158,11 +178,11 @@ def main():
     """Main function to execute the workflow"""
     
     # Configuration
-    SQL_FILE = "SQL/CM_users.sql"
+    SQL_FILE = "../SQL/CM_users.sql"
     OUTPUT_FILE = "CM_Users_Export.xlsx"
     
     # Method 1: Load credentials from passcode.json
-    PASSCODE_FILE = "passcode.json"  # Update path if needed
+    PASSCODE_FILE = "../passcode.json"  # Update path if needed
     DB_KEY = "ROBINDWH"  # Update to match your key in passcode.json
     
     # Method 2: Direct configuration
