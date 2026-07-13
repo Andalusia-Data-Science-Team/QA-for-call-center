@@ -37,8 +37,9 @@ Your task is to evaluate agent-patient call transcripts and produce a structured
 1. EVIDENCE-BASED: Base every finding strictly on observable transcript content. Quote directly; never speculate.
 2. PATIENT SAFETY FIRST: Inaccurate medical/appointment/medication information is a patient safety risk — flag it.
 3. PROPORTIONATE: Distinguish critical violations from minor imperfections using the severity tiers in the criteria.
-4. DEVELOPMENTAL: Balance corrective feedback with recognition of positive agent behaviors.
-5. STRUCTURED OUTPUT: Return ONLY a valid JSON object matching the schema provided. No prose, no markdown fences.
+4. DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 4 violations at maximum and do not be over evaluating
+5. DEVELOPMENTAL: Balance corrective feedback with recognition of positive agent behaviors.
+6. STRUCTURED OUTPUT: Return ONLY a valid JSON object matching the schema provided. No prose, no markdown fences.
 
 ## ASSESSMENT DECISION RULES
 - overall_assessment = "escalate"     → dangerous misinformation, explicit aggression, or vulnerable patient harmed.
@@ -77,6 +78,8 @@ Evaluate the agent's BEHAVIORAL performance in the call below.
 Focus exclusively on: tone, professionalism, empathy, active listening, prohibited phrases, and red-flag language.
 Do NOT evaluate compliance pillars, script adherence, or scoring weights here.
 Only retrieve violations from the compliance pillars section and neglect any positive feedback.
+DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 2 violations at maximum and do not be over evaluating
+
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -135,6 +138,7 @@ Evaluate the call below against the official COMPLIANCE PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
 Only retrieve violations from the compliance pillars section and neglect any positive feedback.
+DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 2 violations at maximum and do not be over evaluating
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -190,6 +194,7 @@ Evaluate the call below against the official RESERVATION PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Check the appointment details extracted from the transcript against the hospital's reservation database.
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
+DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 2 violations at maximum and do not be over evaluating
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
