@@ -505,57 +505,93 @@ async def aggregate_results(state: AgentState) -> dict:
     ──────────────
     • compliance_flags  = behavioral_flags  (Node A)
                         + compliance_flags  (Node B)
-                        + script_flags      (Node C)
-    • agent_performance = professionalism_score (A)
-                        + accuracy_score        (C)
-                        + resolution_score      (D)
-                        + strengths             (A)
-                        + improvements          (A)
+                        + reservation_flags (Node C)
+                        + script_flags      (Node D)
+    • agent_performance = professionalism_score  (A)
+                        + Agent Classification   (scoring)
+                        + Profiling Comment      (scoring)
+                        + strengths              (A)
+                        + improvements           (A)
+    • resolution_score                           ← top-level from Node D (scoring)
     • overall_assessment, assessment_reasoning,
       escalation_required, escalation_reason     ← Node D (scoring)
     """
     call_id = state["call"].call_id
 
-    behavioral = state.get("behavioral_eval") or {}
-    compliance = state.get("compliance_eval") or {}
-    script     = state.get("script_eval")     or {}
-    scoring    = state.get("scoring_eval")    or {}
+    behavioral  = state.get("behavioral_eval")  or {}
+    compliance  = state.get("compliance_eval")  or {}
+    reservation = state.get("reservation_eval") or {}
+    script      = state.get("script_eval")      or {}
+    scoring     = state.get("scoring_eval")     or {}
 
-    # Merge all compliance flag lists from the three focused evaluations
+    # Merge all compliance flag lists from all focused evaluations
     all_flags: list[dict] = (
         behavioral.get("behavioral_flags", [])
         + compliance.get("compliance_flags", [])
+        + reservation.get("reservation_flags", [])
         + script.get("script_flags", [])
+        + scoring.get("compliance_flags", [])
     )
 
+    # Deduplicate flags by (type + transcript_excerpt[:80])
+    seen: set[tuple] = set()
+    deduped_flags: list[dict] = []
+    for flag in all_flags:
+        key = (flag.get("type"), flag.get("transcript_excerpt", "")[:80])
+        if key not in seen:
+            seen.add(key)
+            deduped_flags.append(flag)
+
+    scoring_perf: dict = scoring.get("agent_performance", {})
+
     merged: dict = {
-        "call_id": call_id,
-        "agent_name": state["call"].agent_name,
-        "overall_assessment": scoring.get("overall_assessment", "needs_review"),
+        "call_id":              call_id,
+        "agent_name":           state["call"].agent_name,
+        "overall_assessment":   scoring.get("overall_assessment", "needs_review"),
         "assessment_reasoning": scoring.get("assessment_reasoning", ""),
-        "compliance_flags": all_flags,
+        "compliance_flags":     deduped_flags,
         "agent_performance": {
-            "professionalism_score": _norm_score(behavioral.get("professionalism_score", 0.5)),
-            "accuracy_score":        _norm_score(script.get("accuracy_score", 0.5)),
-            "resolution_score":      _norm_score(scoring.get("resolution_score", 0.5)),
-            "strengths":    behavioral.get("strengths", []),
-            "improvements": behavioral.get("improvements", []),
+            # professionalism_score — prefer behavioral node, fall back to scoring
+            "professionalism_score": _norm_score(
+                behavioral.get("professionalism_score")
+                or scoring_perf.get("professionalism_score", 0.5)
+            ),
+            # Agent Classification — required, from scoring node
+            "Agent Classification": (
+                scoring_perf.get("Agent Classification")
+                or scoring.get("Agent Classification")
+                or "D"
+            ),
+            # Profiling Comment — optional, null when absent
+            "Profiling Comment": (
+                scoring_perf.get("Profiling Comment")
+                or scoring.get("Profiling Comment")
+                or None
+            ),
+            # strengths & improvements — prefer behavioral node
+            "strengths":    behavioral.get("strengths",    scoring_perf.get("strengths",    [])),
+            "improvements": behavioral.get("improvements", scoring_perf.get("improvements", [])),
         },
+        # resolution_score and accuracy_score removed
         "escalation_required": scoring.get("escalation_required", False),
         "escalation_reason":   scoring.get("escalation_reason"),
     }
 
     logger.debug(
-        "aggregate_results | call_id=%s flags=%d assessment=%s",
-        call_id, len(all_flags), merged["overall_assessment"],
+        "aggregate_results | call_id=%s flags=%d assessment=%s classification=%s profiling=%s",
+        call_id,
+        len(deduped_flags),
+        merged["overall_assessment"],
+        merged["agent_performance"].get("Agent Classification"),
+        merged["agent_performance"].get("Profiling Comment"),
     )
 
     try:
         result = QAAnalysisResult.model_validate(merged)
     except ValidationError as exc:
         logger.error(
-            "aggregate_results Pydantic error | call_id=%s errors=%s",
-            call_id, exc.errors(),
+            "aggregate_results Pydantic error | call_id=%s errors=%s merged_keys=%s",
+            call_id, exc.errors(), list(merged.keys()),
         )
         return {
             "error": f"Aggregated result failed schema validation: {exc}",

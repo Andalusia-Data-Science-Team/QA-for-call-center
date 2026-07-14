@@ -235,22 +235,6 @@ function showError(msg) {
     el.textContent   = msg || '';
 }
 
-/* ── load email list on page load ── */
-async function loadEmails() {
-    try {
-        const res  = await fetch(`${API_BASE}/agents/emails`);
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-
-        const sel = $('emailSelect');
-        sel.innerHTML = '<option value="">— select agent email —</option>' +
-            data.emails.map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
-    } catch (err) {
-        $('emailSelect').innerHTML = '<option value="">⚠ Could not load emails</option>';
-        showError('Failed to load agent emails: ' + err.message);
-    }
-}
-
 /* ── enable Run button only when both fields are filled ── */
 function checkReady() {
     const ok = $('emailSelect').value && $('filterDate').value;
@@ -259,9 +243,44 @@ function checkReady() {
 $('emailSelect').addEventListener('change', checkReady);
 $('filterDate').addEventListener('change', checkReady);
 
-/* ── set today as default date ── */
+/* ── set today as default date & trigger checkReady ── */
 const today = new Date().toISOString().slice(0,10);
 $('filterDate').value = today;
+
+/* ── load email list on page load ── */
+async function loadEmails() {
+    const sel = $('emailSelect');
+    sel.innerHTML = '<option value="">— loading… —</option>';
+    showError('');
+
+    try {
+        const res = await fetch(`${API_BASE}/agents/emails`);
+
+        if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
+
+        const data = await res.json();
+
+        /* support both { emails: [...] } and a bare array */
+        const list = Array.isArray(data) ? data : (data.emails ?? data.data ?? []);
+
+        if (!list.length) {
+            sel.innerHTML = '<option value="">— no agents found —</option>';
+            showError('No agent emails were returned by the server.');
+            return;
+        }
+
+        sel.innerHTML =
+            '<option value="">— select agent email —</option>' +
+            list.map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
+
+    } catch (err) {
+        sel.innerHTML = '<option value="">⚠ Could not load emails</option>';
+        showError('Failed to load agent emails: ' + err.message);
+        console.error('[loadEmails]', err);
+    } finally {
+        checkReady();   /* re-evaluate button state after dropdown is populated */
+    }
+}
 
 /* ── run pipeline ── */
 $('runBtn').addEventListener('click', async () => {
@@ -269,7 +288,7 @@ $('runBtn').addEventListener('click', async () => {
     const date  = $('filterDate').value;
     if (!email || !date) return;
 
-    $('runBtn').disabled      = true;
+    $('runBtn').disabled = true;
     $('resultsSection').style.display = 'none';
     showError('');
     showStatus(true, `Retrieving chats for ${email} on ${date}…`);
@@ -289,12 +308,16 @@ $('runBtn').addEventListener('click', async () => {
 
     } catch (err) {
         showError('Error: ' + err.message);
+        console.error('[runAnalysis]', err);
     } finally {
         showStatus(false);
         $('runBtn').disabled = false;
         checkReady();
     }
 });
+
+/* ── kick off email load ── */
+loadEmails();
 
 /* ── render results ── */
 function renderResults(data) {
@@ -327,8 +350,26 @@ function renderResults(data) {
 }
 
 function callRecordHTML(r, idx) {
-    const perf   = r.agent_performance || {};
-    const flags  = r.compliance_flags  || [];
+    const perf  = r.agent_performance || {};
+    const flags = r.compliance_flags  || [];
+
+    const cls       = perf['Agent Classification'] || perf.agent_classification || '';
+    const clsColour = { A:'#22543d', B:'#744210', C:'#e65100', D:'#742a2a' }[cls] || '#2d3748';
+    const clsBg     = { A:'#c6f6d5', B:'#fefcbf', C:'#feebc8', D:'#fed7d7' }[cls] || '#e2e8f0';
+
+    const classificationBadge = cls
+        ? `<span style="background:${clsBg};color:${clsColour};padding:3px 12px;border-radius:12px;font-weight:700;font-size:.85rem;">
+               Class ${esc(cls)}
+           </span>`
+        : '';
+
+    /* Profiling comment — only rendered when present */
+    const profiling    = perf['Profiling Comment'] || perf.profiling_comment || '';
+    const profilingRow = profiling
+        ? `<div class="mini-score" style="margin-top:6px;">
+               🏷 Profiling: <b>${esc(profiling)}</b>
+           </div>`
+        : '';
 
     return `
     <details class="call-record" ${idx === 0 ? 'open' : ''}>
@@ -337,8 +378,11 @@ function callRecordHTML(r, idx) {
                 <span class="call-record-id">${esc(r.call_id)}</span>
                 <span class="call-record-date">${esc(r.call_date || '')}</span>
             </span>
-            <span class="status-badge ${statusClass(r.overall_assessment)}">
-                ${esc((r.overall_assessment||'error').toUpperCase().replace(/_/g,' '))}
+            <span style="display:flex; gap:8px; align-items:center;">
+                ${classificationBadge}
+                <span class="status-badge ${statusClass(r.overall_assessment)}">
+                    ${esc((r.overall_assessment||'error').toUpperCase().replace(/_/g,' '))}
+                </span>
             </span>
         </summary>
         <div class="call-record-body">
@@ -346,8 +390,7 @@ function callRecordHTML(r, idx) {
 
             <div class="mini-scores">
                 <div class="mini-score">Professionalism: <b>${pct(perf.professionalism_score)}</b></div>
-                <div class="mini-score">Accuracy:        <b>${pct(perf.accuracy_score)}</b></div>
-                <div class="mini-score">Resolution:      <b>${pct(perf.resolution_score)}</b></div>
+                ${profilingRow}
             </div>
 
             ${flags.map(f => `
@@ -371,8 +414,6 @@ function callRecordHTML(r, idx) {
         </div>
     </details>`;
 }
-
-loadEmails();
 </script>
 </body>
 </html>

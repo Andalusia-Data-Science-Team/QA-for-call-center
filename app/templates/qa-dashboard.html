@@ -291,7 +291,22 @@
             <div class="card-header">
                 <h2 class="card-title">📊 Performance Metrics</h2>
             </div>
+
+            <!-- Professionalism score -->
             <div class="performance-metrics" id="performanceMetrics"></div>
+
+            <!-- Agent Classification & Profiling Comment -->
+            <div class="classification-grid" id="agentClassificationBox">
+                <div class="classification-card" id="classificationCard">
+                    <div class="classification-label">Agent Classification</div>
+                    <div class="classification-value" id="agentClassification">—</div>
+                </div>
+                <div class="classification-card" id="profilingCard" style="display:none;">
+                    <div class="classification-label">Profiling Comment</div>
+                    <div class="profiling-value" id="profilingComment">—</div>
+                </div>
+            </div>
+
             <div class="strengths-improvements">
                 <div class="list-box strengths-box">
                     <h3>✅ Strengths</h3>
@@ -445,15 +460,39 @@
             <div class="info-item"><div class="info-label">Analysis Date</div><div class="info-value">${new Date().toISOString().slice(0,10)}</div></div>
         `;
 
-        /* 2 — performance metrics */
+        /* 2 — professionalism score metric card only */
         const perf = d.agent_performance || {};
         $('performanceMetrics').innerHTML = `
-            <div class="metric-card"><div class="metric-label">Professionalism</div><div class="metric-value">${pct(perf.professionalism_score ?? 0)}</div></div>
-            <div class="metric-card"><div class="metric-label">Accuracy</div><div class="metric-value">${pct(perf.accuracy_score ?? 0)}</div></div>
-            <div class="metric-card"><div class="metric-label">Resolution</div><div class="metric-value">${pct(perf.resolution_score ?? 0)}</div></div>
+            <div class="metric-card">
+                <div class="metric-label">Professionalism Score</div>
+                <div class="metric-value">${pct(perf.professionalism_score ?? 0)}</div>
+            </div>
         `;
 
-        $('strengthsList').innerHTML   = (perf.strengths    || []).map(s => `<li>${esc(s)}</li>`).join('');
+        /* Agent Classification — colour coded */
+        const colours   = { A: '#22543d', B: '#744210', C: '#e65100', D: '#742a2a' };
+        const bgColours = { A: '#c6f6d5', B: '#fefcbf', C: '#feebc8', D: '#fed7d7' };
+        const cls = perf['Agent Classification'] || perf.agent_classification || '';
+
+        const clsEl = $('agentClassification');
+        clsEl.textContent = cls || '—';
+        if (colours[cls]) {
+            $('classificationCard').style.background   = bgColours[cls];
+            $('classificationCard').style.borderColor  = colours[cls];
+            clsEl.style.color = colours[cls];
+        }
+
+        /* Profiling Comment — show only when present */
+        const profiling = perf['Profiling Comment'] || perf.profiling_comment || '';
+        const profCard  = $('profilingCard');
+        if (profiling) {
+            $('profilingComment').textContent = profiling;
+            profCard.style.display = 'block';
+        } else {
+            profCard.style.display = 'none';
+        }
+
+        $('strengthsList').innerHTML    = (perf.strengths    || []).map(s => `<li>${esc(s)}</li>`).join('');
         $('improvementsList').innerHTML = (perf.improvements || []).map(s => `<li>${esc(s)}</li>`).join('');
 
         /* 3 — compliance flags */

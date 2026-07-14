@@ -77,6 +77,11 @@ async def agents_dashboard_page(request: Request):
     return templates.TemplateResponse(request=request, name="agents-dashboard.html")
 
 
+@app.get("/qa-supervisor.html", response_class=HTMLResponse)
+async def qa_supervisor_page(request: Request):
+    return templates.TemplateResponse(request=request, name="qa-supervisor.html")
+
+
 # ── Agent email list ──────────────────────────────────────────────────────────
 
 @app.get("/agents/emails")

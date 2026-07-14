@@ -36,10 +36,25 @@ Your task is to evaluate agent-patient call transcripts and produce a structured
 ## CORE PRINCIPLES
 1. EVIDENCE-BASED: Base every finding strictly on observable transcript content. Quote directly; never speculate.
 2. PATIENT SAFETY FIRST: Inaccurate medical/appointment/medication information is a patient safety risk — flag it.
-3. PROPORTIONATE: Distinguish critical violations from minor imperfections using the severity tiers in the criteria.
-4. DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 4 violations at maximum and do not be over evaluating
+3. PROPORTIONATE: Distinguish critical violations from minor imperfections using the severity tiers below.
+4. DEFINED SCOPE: Mention only the most critical severe violations. Report 0 to 4 violations at maximum. Do NOT over-evaluate.
 5. DEVELOPMENTAL: Balance corrective feedback with recognition of positive agent behaviors.
 6. STRUCTURED OUTPUT: Return ONLY a valid JSON object matching the schema provided. No prose, no markdown fences.
+
+## SEVERITY TIER DEFINITIONS  (apply strictly)
+- critical   → Direct patient safety risk: wrong medication name/dose, wrong doctor, dangerous misinformation,
+               explicit patient aggression ignored, or a vulnerable patient actively harmed.
+               A callback promise, a hold, or an unresolved prior inquiry is NEVER critical on its own.
+- positive   → Agent exceeded expectations or demonstrated exemplary behavior.
+
+## WHAT IS NOT A VIOLATION
+- Promising a callback within a stated time window (30 min, 1 hour, etc.) is standard practice — NOT a violation
+  unless the agent gave a demonstrably false or impossible commitment.
+- A patient reporting a previous unresolved inquiry is historical context — do NOT penalize the current agent
+  for prior team failures unless this agent also fails to address the issue in the current call.
+- Asking a clarifying question or deferring to a specialist is good practice — NOT "failure to identify problem".
+- Short transcripts or single-turn exchanges does not count as a violation.
+
 
 ## ASSESSMENT DECISION RULES
 - overall_assessment = "escalate"     → dangerous misinformation, explicit aggression, or vulnerable patient harmed.
@@ -54,7 +69,7 @@ Your task is to evaluate agent-patient call transcripts and produce a structured
 
 All specific violation definitions, behavioral standards, script templates, and scoring weights
 are provided in the user message below. Evaluate strictly against those criteria.
-just be realistic not overly harsh. If the transcript is too short to assess a dimension, score it at 0.5 and note that in the reasoning.
+Be realistic, not overly harsh.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,17 +84,16 @@ def build_behavioral_prompt(
     call: CallTranscript,
     behavioral_criteria: str = "",
 ) -> str:
-    """
-    Prompt focused SOLELY on behavioral standards.
-    Returns a JSON fragment with professionalism flags and agent strengths/improvements.
-    """
     return f"""\
 Evaluate the agent's BEHAVIORAL performance in the call below.
 Focus exclusively on: tone, professionalism, empathy, active listening, prohibited phrases, and red-flag language.
 Do NOT evaluate compliance pillars, script adherence, or scoring weights here.
-Only retrieve violations from the compliance pillars section and neglect any positive feedback.
-DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 2 violations at maximum and do not be over evaluating
 
+## SEVERITY REMINDER
+- critical   → patient safety risk ONLY (wrong drug, wrong dose, aggression ignored).
+- NOT a violation: callback promises, hold times, prior team failures reported by the patient.
+
+DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT flag normal service interactions as violations.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -108,7 +122,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "behavioral_flags": [
     {{
       "type": "<C2C | C2B | NC>",
-      "severity": "<critical | moderate | minor | positive>",
+      "severity": "<critical | positive>",
       "description": "<1-2 sentences citing the specific behavioral standard violated or met>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -129,16 +143,28 @@ def build_compliance_prompt(
     call: CallTranscript,
     compliance_pillars: str = "",
 ) -> str:
-    """
-    Prompt focused SOLELY on the 15 compliance pillars.
-    Returns a JSON fragment with all pillar violations and an escalation signal.
-    """
     return f"""\
 Evaluate the call below against the official COMPLIANCE PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
-Only retrieve violations from the compliance pillars section and neglect any positive feedback.
-DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 2 violations at maximum and do not be over evaluating
+
+## SEVERITY REMINDER — apply before flagging anything as critical
+- critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
+               dangerous medical misinformation given as fact.
+- moderate   → process failure without safety risk.
+- minor      → small deviation, negligible impact.
+- NOT a violation: a callback promise within a stated window, a patient citing a prior unresolved inquiry,
+  the agent deferring a medication availability check to a specialist or pharmacy team.
+
+## WHAT DOES NOT CONSTITUTE "INACCURATE INFORMATION"
+  Saying "we will contact you within 30 minutes" is a service commitment — not inaccurate information.
+  Only flag information accuracy if the agent stated a medically or factually wrong claim as truth.
+
+## WHAT DOES NOT CONSTITUTE "FAILED TROUBLESHOOTING"
+  If the agent acknowledged the patient's issue and gave a concrete next step (callback, escalation,
+  transfer), troubleshooting was NOT failed — even if the root cause was not resolved in this call.
+
+DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT over-evaluate.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -166,7 +192,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
-      "severity": "<critical | moderate | minor | positive>",
+      "severity": "<critical | positive>",
       "description": "<1-2 sentences referencing the exact pillar name>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -185,16 +211,29 @@ def build_reservation_prompt(
     appointment_verification: str,
     reservation_pillars: str = "",
 ) -> str:
-    """
-    Prompt focused SOLELY on the 6 reservation pillars.
-    Returns a JSON fragment with all pillar violations and an escalation signal.
-    """
     return f"""\
 Evaluate the call below against the official RESERVATION PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Check the appointment details extracted from the transcript against the hospital's reservation database.
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
-DEFINED SCOPE: Mention only the critical sever violations, Mention from 0 to 2 violations at maximum and do not be over evaluating
+
+## SEVERITY REMINDER — apply before flagging anything as critical
+- critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
+               dangerous medical misinformation given as fact.
+- moderate   → process failure without safety risk.
+- minor      → small deviation, negligible impact.
+- NOT a violation: a callback promise within a stated window, a patient citing a prior unresolved inquiry,
+  the agent deferring a medication availability check to a specialist or pharmacy team.
+
+## WHAT DOES NOT CONSTITUTE "INACCURATE INFORMATION"
+  Saying "we will contact you within 30 minutes" is a service commitment — not inaccurate information.
+  Only flag information accuracy if the agent stated a medically or factually wrong claim as truth.
+
+## WHAT DOES NOT CONSTITUTE "FAILED TROUBLESHOOTING"
+  If the agent acknowledged the patient's issue and gave a concrete next step (callback, escalation,
+  transfer), troubleshooting was NOT failed — even if the root cause was not resolved in this call.
+
+DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT over-evaluate.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -227,7 +266,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
-      "severity": "<critical | moderate | minor | positive>",
+      "severity": "<critical | positive>",
       "description": "<1-2 sentences referencing the exact pillar name>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -245,10 +284,6 @@ def build_script_prompt(
     call: CallTranscript,
     script_templates: str = "",
 ) -> str:
-    """
-    Prompt focused SOLELY on greeting/closing script adherence.
-    Returns a JSON fragment with script-adherence flags and an accuracy score.
-    """
     return f"""\
 Evaluate the agent's adherence to the APPROVED SCRIPT TEMPLATES in the call below.
 Evaluate only the greeting and closing sections. Do not strictly enforce the exact scripts provided; instead, assess whether the conversation aligns with their intended purpose and conveys the expected concepts.
@@ -281,7 +316,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "script_flags": [
     {{
       "type": "<C2C | NC>",
-      "severity": "<critical | moderate | minor | positive>",
+      "severity": "<critical | positive>",
       "description": "<1-2 sentences — state which script element was used/missed>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -316,11 +351,25 @@ def build_scoring_prompt(
     return f"""\
 You are producing the FINAL scoring and overall assessment for a call that has already been
 evaluated in three separate passes. Your job is to:
-  1. Review the three sub-evaluation results provided below.
+  1. Review the sub-evaluation results provided below.
   2. Apply the scoring weights to produce the final dimension scores.
   3. Determine the overall_assessment ("pass" / "needs_review" / "escalate").
   4. Write the assessment_reasoning (2-4 sentences citing specific evidence).
   5. Confirm or correct escalation_required based on the compliance results.
+  6. Merge all compliance_flags from all sub-evaluations into a single deduplicated list.
+  7. Aggregate strengths and improvements from behavioral sub-evaluation.
+  8. Assign Agent Classification based on the violation counts below.
+  9. Assign Profiling Comment ONLY if there is a clear performance issue — otherwise omit it (null).
+
+Agent Classification criteria:
+A  -> No C2C, C2B, C2Com or NC violations
+B  -> Less than 2 NC violations
+C  -> 1 Critical violation  OR  more than 2 NC violations
+D  -> More than 1 Critical violation
+
+Profiling Comment options (use ONLY one of these exact strings, or null if none applies):
+"Poor Knowledge" | "Poor System" | "Poor Process" | "Poor Report" |
+"Poor Selling Skills" | "Poor Behavior" | "Poor Soft Skills"
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -337,27 +386,22 @@ SCORING WEIGHTS  (apply when computing dimension scores)
 {scoring_weights or "(not loaded)"}
 
 ════════════════════════════════════════════════════════════
-SUB-EVALUATION 1 — BEHAVIORAL  
+SUB-EVALUATION 1 — BEHAVIORAL
 ════════════════════════════════════════════════════════════
 {behavioral_summary or "(not available)"}
 
 ════════════════════════════════════════════════════════════
-SUB-EVALUATION 2 — COMPLIANCE PILLARS 
+SUB-EVALUATION 2 — COMPLIANCE PILLARS
 ════════════════════════════════════════════════════════════
 {compliance_summary or "(not available)"}
 
 ════════════════════════════════════════════════════════════
-SUB-EVALUATION 3 — COMPLIANCE PILLARS 
+SUB-EVALUATION 3 — RESERVATION PILLARS
 ════════════════════════════════════════════════════════════
 {reservation_summary or "(not available)"}
 
 ════════════════════════════════════════════════════════════
-SUB-EVALUATION 4 — RESERVATION PILLARS  
-════════════════════════════════════════════════════════════
-{reservation_summary or "(not available)"}
-
-════════════════════════════════════════════════════════════
-SUB-EVALUATION 5 — SCRIPT MATCHING  
+SUB-EVALUATION 4 — SCRIPT MATCHING
 ════════════════════════════════════════════════════════════
 {script_summary or "(not available)"}
 
@@ -369,7 +413,21 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "agent_name": "{call.agent_name}",
   "overall_assessment": "<pass | needs_review | escalate>",
   "assessment_reasoning": "<2-4 sentences citing specific transcript evidence>",
-  "resolution_score": <0.0–1.0>,
+  "compliance_flags": [
+    {{
+      "type": "<C2Com | C2C | C2B | NC>",
+      "severity": "<critical | positive>",
+      "description": "<1-2 sentences — reference the pillar name if a violation>",
+      "transcript_excerpt": "<verbatim excerpt>"
+    }}
+  ],
+  "agent_performance": {{
+    "professionalism_score": <0.0–1.0>,
+    "Agent Classification": "<A | B | C | D>",
+    "Profiling Comment": "<one of the 7 options above, or null>",
+    "strengths": ["<strength 1>", "<strength 2>"],
+    "improvements": ["<improvement 1>", "<improvement 2>"]
+  }},
   "escalation_required": <true | false>,
   "escalation_reason": "<reason string or null>"
 }}
@@ -396,6 +454,11 @@ def build_user_prompt(
     """
     return f"""\
 Analyze the following call transcript and return a JSON quality report.
+Agent Classification is calculated based on the following criteria:
+A	-> No C2C,C2B,C2COM and NC violation Per Transaction	
+B	-> Less than 2 NC violations Per Transaction	
+C	-> 1 Critical Per Transaction	More than 2 NC violations Per Transaction
+D	-> More than 1 Critical Per Transaction	
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -449,8 +512,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   ],
   "agent_performance": {{
     "professionalism_score": <0.0–1.0>,
-    "accuracy_score": <0.0–1.0>,
-    "resolution_score": <0.0–1.0>,
+    "Agent Classification": "<A | B | C | D>",
+    "Profiling Comment": "<one of the 7 options above, or null>",
     "strengths": ["<strength 1>", "<strength 2>"],
     "improvements": ["<improvement 1>", "<improvement 2>"]
   }},

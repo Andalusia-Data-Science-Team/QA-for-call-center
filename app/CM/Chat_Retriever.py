@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import argparse
 import warnings
+import logging
 from typing import Optional
 
 project_root = Path.cwd().parent.parent.resolve()
@@ -12,6 +13,15 @@ if str(project_root) not in sys.path:
 from app.models.input import BatchCallTranscripts, CallTranscript
 from pydantic import ValidationError
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Columns that must be strings — NaN → empty string / sensible default
+_STR_COLUMNS = [
+    "Content", "SenderType", "OwnerName", "RelationName",
+    "SenderIdName", "ConversationChannel", "Scope",
+    "ConversationState", "WebStoreName", "OwnerId", "RelationId",
+]
 
 
 def get_db_handler(json_file: str = "passcode.json", db_key: str = "CM") -> CMDatabaseHandler:
@@ -43,8 +53,28 @@ def retrieve_chats_by_agent_email(
         handler.close()
 
 
+def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Coerce NaN floats → empty strings for all text columns so that
+    field validators calling .strip() never receive a float.
+    """
+    df = df.copy()
+    for col in _STR_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
+
+    # Any remaining object columns that may hold mixed str/float
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].apply(
+            lambda v: "" if (isinstance(v, float) and pd.isna(v)) else v
+        )
+
+    return df
+
+
 def _convert_df_to_batch(df: pd.DataFrame) -> BatchCallTranscripts:
-    calls = []
+    df = _sanitize_df(df)
+    calls  = []
     errors = []
 
     for uid, group in df.groupby("UniqueId", sort=False):
@@ -53,11 +83,14 @@ def _convert_df_to_batch(df: pd.DataFrame) -> BatchCallTranscripts:
             calls.append(CallTranscript.from_cm_rows(rows))
         except (ValidationError, ValueError) as exc:
             errors.append({"UniqueId": uid, "error": str(exc)})
+            logger.warning("Skipped conversation %s: %s", uid, exc)
 
-    if errors:
-        import logging
-        for e in errors:
-            logging.warning("Skipped conversation %s: %s", e["UniqueId"], e["error"])
+    if not calls:
+        raise ValueError(
+            f"No valid conversations could be parsed. "
+            f"{len(errors)} conversation(s) failed validation:\n" +
+            "\n".join(f"  {e['UniqueId']}: {e['error']}" for e in errors)
+        )
 
     return BatchCallTranscripts(calls=calls)
 
@@ -70,7 +103,8 @@ def df_to_batch(df: pd.DataFrame) -> BatchCallTranscripts:
     first_uids = set(uids[:50])
     df_chunk = df.loc[df["UniqueId"].isin(first_uids)]
     warnings.warn(
-        f"Input contains {len(uids)} conversations; truncating to first 50 unique conversations to satisfy BatchCallTranscripts limit."
+        f"Input contains {len(uids)} conversations; truncating to first 50 "
+        f"unique conversations to satisfy BatchCallTranscripts limit."
     )
     return _convert_df_to_batch(df_chunk)
 
@@ -86,7 +120,7 @@ def main():
     parser = argparse.ArgumentParser(description="Retrieve chats by agent email and save as JSON.")
     parser.add_argument("--agent-email", required=True, help="Agent email to filter chat transcripts.")
     parser.add_argument("--filter-date", required=True, help="Date filter for the chat query.")
-    parser.add_argument("--output", default= "data/chats.json", help="Output JSON path.")
+    parser.add_argument("--output", default="data/chats.json", help="Output JSON path.")
     parser.add_argument("--json-file", default="passcode.json", help="Credentials JSON file.")
     parser.add_argument("--db-key", default="CM", help="Database key in the credentials file.")
     args = parser.parse_args()
