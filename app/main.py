@@ -67,18 +67,18 @@ async def dashboard(request: Request):
     return templates.TemplateResponse(request=request, name="qa-dashboard.html")
 
 
-@app.get("/qa-dashboard.html", response_class=HTMLResponse)
-async def qa_dashboard_page(request: Request):
+@app.get("/qa-dashboard", response_class=HTMLResponse)
+async def qa_dashboard_page_short(request: Request):
     return templates.TemplateResponse(request=request, name="qa-dashboard.html")
 
 
-@app.get("/agents-dashboard.html", response_class=HTMLResponse)
-async def agents_dashboard_page(request: Request):
+@app.get("/agents-dashboard", response_class=HTMLResponse)
+async def agents_dashboard_page_short(request: Request):
     return templates.TemplateResponse(request=request, name="agents-dashboard.html")
 
 
-@app.get("/qa-supervisor.html", response_class=HTMLResponse)
-async def qa_supervisor_page(request: Request):
+@app.get("/qa-supervisor", response_class=HTMLResponse)
+async def qa_supervisor_page_short(request: Request):
     return templates.TemplateResponse(request=request, name="qa-supervisor.html")
 
 

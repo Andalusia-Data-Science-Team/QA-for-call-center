@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QA Supervisor Review — Andalusia</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: "Segoe UI", Tahoma, "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", "Apple Color Emoji", sans-serif;
+            background: linear-gradient(135deg, #1a202c 0%, #2d3748 50%, #4a1942 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container { max-width: 1100px; margin: 0 auto; }
+
+        /* ── Header ── */
+        .header {
+            background: white;
+            padding: 28px 32px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,.3);
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+        .header-left h1 { color: #2d3748; font-size: 1.7rem; }
+        .header-left p  { color: #718096; font-size: .92rem; margin-top: 4px; }
+
+        .header-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 9px 18px;
+            border-radius: 10px;
+            border: none;
+            font-weight: 600;
+            font-size: .88rem;
+            cursor: pointer;
+            text-decoration: none;
+            transition: opacity .2s, transform .12s;
+        }
+        .btn:hover { opacity: .88; transform: translateY(-1px); }
+        .btn-back   { background: #edf2f7; color: #4a5568; }
+        .btn-clear  { background: #fff5f5; color: #e53e3e; border: 1.5px solid #fed7d7; }
+        .btn-export { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+
+        /* ── Stats bar ── */
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 14px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: white;
+            border-radius: 12px;
+            padding: 16px 20px;
+            text-align: center;
+            box-shadow: 0 4px 14px rgba(0,0,0,.15);
+        }
+        .stat-value { font-size: 2rem; font-weight: 800; }
+        .stat-label { font-size: .78rem; color: #718096; margin-top: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
+        .stat-pending  .stat-value { color: #e53e3e; }
+        .stat-reviewed .stat-value { color: #38a169; }
+        .stat-dismissed .stat-value { color: #718096; }
+        .stat-total    .stat-value { color: #667eea; }
+
+        /* ── Filter pills ── */
+        .filter-bar {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .filter-pill {
+            padding: 7px 18px;
+            border-radius: 20px;
+            border: 2px solid transparent;
+            background: white;
+            color: #4a5568;
+            font-weight: 600;
+            font-size: .85rem;
+            cursor: pointer;
+            transition: all .15s;
+            box-shadow: 0 2px 8px rgba(0,0,0,.1);
+        }
+        .filter-pill:hover { border-color: #667eea; color: #667eea; }
+        .filter-pill.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-color: transparent;
+        }
+
+        /* ── Escalation cards ── */
+        .escalation-list { display: flex; flex-direction: column; gap: 16px; }
+
+        .escalation-card {
+            background: white;
+            border-radius: 14px;
+            box-shadow: 0 6px 20px rgba(0,0,0,.15);
+            overflow: hidden;
+            transition: transform .15s;
+        }
+        .escalation-card:hover { transform: translateY(-2px); }
+        .escalation-card[data-status="reviewed"]  { opacity: .75; }
+        .escalation-card[data-status="dismissed"] { opacity: .5; }
+
+        /* Card header strip */
+        .card-strip {
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .card-strip.pending  { background: linear-gradient(90deg, #fff5f5, #fff); border-left: 4px solid #e53e3e; }
+        .card-strip.reviewed { background: linear-gradient(90deg, #f0fff4, #fff); border-left: 4px solid #38a169; }
+        .card-strip.dismissed{ background: linear-gradient(90deg, #f7fafc, #fff); border-left: 4px solid #cbd5e0; }
+
+        .card-strip-left { display: flex; flex-direction: column; gap: 3px; }
+        .esc-id   { font-size: .72rem; color: #a0aec0; font-family: monospace; letter-spacing: .5px; }
+        .esc-agent { font-size: 1.05rem; font-weight: 700; color: #2d3748; }
+        .esc-meta  { font-size: .82rem; color: #718096; }
+
+        .status-chip {
+            padding: 5px 14px;
+            border-radius: 20px;
+            font-size: .75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+        }
+        .chip-pending   { background: #fed7d7; color: #742a2a; }
+        .chip-reviewed  { background: #c6f6d5; color: #22543d; }
+        .chip-dismissed { background: #e2e8f0; color: #4a5568; }
+
+        /* Card body */
+        .card-body { padding: 18px 20px; }
+
+        /* Section headings inside card */
+        .section-label {
+            font-size: .72rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #a0aec0;
+            margin-bottom: 8px;
+        }
+
+        /* Assessment reasoning */
+        .reasoning-box {
+            background: #f7fafc;
+            border-radius: 8px;
+            padding: 12px 14px;
+            color: #4a5568;
+            font-size: .88rem;
+            line-height: 1.6;
+            margin-bottom: 16px;
+        }
+
+        /* The violation — prominent */
+        .violation-block {
+            border: 2px solid #fed7d7;
+            border-radius: 10px;
+            padding: 14px;
+            background: #fff5f5;
+            margin-bottom: 16px;
+        }
+        .violation-badges {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .v-badge {
+            padding: 4px 11px;
+            border-radius: 12px;
+            font-size: .75rem;
+            font-weight: 700;
+        }
+        .v-type-c2c   { background: #f3e5f5; color: #4a148c; }
+        .v-type-c2b   { background: #e8f5e9; color: #1b5e20; }
+        .v-type-c2com { background: #fff3e0; color: #e65100; }
+        .v-type-nc    { background: #e3f2fd; color: #0d47a1; }
+        .v-sev-critical  { background: #fed7d7; color: #742a2a; }
+        .v-sev-moderate  { background: #fef5e7; color: #b7791f; }
+        .v-sev-minor     { background: #fef9c3; color: #92400e; }
+        .v-sev-positive  { background: #d4edda; color: #155724; }
+        .violation-desc { font-size: .9rem; color: #2d3748; line-height: 1.5; margin-bottom: 10px; }
+        .excerpt-box {
+            background: white;
+            border-left: 3px solid #fc8181;
+            padding: 10px 12px;
+            border-radius: 0 8px 8px 0;
+            font-style: italic;
+            color: #4a5568;
+            font-size: .87rem;
+        }
+
+        /* Performance mini */
+        .perf-row {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        .perf-chip {
+            background: #f7fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 7px 14px;
+            font-size: .82rem;
+            color: #4a5568;
+        }
+        .perf-chip b { color: #2d3748; }
+
+        /* Conversation link */
+        .conv-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #667eea;
+            font-size: .85rem;
+            font-weight: 600;
+            text-decoration: none;
+            margin-bottom: 16px;
+        }
+        .conv-link:hover { text-decoration: underline; }
+
+        /* Action row */
+        .card-actions {
+            border-top: 1px solid #edf2f7;
+            padding: 12px 20px;
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .reviewed-at {
+            font-size: .78rem;
+            color: #a0aec0;
+            margin-right: auto;
+        }
+        .action-btn {
+            padding: 7px 16px;
+            border-radius: 8px;
+            border: none;
+            font-size: .83rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: opacity .15s, transform .1s;
+        }
+        .action-btn:hover { opacity: .85; transform: translateY(-1px); }
+        .action-btn:disabled { opacity: .4; cursor: default; transform: none; }
+        .btn-review  { background: #48bb78; color: white; }
+        .btn-dismiss { background: #edf2f7; color: #4a5568; }
+        .btn-reopen  { background: #667eea; color: white; }
+
+        /* ── Note field ── */
+        .note-area {
+            width: 100%;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: .85rem;
+            color: #2d3748;
+            resize: vertical;
+            font-family: inherit;
+            min-height: 60px;
+            margin-bottom: 10px;
+            display: none;
+        }
+        .note-area:focus { outline: none; border-color: #667eea; }
+        .note-area.visible { display: block; }
+        .note-display {
+            background: #f0fff4;
+            border-left: 3px solid #48bb78;
+            border-radius: 0 8px 8px 0;
+            padding: 8px 12px;
+            font-size: .83rem;
+            color: #276749;
+            margin-top: 10px;
+            display: none;
+        }
+        .note-display.visible { display: block; }
+
+        /* ── Empty state ── */
+        .empty-state {
+            background: white;
+            border-radius: 14px;
+            padding: 60px 40px;
+            text-align: center;
+            box-shadow: 0 6px 20px rgba(0,0,0,.12);
+        }
+        .empty-icon  { font-size: 3.5rem; margin-bottom: 16px; }
+        .empty-title { font-size: 1.3rem; font-weight: 700; color: #2d3748; margin-bottom: 8px; }
+        .empty-sub   { color: #718096; font-size: .92rem; }
+
+        /* ── Toast ── */
+        .toast {
+            position: fixed; bottom: 28px; right: 28px;
+            background: #2d3748; color: white;
+            padding: 12px 18px; border-radius: 10px;
+            font-size: .88rem; font-weight: 600;
+            box-shadow: 0 8px 24px rgba(0,0,0,.3);
+            transform: translateY(80px); opacity: 0;
+            transition: transform .3s, opacity .3s;
+            z-index: 1000;
+        }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.ok   { border-left: 4px solid #48bb78; }
+        .toast.info { border-left: 4px solid #667eea; }
+
+        @media (max-width: 640px) {
+            .header { flex-direction: column; align-items: flex-start; }
+            .header-actions { width: 100%; }
+            .btn { flex: 1; justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <!-- ── Header ── -->
+    <div class="header">
+        <div class="header-left">
+            <h1>🔍 QA Supervisor Review</h1>
+            <p>Violations escalated by team leaders — review, annotate, and resolve</p>
+        </div>
+        <div class="header-actions">
+            <a href="/agents-dashboard" class="btn btn-back">← Agents Dashboard</a>
+            <button class="btn btn-clear" id="clearReviewedBtn" onclick="clearResolved()">🗑 Clear Resolved</button>
+            <button class="btn btn-export" onclick="exportCSV()">⬇ Export CSV</button>
+        </div>
+    </div>
+
+    <!-- ── Stats ── -->
+    <div class="stats-bar" id="statsBar">
+        <div class="stat-card stat-pending">
+            <div class="stat-value" id="statPending">0</div>
+            <div class="stat-label">Pending Review</div>
+        </div>
+        <div class="stat-card stat-reviewed">
+            <div class="stat-value" id="statReviewed">0</div>
+            <div class="stat-label">Reviewed</div>
+        </div>
+        <div class="stat-card stat-dismissed">
+            <div class="stat-value" id="statDismissed">0</div>
+            <div class="stat-label">Dismissed</div>
+        </div>
+        <div class="stat-card stat-total">
+            <div class="stat-value" id="statTotal">0</div>
+            <div class="stat-label">Total Received</div>
+        </div>
+    </div>
+
+    <!-- ── Filters ── -->
+    <div class="filter-bar" id="filterBar">
+        <button class="filter-pill active" data-filter="all"       onclick="setFilter('all',       this)">All</button>
+        <button class="filter-pill"        data-filter="pending"   onclick="setFilter('pending',   this)">🔴 Pending</button>
+        <button class="filter-pill"        data-filter="reviewed"  onclick="setFilter('reviewed',  this)">✅ Reviewed</button>
+        <button class="filter-pill"        data-filter="dismissed" onclick="setFilter('dismissed', this)">⬜ Dismissed</button>
+    </div>
+
+    <!-- ── List ── -->
+    <div class="escalation-list" id="escalationList"></div>
+
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+const ESCALATION_KEY = 'qa_escalations';
+let _currentFilter   = 'all';
+
+/* ── localStorage helpers ── */
+function loadAll() {
+    try { return JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]'); }
+    catch (_) { return []; }
+}
+function saveAll(items) {
+    try { localStorage.setItem(ESCALATION_KEY, JSON.stringify(items)); }
+    catch (err) { console.error('save failed', err); }
+}
+function patchItem(id, patch) {
+    const items = loadAll().map(e => e.id === id ? { ...e, ...patch } : e);
+    saveAll(items);
+    return items;
+}
+
+/* ── Toast ── */
+let _tt = null;
+function toast(msg, type = 'ok', ms = 3000) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.className   = `toast ${type}`;
+    requestAnimationFrame(() => el.classList.add('show'));
+    if (_tt) clearTimeout(_tt);
+    _tt = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+/* ── Escape HTML ── */
+function esc(s) {
+    return String(s ?? '')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── Format timestamp ── */
+function fmtTs(iso) {
+    if (!iso) return '';
+    try {
+        return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    } catch (_) { return iso; }
+}
+
+/* ── Stats ── */
+function refreshStats(items) {
+    const pending   = items.filter(e => e.status === 'pending').length;
+    const reviewed  = items.filter(e => e.status === 'reviewed').length;
+    const dismissed = items.filter(e => e.status === 'dismissed').length;
+    document.getElementById('statPending').textContent   = pending;
+    document.getElementById('statReviewed').textContent  = reviewed;
+    document.getElementById('statDismissed').textContent = dismissed;
+    document.getElementById('statTotal').textContent     = items.length;
+}
+
+/* ── Filter ── */
+function setFilter(f, btn) {
+    _currentFilter = f;
+    document.querySelectorAll('.filter-pill').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    render();
+}
+
+/* ── Badge helpers ── */
+function typeBadgeClass(t) {
+    return 'v-type-' + (t||'nc').toLowerCase();
+}
+function sevBadgeClass(s) {
+    return 'v-sev-' + (s||'minor').toLowerCase();
+}
+function chipClass(status) {
+    return { pending:'chip-pending', reviewed:'chip-reviewed', dismissed:'chip-dismissed' }[status] || 'chip-pending';
+}
+function stripClass(status) {
+    return status === 'reviewed' ? 'reviewed' : status === 'dismissed' ? 'dismissed' : 'pending';
+}
+
+/* ── Render ── */
+function render() {
+    const all   = loadAll();
+    const items = _currentFilter === 'all' ? all : all.filter(e => e.status === _currentFilter);
+    refreshStats(all);
+
+    const list = document.getElementById('escalationList');
+    if (!items.length) {
+        const label = _currentFilter === 'all'
+            ? 'No violations have been escalated yet.'
+            : `No ${_currentFilter} items.`;
+        list.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">🗂️</div>
+                <div class="empty-title">Queue is clear</div>
+                <div class="empty-sub">${esc(label)}</div>
+            </div>`;
+        return;
+    }
+
+    list.innerHTML = items.map(e => cardHTML(e)).join('');
+}
+
+function cardHTML(e) {
+    const f   = e.flag || {};
+    const perf = {
+        score:    e.professionalism_score,
+        cls:      e.agent_classification,
+        profiling: e.profiling_comment,
+    };
+
+    /* Agent classification colour */
+    const clsColor = { A:'#22543d', B:'#744210', C:'#e65100', D:'#742a2a' }[perf.cls] || '#2d3748';
+    const clsBg    = { A:'#c6f6d5', B:'#fefcbf', C:'#feebc8', D:'#fed7d7' }[perf.cls] || '#e2e8f0';
+
+    const linkHTML = e.conversation_link
+        ? `<a class="conv-link" href="${esc(e.conversation_link)}" target="_blank" rel="noopener">
+               🔗 Open Conversation
+           </a>`
+        : '';
+
+    const reviewedLine = e.reviewed_at
+        ? `<span class="reviewed-at">Reviewed ${fmtTs(e.reviewed_at)}</span>`
+        : '';
+
+    /* Action buttons based on current status */
+    let actionBtns = '';
+    if (e.status === 'pending') {
+        actionBtns = `
+            <button class="action-btn btn-dismiss" onclick="dismissItem('${esc(e.id)}')">Dismiss</button>
+            <button class="action-btn btn-review"  onclick="toggleNoteArea('${esc(e.id)}')">✓ Mark as Reviewed</button>`;
+    } else if (e.status === 'reviewed') {
+        actionBtns = `
+            <button class="action-btn btn-reopen" onclick="reopenItem('${esc(e.id)}')">↩ Reopen</button>`;
+    } else if (e.status === 'dismissed') {
+        actionBtns = `
+            <button class="action-btn btn-reopen" onclick="reopenItem('${esc(e.id)}')">↩ Reopen</button>`;
+    }
+
+    const noteAreaId    = `note-${e.id}`;
+    const noteDisplayId = `notedisp-${e.id}`;
+    const noteRowId     = `noterow-${e.id}`;
+
+    const existingNote = e.review_note
+        ? `<div class="note-display visible" id="${noteDisplayId}">📝 ${esc(e.review_note)}</div>`
+        : `<div class="note-display" id="${noteDisplayId}"></div>`;
+
+    const perfChips = [
+        perf.score != null
+            ? `<div class="perf-chip">Professionalism: <b>${Math.round((perf.score||0)*100)}%</b></div>`
+            : '',
+        perf.cls
+            ? `<div class="perf-chip">Class: <b style="color:${clsColor};background:${clsBg};padding:1px 7px;border-radius:8px">${esc(perf.cls)}</b></div>`
+            : '',
+        perf.profiling
+            ? `<div class="perf-chip">Profiling: <b>${esc(perf.profiling)}</b></div>`
+            : '',
+    ].filter(Boolean).join('');
+
+    return `
+    <div class="escalation-card" id="card-${esc(e.id)}" data-status="${esc(e.status)}">
+
+        <!-- Strip -->
+        <div class="card-strip ${stripClass(e.status)}">
+            <div class="card-strip-left">
+                <span class="esc-id">${esc(e.id)}</span>
+                <span class="esc-agent">${esc(e.agent_name || 'Unknown Agent')}</span>
+                <span class="esc-meta">Call ID: ${esc(e.call_id)} &nbsp;·&nbsp; ${esc(e.call_date || '')} &nbsp;·&nbsp; Escalated ${fmtTs(e.escalated_at)}</span>
+            </div>
+            <span class="status-chip ${chipClass(e.status)}">${esc(e.status)}</span>
+        </div>
+
+        <!-- Body -->
+        <div class="card-body">
+
+            ${linkHTML}
+
+            <!-- Assessment context -->
+            ${e.assessment_reasoning ? `
+            <div class="section-label">Assessment Reasoning</div>
+            <div class="reasoning-box">${esc(e.assessment_reasoning)}</div>
+            ` : ''}
+
+            <!-- Performance -->
+            ${perfChips ? `
+            <div class="section-label">Agent Performance</div>
+            <div class="perf-row">${perfChips}</div>
+            ` : ''}
+
+            <!-- The escalated violation -->
+            <div class="section-label">Escalated Violation</div>
+            <div class="violation-block">
+                <div class="violation-badges">
+                    <span class="v-badge ${typeBadgeClass(f.type)}">${esc(f.type || '—')}</span>
+                    <span class="v-badge ${sevBadgeClass(f.severity)}">${esc(f.severity || '—')}</span>
+                </div>
+                <div class="violation-desc">${esc(f.description || '—')}</div>
+                ${f.transcript_excerpt
+                    ? `<div class="excerpt-box">${esc(f.transcript_excerpt)}</div>`
+                    : ''}
+            </div>
+
+            <!-- Supervisor note (visible after clicking Mark Reviewed) -->
+            <div id="${noteRowId}" style="display:none;">
+                <textarea
+                    class="note-area"
+                    id="${noteAreaId}"
+                    placeholder="Add a review note (optional)…"
+                ></textarea>
+                <div style="display:flex;gap:8px;justify-content:flex-end;">
+                    <button class="action-btn btn-dismiss" onclick="cancelNote('${esc(e.id)}')">Cancel</button>
+                    <button class="action-btn btn-review"  onclick="confirmReview('${esc(e.id)}')">Confirm Review</button>
+                </div>
+            </div>
+            ${existingNote}
+
+        </div>
+
+        <!-- Actions -->
+        <div class="card-actions">
+            ${reviewedLine}
+            ${actionBtns}
+        </div>
+
+    </div>`;
+}
+
+/* ── Actions ── */
+function toggleNoteArea(id) {
+    const row = document.getElementById(`noterow-${id}`);
+    if (!row) return;
+    const area = document.getElementById(`note-${id}`);
+    row.style.display = 'block';
+    if (area) {
+        area.classList.add('visible');
+        area.focus();
+    }
+}
+
+function cancelNote(id) {
+    const row = document.getElementById(`noterow-${id}`);
+    if (row) row.style.display = 'none';
+}
+
+function confirmReview(id) {
+    const area = document.getElementById(`note-${id}`);
+    const note = area ? area.value.trim() : '';
+    const items = patchItem(id, {
+        status:      'reviewed',
+        reviewed_at: new Date().toISOString(),
+        review_note: note || null,
+    });
+    refreshStats(items);
+    render();
+    toast('✅ Marked as reviewed', 'ok');
+}
+
+function dismissItem(id) {
+    const items = patchItem(id, {
+        status:      'dismissed',
+        reviewed_at: new Date().toISOString(),
+    });
+    refreshStats(items);
+    render();
+    toast('⬜ Escalation dismissed', 'info');
+}
+
+function reopenItem(id) {
+    const items = patchItem(id, {
+        status:      'pending',
+        reviewed_at: null,
+        review_note: null,
+    });
+    refreshStats(items);
+    render();
+    toast('↩ Reopened as pending', 'info');
+}
+
+function clearResolved() {
+    const all      = loadAll();
+    const remaining = all.filter(e => e.status === 'pending');
+    const removed   = all.length - remaining.length;
+    if (!removed) { toast('Nothing to clear — no resolved items.', 'info'); return; }
+    if (!confirm(`Remove ${removed} resolved/dismissed item(s)? This cannot be undone.`)) return;
+    saveAll(remaining);
+    render();
+    toast(`🗑 Cleared ${removed} resolved item(s)`, 'ok');
+}
+
+/* ── Export CSV ── */
+function exportCSV() {
+    const items = loadAll();
+    if (!items.length) { toast('Nothing to export.', 'info'); return; }
+
+    const cols = [
+        'id','escalated_at','call_id','agent_name','call_date',
+        'overall_assessment','agent_classification','professionalism_score',
+        'profiling_comment','flag_type','flag_severity','flag_description',
+        'flag_excerpt','status','reviewed_at','review_note',
+    ];
+    const rows = items.map(e => [
+        e.id, e.escalated_at, e.call_id, e.agent_name, e.call_date,
+        e.overall_assessment, e.agent_classification,
+        e.professionalism_score != null ? Math.round(e.professionalism_score * 100) + '%' : '',
+        e.profiling_comment || '',
+        (e.flag||{}).type || '', (e.flag||{}).severity || '',
+        (e.flag||{}).description || '', (e.flag||{}).transcript_excerpt || '',
+        e.status, e.reviewed_at || '', e.review_note || '',
+    ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','));
+
+    const csv  = [cols.join(','), ...rows].join('\n');
+    const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `qa_escalations_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('⬇ CSV exported', 'ok');
+}
+
+/* ── Init ── */
+render();
+
+/* ── Listen for changes from other tabs (e.g. team leader escalates) ── */
+window.addEventListener('storage', e => {
+    if (e.key === ESCALATION_KEY) render();
+});
+</script>
+</body>
+</html>

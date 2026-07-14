@@ -8,7 +8,7 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: "Segoe UI", Tahoma, "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", "Apple Color Emoji", sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px;
@@ -28,9 +28,17 @@
         .header h1 { color: #2d3748; font-size: 2rem; margin-bottom: 10px; }
         .header p  { color: #718096; font-size: 1rem; }
 
-        .header-nav-btn {
-            display: inline-block;
+        .header-nav {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
             margin-top: 18px;
+            flex-wrap: wrap;
+        }
+        .header-nav-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
             padding: 10px 22px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
@@ -39,8 +47,30 @@
             font-weight: 600;
             font-size: .95rem;
             transition: opacity .2s, transform .15s;
+            position: relative;
         }
         .header-nav-btn:hover { opacity: .9; transform: translateY(-2px); }
+
+        /* Supervisor link with pending badge */
+        .header-nav-btn.supervisor {
+            background: linear-gradient(135deg, #e53e3e 0%, #c53030 100%);
+        }
+        .pending-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: white;
+            color: #e53e3e;
+            font-size: .72rem;
+            font-weight: 800;
+            border-radius: 50%;
+            min-width: 20px;
+            height: 20px;
+            padding: 0 4px;
+            line-height: 1;
+        }
+        .pending-badge:empty,
+        .pending-badge[data-count="0"] { display: none; }
 
         /* ── Generic card ── */
         .card {
@@ -127,8 +157,16 @@
         .status-escalate     { background: #fed7d7; color: #742a2a; }
         .status-error        { background: #e2e8f0; color: #4a5568; }
 
-        .compliance-item { background: #fafafa; border: 2px solid #e2e8f0; padding: 13px; border-radius: 10px; margin-top: 12px; }
-        .compliance-header { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+        /* ── Compliance items ── */
+        .compliance-item {
+            background: #fafafa; border: 2px solid #e2e8f0;
+            padding: 13px; border-radius: 10px; margin-top: 12px;
+        }
+        .compliance-item.escalated-item {
+            border-color: #fed7d7;
+            background: #fff5f5;
+        }
+        .compliance-header { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
         .severity-badge { padding: 4px 11px; border-radius: 15px; font-size: .78rem; font-weight: 600; }
         .severity-critical { background: #fed7d7; color: #742a2a; }
         .severity-moderate { background: #fef5e7; color: #b7791f; }
@@ -139,11 +177,44 @@
         .type-c2b    { background: #e8f5e9; color: #1b5e20; }
         .type-c2com  { background: #fff3e0; color: #e65100; }
         .type-nc     { background: #e3f2fd; color: #0d47a1; }
+
         .excerpt-box {
             background: #f7fafc; padding: 10px; border-radius: 8px;
             margin-top: 8px; font-style: italic; color: #4a5568;
             border-left: 3px solid #cbd5e0; font-size: .9rem;
         }
+
+        /* ── Escalate button ── */
+        .compliance-footer {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 10px;
+        }
+        .escalate-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 6px 14px;
+            border: 1.5px solid #e53e3e;
+            border-radius: 8px;
+            background: white;
+            color: #e53e3e;
+            font-size: .8rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: background .15s, color .15s, transform .1s;
+        }
+        .escalate-btn:hover:not(.done) {
+            background: #e53e3e;
+            color: white;
+            transform: translateY(-1px);
+        }
+        .escalate-btn.done {
+            border-color: #38a169;
+            color: #38a169;
+            cursor: default;
+        }
+
         .mini-scores { display: flex; gap: 18px; margin-top: 10px; flex-wrap: wrap; }
         .mini-score  { font-size: .85rem; color: #4a5568; }
         .mini-score b { color: #2d3748; }
@@ -161,6 +232,39 @@
             color: #667eea; cursor: pointer;
         }
 
+        /* ── Toast ── */
+        .toast {
+            position: fixed;
+            bottom: 28px;
+            right: 28px;
+            background: #2d3748;
+            color: white;
+            padding: 14px 20px;
+            border-radius: 10px;
+            font-size: .9rem;
+            font-weight: 600;
+            box-shadow: 0 8px 24px rgba(0,0,0,.3);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            transform: translateY(80px);
+            opacity: 0;
+            transition: transform .3s ease, opacity .3s ease;
+            z-index: 1000;
+            max-width: 360px;
+        }
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+        .toast.success { border-left: 4px solid #48bb78; }
+        .toast a {
+            color: #90cdf4;
+            text-decoration: underline;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
         @media (max-width: 700px) {
             .retrieve-form { grid-template-columns: 1fr; }
         }
@@ -172,7 +276,13 @@
     <div class="header">
         <h1>👥 Andalusia Agents QA Dashboard</h1>
         <p>Select an agent email &amp; date to retrieve and analyse conversations</p>
-        <a href="qa-dashboard.html" class="header-nav-btn">📞 Back to Call Analysis</a>
+        <div class="header-nav">
+            <a href="/qa-dashboard" class="header-nav-btn">📞 Call Analysis</a>
+            <a href="/qa-supervisor" class="header-nav-btn supervisor" id="supervisorLink">
+                🔍 QA Supervisor
+                <span class="pending-badge" id="pendingBadge"></span>
+            </a>
+        </div>
     </div>
 
     <!-- ── Retrieve form ── -->
@@ -211,8 +321,14 @@
 
 </div>
 
+<!-- ── Toast notification ── -->
+<div class="toast" id="toast"></div>
+
 <script>
 const API_BASE = '';
+
+/* ── Store last results for escalation references ── */
+let _lastResults = [];
 
 /* ── helpers ── */
 const $ = id => document.getElementById(id);
@@ -235,6 +351,95 @@ function showError(msg) {
     el.textContent   = msg || '';
 }
 
+/* ── Toast ── */
+let _toastTimer = null;
+function showToast(html, type = 'success', duration = 4000) {
+    const el = $('toast');
+    el.innerHTML = html;
+    el.className = `toast ${type}`;
+    requestAnimationFrame(() => el.classList.add('show'));
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => el.classList.remove('show'), duration);
+}
+
+/* ── Supervisor badge ── */
+const ESCALATION_KEY = 'qa_escalations';
+
+function updateSupervisorBadge() {
+    try {
+        const all    = JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]');
+        const count  = all.filter(e => e.status === 'pending').length;
+        const badge  = $('pendingBadge');
+        badge.textContent = count > 0 ? String(count) : '';
+        badge.setAttribute('data-count', count);
+    } catch (_) {}
+}
+
+/* ── Escalate a single violation ── */
+function escalateViolation(rIdx, fIdx, btn) {
+    if (btn.classList.contains('done')) return;
+
+    const r = _lastResults[rIdx];
+    if (!r) return;
+    const flags = r.compliance_flags || [];
+    const f = flags[fIdx];
+    if (!f) return;
+
+    const perf = r.agent_performance || {};
+    const escId = `ESC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,5).toUpperCase()}`;
+
+    const escalation = {
+        id: escId,
+        escalated_at: new Date().toISOString(),
+        /* Call context */
+        call_id:              r.call_id || '',
+        agent_name:           r.agent_name || '',
+        conversation_link:    r.conversation_link || null,
+        call_date:            r.call_date || '',
+        overall_assessment:   r.overall_assessment || '',
+        assessment_reasoning: r.assessment_reasoning || '',
+        /* Performance snapshot */
+        professionalism_score:  perf.professionalism_score ?? perf['professionalism_score'] ?? null,
+        agent_classification:   perf.agent_classification  || perf['Agent Classification']  || null,
+        profiling_comment:      perf.profiling_comment     || perf['Profiling Comment']     || null,
+        strengths:              perf.strengths    || [],
+        improvements:           perf.improvements || [],
+        /* The single violation escalated */
+        flag: {
+            type:               f.type,
+            severity:           f.severity,
+            description:        f.description,
+            transcript_excerpt: f.transcript_excerpt,
+        },
+        status: 'pending',
+        reviewed_at:  null,
+        review_note:  null,
+    };
+
+    try {
+        const existing = JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]');
+        existing.unshift(escalation);          // newest first
+        localStorage.setItem(ESCALATION_KEY, JSON.stringify(existing));
+    } catch (err) {
+        console.error('[escalate] localStorage write failed:', err);
+        showToast('⚠️ Could not save escalation — storage may be full.', 'error');
+        return;
+    }
+
+    /* Update button state */
+    btn.classList.add('done');
+    btn.innerHTML = '✓ Escalated';
+    btn.closest('.compliance-item').classList.add('escalated-item');
+
+    updateSupervisorBadge();
+
+    showToast(
+        `🚨 Violation escalated — <a onclick="window.location.href='/qa-supervisor'">Open Supervisor Dashboard</a>`,
+        'success',
+        5000
+    );
+}
+
 /* ── enable Run button only when both fields are filled ── */
 function checkReady() {
     const ok = $('emailSelect').value && $('filterDate').value;
@@ -243,7 +448,7 @@ function checkReady() {
 $('emailSelect').addEventListener('change', checkReady);
 $('filterDate').addEventListener('change', checkReady);
 
-/* ── set today as default date & trigger checkReady ── */
+/* ── set today as default date ── */
 const today = new Date().toISOString().slice(0,10);
 $('filterDate').value = today;
 
@@ -255,12 +460,8 @@ async function loadEmails() {
 
     try {
         const res = await fetch(`${API_BASE}/agents/emails`);
-
         if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
-
         const data = await res.json();
-
-        /* support both { emails: [...] } and a bare array */
         const list = Array.isArray(data) ? data : (data.emails ?? data.data ?? []);
 
         if (!list.length) {
@@ -278,7 +479,7 @@ async function loadEmails() {
         showError('Failed to load agent emails: ' + err.message);
         console.error('[loadEmails]', err);
     } finally {
-        checkReady();   /* re-evaluate button state after dropdown is populated */
+        checkReady();
     }
 }
 
@@ -316,11 +517,15 @@ $('runBtn').addEventListener('click', async () => {
     }
 });
 
-/* ── kick off email load ── */
+/* ── kick off ── */
 loadEmails();
+updateSupervisorBadge();
 
 /* ── render results ── */
 function renderResults(data) {
+    const results = data.results || [];
+    _lastResults  = results;        // store for escalation references
+
     const s = data.summary || {};
     $('summaryMetrics').innerHTML = `
         <div class="metric-card"><div class="metric-label">Total Analysed</div><div class="metric-value">${s.total ?? 0}</div></div>
@@ -330,7 +535,6 @@ function renderResults(data) {
         <div class="metric-card"><div class="metric-label">⚠ Errors</div><div class="metric-value">${s.errors ?? 0}</div></div>
     `;
 
-    const results = data.results || [];
     $('callRecordsList').innerHTML = results.length
         ? results.map((r, i) => callRecordHTML(r, i)).join('')
         : '<p class="empty-note">No results to display.</p>';
@@ -341,7 +545,7 @@ function renderResults(data) {
     /* transcript toggles */
     document.querySelectorAll('.transcript-toggle').forEach(btn => {
         btn.addEventListener('click', () => {
-            const box = btn.nextElementSibling;
+            const box    = btn.nextElementSibling;
             const hidden = box.style.display === 'none';
             box.style.display = hidden ? 'block' : 'none';
             btn.textContent   = hidden ? '▲ Hide Transcript' : '▼ Show Transcript';
@@ -363,22 +567,49 @@ function callRecordHTML(r, idx) {
            </span>`
         : '';
 
-    /* Profiling comment — only rendered when present */
     const profiling    = perf['Profiling Comment'] || perf.profiling_comment || '';
     const profilingRow = profiling
-        ? `<div class="mini-score" style="margin-top:6px;">
-               🏷 Profiling: <b>${esc(profiling)}</b>
-           </div>`
+        ? `<div class="mini-score" style="margin-top:6px;">🏷 Profiling: <b>${esc(profiling)}</b></div>`
         : '';
+
+    /* ── Conversation link (replaces call ID everywhere) ── */
+    const convLinkHTML = r.conversation_link
+        ? `<a
+               href="${esc(r.conversation_link)}"
+               target="_blank"
+               rel="noopener"
+               style="color:#667eea;font-weight:700;font-size:.95rem;text-decoration:none;display:inline-flex;align-items:center;gap:4px;"
+               title="Open conversation"
+           >🔗 ${esc(r.conversation_link)}</a>`
+        : `<span class="call-record-id" style="color:#a0aec0;font-style:italic;">No conversation link</span>`;
+
+    const flagsHTML = flags.map((f, fi) => `
+        <div class="compliance-item" id="ci-${idx}-${fi}">
+            <div class="compliance-header">
+                <span class="type-badge ${typeClass(f.type)}">${esc(f.type)}</span>
+                <span class="severity-badge ${severityClass(f.severity)}">${esc(f.severity)}</span>
+            </div>
+            <p>${esc(f.description)}</p>
+            <div class="excerpt-box">${esc(f.transcript_excerpt)}</div>
+            <div class="compliance-footer">
+                <button
+                    class="escalate-btn"
+                    onclick="escalateViolation(${idx}, ${fi}, this)"
+                    title="Escalate this violation to the QA Supervisor"
+                >
+                    🚨 Escalate to QA
+                </button>
+            </div>
+        </div>`).join('');
 
     return `
     <details class="call-record" ${idx === 0 ? 'open' : ''}>
         <summary>
-            <span>
-                <span class="call-record-id">${esc(r.call_id)}</span>
+            <span style="display:flex;flex-direction:column;gap:3px;min-width:0;flex:1;">
+                ${convLinkHTML}
                 <span class="call-record-date">${esc(r.call_date || '')}</span>
             </span>
-            <span style="display:flex; gap:8px; align-items:center;">
+            <span style="display:flex; gap:8px; align-items:center; flex-shrink:0;">
                 ${classificationBadge}
                 <span class="status-badge ${statusClass(r.overall_assessment)}">
                     ${esc((r.overall_assessment||'error').toUpperCase().replace(/_/g,' '))}
@@ -393,15 +624,7 @@ function callRecordHTML(r, idx) {
                 ${profilingRow}
             </div>
 
-            ${flags.map(f => `
-            <div class="compliance-item">
-                <div class="compliance-header">
-                    <span class="type-badge ${typeClass(f.type)}">${esc(f.type)}</span>
-                    <span class="severity-badge ${severityClass(f.severity)}">${esc(f.severity)}</span>
-                </div>
-                <p>${esc(f.description)}</p>
-                <div class="excerpt-box">${esc(f.transcript_excerpt)}</div>
-            </div>`).join('')}
+            ${flagsHTML}
 
             ${r.escalation_required
                 ? `<div class="excerpt-box" style="border-left-color:#f56565;margin-top:12px;">
