@@ -15,19 +15,11 @@ from app.agent import QAAgent
 from app.services.llm_client import LLMClient
 from app.config import settings
 
-""" TEMPLATES_DIR = Path(__file__).parent / "templates"
+TEMPLATES_DIR = Path(__file__).parent / "templates"
 CM_DIR        = Path(__file__).parent / "CM"
-SQL_DIR       = Path(__file__).parent / "SQL" """
-# ❌ Current — resolves to  QA_System-main/app/templates/  (doesn't exist)
-""" TEMPLATES_DIR = Path(__file__).parent / "templates"
-CM_DIR        = Path(__file__).parent / "CM"
-SQL_DIR       = Path(__file__).parent / "SQL" """
+SQL_DIR       = Path(__file__).parent / "SQL"
 
-# ✅ Fixed — resolves to  QA_System-main/templates/  (correct)
-PROJECT_ROOT  = Path(__file__).parent.parent
-TEMPLATES_DIR = PROJECT_ROOT / "templates"
-CM_DIR        = PROJECT_ROOT / "CM"
-SQL_DIR       = PROJECT_ROOT / "SQL"
+
 
 logging.basicConfig(
     level=logging.INFO,
