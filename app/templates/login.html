@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Login — Andalusia QA</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+        }
+        .card {
+            width: 100%;
+            max-width: 420px;
+            background: #ffffff;
+            border-radius: 20px;
+            box-shadow: 0 18px 50px rgba(0,0,0,.18);
+            padding: 34px 28px;
+        }
+        h1 { margin-bottom: 12px; color: #2d3748; font-size: 1.9rem; }
+        p { margin-bottom: 22px; color: #4a5568; line-height: 1.5; }
+        .field { margin-bottom: 18px; }
+        .field label { display: block; margin-bottom: 8px; font-weight: 700; color: #4a5568; }
+        .field input {
+            width: 100%;
+            padding: 12px 14px;
+            border: 1.8px solid #e2e8f0;
+            border-radius: 12px;
+            font-size: 1rem;
+        }
+        .field input:focus { border-color: #667eea; outline: none; }
+        .btn {
+            width: 100%;
+            padding: 14px 16px;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #ffffff;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .error { margin-bottom: 18px; padding: 12px 14px; border-radius: 12px; background: #fed7d7; color: #742a2a; }
+        .note { margin-top: 18px; font-size: .9rem; color: #718096; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Sign in</h1>
+        <p>Login with username and password. Team leaders go to Agents Dashboard, QA admins go to Supervisor Dashboard.</p>
+
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+
+        <form action="/login" method="post">
+            <div class="field">
+                <label for="username">Username</label>
+                <input id="username" name="username" type="text" required autofocus />
+            </div>
+            <div class="field">
+                <label for="password">Password</label>
+                <input id="password" name="password" type="password" required />
+            </div>
+            <button class="btn" type="submit">Login</button>
+        </form>
+
+        <div class="note">
+            Example users:
+            <br />team leader: <strong>leader / leaderpass</strong>
+            <br />qa admin: <strong>admin / adminpass</strong>
+        </div>
+    </div>
+</body>
+</html>

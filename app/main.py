@@ -1,12 +1,12 @@
+import json                          # ← was missing; needed by upload_analyze
 import time
-import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query, Form, status
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+# StaticFiles removed — it was imported but never used
 from fastapi.templating import Jinja2Templates
 
 from app.models.input import CallTranscript, BatchCallTranscripts
@@ -15,9 +15,19 @@ from app.agent import QAAgent
 from app.services.llm_client import LLMClient
 from app.config import settings
 
+""" TEMPLATES_DIR = Path(__file__).parent / "templates"
+CM_DIR        = Path(__file__).parent / "CM"
+SQL_DIR       = Path(__file__).parent / "SQL" """
+# ❌ Current — resolves to  QA_System-main/app/templates/  (doesn't exist)
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 CM_DIR        = Path(__file__).parent / "CM"
 SQL_DIR       = Path(__file__).parent / "SQL"
+
+# ✅ Fixed — resolves to  QA_System-main/templates/  (correct)
+PROJECT_ROOT  = Path(__file__).parent.parent
+TEMPLATES_DIR = PROJECT_ROOT / "templates"
+CM_DIR        = PROJECT_ROOT / "CM"
+SQL_DIR       = PROJECT_ROOT / "SQL"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +52,11 @@ app = FastAPI(
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
+USER_STORE = {
+    "leader": {"password": "leaderpass", "role": "team_leader"},
+    "admin":  {"password": "adminpass",  "role": "qa_admin"},
+}
+
 llm_client = LLMClient(provider=settings.llm_provider, model=settings.llm_model)
 analyzer   = QAAgent(llm_client=llm_client)
 
@@ -55,31 +70,65 @@ async def add_process_time_header(request: Request, call_next):
     return response
 
 
-# ── Static pages ─────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "provider": settings.llm_provider, "model": settings.llm_model}
 
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    return templates.TemplateResponse(request=request, name="qa-dashboard.html")
+# ── Auth pages ────────────────────────────────────────────────────────────────
+# NOTE: all TemplateResponse calls now use the Starlette 1.x signature:
+#   templates.TemplateResponse(request, "template.html", {extra_context})
+# "request" is the FIRST positional arg — NOT a key inside the context dict.
 
+@app.get("/", response_class=HTMLResponse)
+async def login_page(request: Request):
+    return templates.TemplateResponse(request, "login.html", {"error": None})
+
+
+@app.post("/login")
+async def login(
+    request:  Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    user = USER_STORE.get(username)
+    if not user or user["password"] != password:
+        return templates.TemplateResponse(
+            request, "login.html",
+            {"error": "Invalid username or password."},
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    if user["role"] == "team_leader":
+        return RedirectResponse(url="/agents-dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+    if user["role"] == "qa_admin":
+        return RedirectResponse(url="/qa-supervisor", status_code=status.HTTP_303_SEE_OTHER)
+
+    return templates.TemplateResponse(
+        request, "login.html",
+        {"error": "Unable to determine user role."},
+        status_code=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+# ── Dashboard pages ───────────────────────────────────────────────────────────
 
 @app.get("/qa-dashboard", response_class=HTMLResponse)
-async def qa_dashboard_page_short(request: Request):
-    return templates.TemplateResponse(request=request, name="qa-dashboard.html")
+async def qa_dashboard_page(request: Request):
+    return templates.TemplateResponse(request, "qa-dashboard.html")
 
 
 @app.get("/agents-dashboard", response_class=HTMLResponse)
-async def agents_dashboard_page_short(request: Request):
-    return templates.TemplateResponse(request=request, name="agents-dashboard.html")
+async def agents_dashboard_page(request: Request):
+    return templates.TemplateResponse(request, "agents-dashboard.html")
 
 
 @app.get("/qa-supervisor", response_class=HTMLResponse)
-async def qa_supervisor_page_short(request: Request):
-    return templates.TemplateResponse(request=request, name="qa-supervisor.html")
+async def qa_supervisor_page(request: Request):
+    return templates.TemplateResponse(request, "qa-supervisor.html")
 
 
 # ── Agent email list ──────────────────────────────────────────────────────────
@@ -93,7 +142,6 @@ async def list_agent_emails(
     sys.path.insert(0, str(CM_DIR))
     from CM_DB_Handler import CMDatabaseHandler
 
-    # Resolve json_file relative to CM_DIR if not absolute
     json_path = Path(json_file)
     if not json_path.is_absolute():
         json_path = CM_DIR / json_file
@@ -112,12 +160,7 @@ async def list_agent_emails(
     finally:
         handler.close()
 
-    emails = (
-        df["EmailAddress"]
-        .dropna()
-        .unique()
-        .tolist()
-    )
+    emails = df["EmailAddress"].dropna().unique().tolist()
     emails.sort()
     return {"emails": emails}
 
@@ -136,7 +179,6 @@ async def retrieve_and_analyze(
     from CM_DB_Handler import CMDatabaseHandler
     from Chat_Retriever import retrieve_chats_by_agent_email, df_to_batch
 
-    # Resolve json_file relative to CM_DIR if not absolute
     json_path = Path(json_file)
     if not json_path.is_absolute():
         json_path = CM_DIR / json_file
@@ -145,7 +187,6 @@ async def retrieve_and_analyze(
 
     logger.info("retrieve-and-analyze | agent=%s date=%s", agent_email, filter_date)
 
-    # ── Step 1: fetch rows ────────────────────────────────────────────────────
     handler = CMDatabaseHandler(json_file=str(json_path), db_key=db_key)
     try:
         df = retrieve_chats_by_agent_email(
@@ -171,7 +212,6 @@ async def retrieve_and_analyze(
         len(df), df["UniqueId"].nunique(),
     )
 
-    # ── Step 2: convert to BatchCallTranscripts ───────────────────────────────
     try:
         batch = df_to_batch(df)
     except Exception as exc:
@@ -179,7 +219,6 @@ async def retrieve_and_analyze(
 
     logger.info("retrieve-and-analyze | %d calls passed validation", len(batch.calls))
 
-    # ── Step 3: analyze each call ─────────────────────────────────────────────
     async def safe_analyze(call: CallTranscript):
         try:
             return await analyzer.analyze(call)
@@ -200,13 +239,13 @@ async def retrieve_and_analyze(
     return BatchQAAnalysisResult(results=list(results), summary=summary)
 
 
-# ── Existing single / batch endpoints (unchanged) ─────────────────────────────
+# ── Single / batch analysis endpoints ────────────────────────────────────────
 
 @app.post("/upload-analyze", response_model=QAAnalysisResult)
 async def upload_analyze(file: UploadFile = File(...)):
     try:
         raw  = await file.read()
-        data = json.loads(raw)
+        data = json.loads(raw)          # json is now imported at the top
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON file: {exc}")
 
@@ -215,28 +254,32 @@ async def upload_analyze(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"JSON does not match CallTranscript schema: {exc}")
 
-    logger.info("upload-analyze | call_id=%s agent=%s dept=%s", payload.call_id, payload.agent_name, payload.department)
+    logger.info("upload-analyze | call_id=%s agent=%s dept=%s",
+                payload.call_id, payload.agent_name, payload.department)
     try:
         result = await analyzer.analyze(payload)
     except Exception as exc:
         logger.exception("upload-analyze failed | call_id=%s", payload.call_id)
         raise HTTPException(status_code=502, detail=f"LLM analysis failed: {exc}")
 
-    logger.info("upload-analyze done | call_id=%s assessment=%s", payload.call_id, result.overall_assessment)
+    logger.info("upload-analyze done | call_id=%s assessment=%s",
+                payload.call_id, result.overall_assessment)
     return result
 
 
 @app.post("/analyze-call", response_model=QAAnalysisResult)
 async def analyze_call(payload: CallTranscript) -> QAAnalysisResult:
     logger.info("analyze-call | call_id=%s agent=%s dept=%s duration=%ss",
-                payload.call_id, payload.agent_name, payload.department, payload.call_duration_seconds)
+                payload.call_id, payload.agent_name, payload.department,
+                payload.call_duration_seconds)
     try:
         result = await analyzer.analyze(payload)
     except Exception as exc:
         logger.exception("analyze-call failed | call_id=%s", payload.call_id)
         raise HTTPException(status_code=502, detail=f"LLM analysis failed: {exc}")
 
-    logger.info("analyze-call done | call_id=%s assessment=%s", payload.call_id, result.overall_assessment)
+    logger.info("analyze-call done | call_id=%s assessment=%s",
+                payload.call_id, result.overall_assessment)
     return result
 
 
