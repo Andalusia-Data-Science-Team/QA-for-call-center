@@ -19,9 +19,9 @@ from app.config import settings
 CM_DIR        = Path(__file__).parent / "CM"
 SQL_DIR       = Path(__file__).parent / "SQL" """
 # ❌ Current — resolves to  QA_System-main/app/templates/  (doesn't exist)
-TEMPLATES_DIR = Path(__file__).parent / "templates"
+""" TEMPLATES_DIR = Path(__file__).parent / "templates"
 CM_DIR        = Path(__file__).parent / "CM"
-SQL_DIR       = Path(__file__).parent / "SQL"
+SQL_DIR       = Path(__file__).parent / "SQL" """
 
 # ✅ Fixed — resolves to  QA_System-main/templates/  (correct)
 PROJECT_ROOT  = Path(__file__).parent.parent
