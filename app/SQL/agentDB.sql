@@ -8,6 +8,7 @@ INSERT INTO [DWH].[AI].[Call_QA_Results]
     Channel_Name,
     Call_Date,
     Call_Duration_Seconds,
+    Conversation_Link,
     Compliance_Flag_Type,
     Severity,
     Violation,
@@ -23,7 +24,17 @@ INSERT INTO [DWH].[AI].[Call_QA_Results]
     Escalation_Required,
     Escalation_Reason,
     Weighted_Score,
-    Created_at
+    Created_at,
+    Agent_Classification,
+    Profiling_Comment,
+    BU,
+    Agent_Email_Address,
+    Supervisor_Name,
+    Supervisor_Email_Address,
+    Coaching_Status,
+    Escalated,
+    QA_Reviewed,
+    QA_Review_Comment
 )
 VALUES
 (
@@ -35,6 +46,7 @@ VALUES
     :Channel_Name,
     :Call_Date,
     :Call_Duration_Seconds,
+    :Conversation_Link,
     :Compliance_Flag_Type,
     :Severity,
     :Violation,
@@ -50,5 +62,15 @@ VALUES
     :Escalation_Required,
     :Escalation_Reason,
     :Weighted_Score,
-    :Created_at
+    :Created_at,
+    :Agent_Classification,
+    :Profiling_Comment,
+    :BU,
+    :Agent_Email_Address,
+    :Supervisor_Name,
+    :Supervisor_Email_Address,
+    :Coaching_Status,
+    :Escalated,
+    :QA_Reviewed,
+    :QA_Review_Comment
 );

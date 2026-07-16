@@ -13,6 +13,7 @@ from app.models.input import CallTranscript, BatchCallTranscripts
 from app.models.output import QAAnalysisResult, BatchQAAnalysisResult
 from app.agent import QAAgent
 from app.services.llm_client import LLMClient
+from app.services.sql_helpers import DatabaseWritePermissionError, update_escalation_row
 from app.config import settings
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -125,10 +126,82 @@ async def qa_supervisor_page(request: Request):
 
 # ── Agent email list ──────────────────────────────────────────────────────────
 
+@app.post("/escalations")
+async def create_escalation(payload: dict):
+    call_id = payload.get("call_id")
+    flag_description = payload.get("flag_description")
+    transcript_excerpt = payload.get("transcript_excerpt")
+    supervisor_name = payload.get("supervisor_name")
+    supervisor_email_address = payload.get("supervisor_email_address")
+    conversation_link = payload.get("conversation_link")
+    if not call_id:
+        raise HTTPException(status_code=400, detail="call_id is required")
+
+    try:
+        updated = update_escalation_row(
+            call_id,
+            escalated=True,
+            qa_reviewed=False,
+            qa_review_comment=None,
+            supervisor_name=supervisor_name,
+            supervisor_email_address=supervisor_email_address,
+            coaching_status="Pending Review",
+            flag_description=flag_description,
+            transcript_excerpt=transcript_excerpt,
+            conversation_link=conversation_link,
+        )
+    except DatabaseWritePermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if updated == 0:
+        raise HTTPException(status_code=404, detail="No QA result row found to update")
+    return {"ok": True, "updated": updated}
+
+
+@app.post("/escalations/review")
+async def review_escalation(payload: dict):
+    call_id = payload.get("call_id")
+    review_comment = payload.get("review_comment")
+    if not call_id:
+        raise HTTPException(status_code=400, detail="call_id is required")
+
+    try:
+        updated = update_escalation_row(
+            call_id,
+            qa_reviewed=True,
+            qa_review_comment=review_comment if review_comment is not None else "",
+            coaching_status="Reviewed",
+        )
+    except DatabaseWritePermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if updated == 0:
+        raise HTTPException(status_code=404, detail="No QA result row found to update")
+    return {"ok": True, "updated": updated}
+
+
+@app.post("/escalations/dismiss")
+async def dismiss_escalation(payload: dict):
+    call_id = payload.get("call_id")
+    if not call_id:
+        raise HTTPException(status_code=400, detail="call_id is required")
+
+    try:
+        updated = update_escalation_row(
+            call_id,
+            qa_reviewed=False,
+            qa_review_comment=None,
+            coaching_status="Dismissed",
+        )
+    except DatabaseWritePermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if updated == 0:
+        raise HTTPException(status_code=404, detail="No QA result row found to update")
+    return {"ok": True, "updated": updated}
+
+
 @app.get("/agents/emails")
 async def list_agent_emails(
-    json_file: str = Query(default="passcode.json"),
-    db_key:    str = Query(default="CM"),
+    json_file: str = Query(default="/home/ai/Workspace/Rafik/QA_System-main/app/Passcode.json"),
+    db_key:    str = Query(default="DWH"),
 ):
     import sys
     sys.path.insert(0, str(CM_DIR))
@@ -144,7 +217,7 @@ async def list_agent_emails(
     if not handler.connect():
         raise HTTPException(status_code=503, detail="Cannot connect to CM database.")
 
-    sql_file = str(SQL_DIR / "CM_users.sql")
+    sql_file = str(SQL_DIR / "DWH_Agents.sql")
     try:
         df = handler.execute_query_from_file(sql_file)
     except Exception as exc:
@@ -152,7 +225,7 @@ async def list_agent_emails(
     finally:
         handler.close()
 
-    emails = df["EmailAddress"].dropna().unique().tolist()
+    emails = df["Agent_Email_Address"].dropna().unique().tolist()
     emails.sort()
     return {"emails": emails}
 
@@ -216,7 +289,7 @@ async def retrieve_and_analyze(
             return await analyzer.analyze(call)
         except Exception as exc:
             logger.error("analyze failed | call_id=%s | %s", call.call_id, exc)
-            return QAAnalysisResult.error_result(call.call_id, str(exc))
+            return QAAnalysisResult.error_result(call.call_id, str(exc), conversation_link=call.conversation_link)
 
     results = await asyncio.gather(*[safe_analyze(c) for c in batch.calls])
 

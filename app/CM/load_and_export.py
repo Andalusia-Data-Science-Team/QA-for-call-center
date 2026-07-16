@@ -124,6 +124,79 @@ def export_to_excel(dataframe, output_file):
         print(f"✗ Failed to save Excel file: {e}")
         sys.exit(1)
 
+def load_to_database():
+    """Load the exported CM users Excel file into the target SQL Server table."""
+
+    EXCEL_FILE = Path(__file__).resolve().parent / "CM_Users.xlsx"
+
+    creds = load_credentials_from_json(PASSCODE_FILE, "DWH")
+    if creds:
+        server = creds['server']
+        database = creds['database']
+        username = creds['username']
+        password = creds['password']
+        driver = creds['driver']
+        print(f"✓ Credentials loaded from {PASSCODE_FILE}")
+    else:
+        print("Using default configuration...")
+        server = DB_SERVER
+        database = DB_NAME
+        username = DB_USERNAME
+        password = DB_PASSWORD
+        driver = '{ODBC Driver 17 for SQL Server}'
+
+    connection = connect_to_database(server, database, username, password, driver)
+
+    try:
+        if not EXCEL_FILE.exists():
+            raise FileNotFoundError(f"Excel file not found: {EXCEL_FILE}")
+
+        df = pd.read_excel(EXCEL_FILE)
+        df = df.where(pd.notnull(df), None)
+
+        cursor = connection.cursor()
+        try:
+            insert_query = """
+                INSERT INTO [DWH].[AI].[Agents]
+                (
+                    Agent_Name,
+                    Department,
+                    Created_at,
+                    Agent_Email_Address,
+                    Agent_Email_Password,
+                    [Level],
+                    Supervisor_Name
+                )
+                VALUES
+                (
+                    ?,  -- Agent_Name
+                    ?,  -- Department
+                    ?,  -- Created_at
+                    ?,  -- Agent_Email_Address
+                    ?,  -- Agent_Email_Password
+                    ?,  -- Level
+                    ?   -- Supervisor_Name
+                );
+                """
+
+            for _, row in df.iterrows():
+                cursor.execute(
+                    insert_query,
+                    row["FullName"],                   # Agent_Name
+                    None,                              # Department
+                    row["AccountCreationDateTime"],    # Created_at
+                    row["AccountEmailAddress"],        # Agent_Email_Address
+                    None,                              # Agent_Email_Password
+                    None,                              # Level
+                    None                               # Supervisor_Name
+                )
+
+            connection.commit()
+            print(f"Data imported successfully. Inserted {len(df)} row(s).")
+        finally:
+            cursor.close()
+    finally:
+        connection.close()
 
 def main():
     """Main execution"""
@@ -169,6 +242,7 @@ def main():
         
     finally:
         connection.close()
+        load_to_database()
         print("✓ Database connection closed")
 
 

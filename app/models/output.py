@@ -26,6 +26,8 @@ class ComplianceFlag(BaseModel):
 
 class AgentPerformance(BaseModel):
     professionalism_score: float = Field(..., ge=0.0, le=1.0)
+    accuracy_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    resolution_score: Optional[float] = Field(None, ge=0.0, le=1.0)
     agent_classification: AgentClassification = Field(
         ...,
         alias="Agent Classification",
@@ -51,6 +53,15 @@ class QAAnalysisResult(BaseModel):
     agent_performance: AgentPerformance
     escalation_required: bool
     escalation_reason: Optional[str] = None
+    conversation_link: Optional[str] = None
+    business_unit: Optional[str] = None
+    agent_email_address: Optional[str] = None
+    supervisor_name: Optional[str] = None
+    supervisor_email_address: Optional[str] = None
+    coaching_status: Optional[str] = None
+    escalated: bool = False
+    qa_reviewed: bool = False
+    qa_review_comment: Optional[str] = None
 
     # monitoring only — not part of the public schema
     _latency_ms: Optional[float] = None
@@ -58,7 +69,7 @@ class QAAnalysisResult(BaseModel):
     _completion_tokens: Optional[int] = None
 
     @classmethod
-    def error_result(cls, call_id: str, reason: str) -> "QAAnalysisResult":
+    def error_result(cls, call_id: str, reason: str, conversation_link: Optional[str] = None) -> "QAAnalysisResult":
         """Minimal safe result returned when analysis fails in a batch."""
         return cls(
             call_id=call_id,
@@ -75,6 +86,15 @@ class QAAnalysisResult(BaseModel):
             }),
             escalation_required=False,
             escalation_reason=None,
+            conversation_link=conversation_link,
+            business_unit=None,
+            agent_email_address=None,
+            supervisor_name=None,
+            supervisor_email_address=None,
+            coaching_status=None,
+            escalated=False,
+            qa_reviewed=False,
+            qa_review_comment=None,
         )
 
 

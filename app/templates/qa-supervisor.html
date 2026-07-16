@@ -429,6 +429,26 @@ function fmtTs(iso) {
     } catch (_) { return iso; }
 }
 
+async function readErrorMessage(res) {
+    try {
+        const data = await res.json();
+        if (typeof data?.detail === 'string') return data.detail;
+        if (Array.isArray(data?.detail)) {
+            return data.detail.map(item => item?.msg || item).join(' • ');
+        }
+        if (data?.detail && typeof data.detail === 'object') {
+            return data.detail.msg || JSON.stringify(data.detail);
+        }
+    } catch (_) {}
+
+    try {
+        const text = await res.text();
+        if (text) return text;
+    } catch (_) {}
+
+    return `Request failed with status ${res.status}`;
+}
+
 /* ── Stats ── */
 function refreshStats(items) {
     const pending   = items.filter(e => e.status === 'pending').length;
@@ -626,9 +646,28 @@ function cancelNote(id) {
     if (row) row.style.display = 'none';
 }
 
-function confirmReview(id) {
+async function confirmReview(id) {
     const area = document.getElementById(`note-${id}`);
     const note = area ? area.value.trim() : '';
+    const item = loadAll().find(e => e.id === id);
+    if (!item) return;
+
+    try {
+        const res = await fetch('/escalations/review', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ call_id: item.call_id, review_comment: note || '' }),
+        });
+        if (!res.ok) {
+            const message = await readErrorMessage(res);
+            throw new Error(message);
+        }
+    } catch (err) {
+        console.error('review failed', err);
+        toast(`⚠ ${err.message || 'Review update failed'}`, 'info');
+        return;
+    }
+
     const items = patchItem(id, {
         status:      'reviewed',
         reviewed_at: new Date().toISOString(),
@@ -639,7 +678,26 @@ function confirmReview(id) {
     toast('✅ Marked as reviewed', 'ok');
 }
 
-function dismissItem(id) {
+async function dismissItem(id) {
+    const item = loadAll().find(e => e.id === id);
+    if (!item) return;
+
+    try {
+        const res = await fetch('/escalations/dismiss', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ call_id: item.call_id }),
+        });
+        if (!res.ok) {
+            const message = await readErrorMessage(res);
+            throw new Error(message);
+        }
+    } catch (err) {
+        console.error('dismiss failed', err);
+        toast(`⚠ ${err.message || 'Dismiss update failed'}`, 'info');
+        return;
+    }
+
     const items = patchItem(id, {
         status:      'dismissed',
         reviewed_at: new Date().toISOString(),

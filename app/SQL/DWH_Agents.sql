@@ -1,0 +1,11 @@
+/****** Script for SelectTopNRows command from SSMS  ******/
+SELECT [Agent_id]
+      ,[Agent_Name]
+      ,[Department]
+      ,[is_Active]
+      ,[Created_at]
+      ,[Agent_Email_Address]
+      ,[Agent_Email_Password]
+      ,[Level]
+      ,[Supervisor_Name]
+  FROM [DWH].[AI].[Agents]

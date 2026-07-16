@@ -371,11 +371,17 @@ function callRecordHTML(r, idx) {
            </div>`
         : '';
 
+    const conversationLinkHTML = r.conversation_link
+        ? `<a href="${esc(r.conversation_link)}" target="_blank" rel="noopener" style="color:#667eea;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:4px;">
+               🔗 ${esc(r.conversation_link)}
+           </a>`
+        : '<span style="color:#a0aec0;font-style:italic;">No conversation link</span>';
+
     return `
     <details class="call-record" ${idx === 0 ? 'open' : ''}>
         <summary>
-            <span>
-                <span class="call-record-id">${esc(r.call_id)}</span>
+            <span style="display:flex;flex-direction:column;gap:3px;min-width:0;flex:1;">
+                ${conversationLinkHTML}
                 <span class="call-record-date">${esc(r.call_date || '')}</span>
             </span>
             <span style="display:flex; gap:8px; align-items:center;">

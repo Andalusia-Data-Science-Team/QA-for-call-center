@@ -575,6 +575,7 @@ async def aggregate_results(state: AgentState) -> dict:
         # resolution_score and accuracy_score removed
         "escalation_required": scoring.get("escalation_required", False),
         "escalation_reason":   scoring.get("escalation_reason"),
+        "conversation_link":   state["call"].conversation_link,
     }
 
     logger.debug(

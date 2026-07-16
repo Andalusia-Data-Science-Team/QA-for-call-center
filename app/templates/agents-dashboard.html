@@ -376,7 +376,7 @@ function updateSupervisorBadge() {
 }
 
 /* ── Escalate a single violation ── */
-function escalateViolation(rIdx, fIdx, btn) {
+async function escalateViolation(rIdx, fIdx, btn) {
     if (btn.classList.contains('done')) return;
 
     const r = _lastResults[rIdx];
@@ -422,7 +422,28 @@ function escalateViolation(rIdx, fIdx, btn) {
         localStorage.setItem(ESCALATION_KEY, JSON.stringify(existing));
     } catch (err) {
         console.error('[escalate] localStorage write failed:', err);
-        showToast('⚠️ Could not save escalation — storage may be full.', 'error');
+    }
+
+    try {
+        const res = await fetch(`${API_BASE}/escalations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                call_id: r.call_id,
+                flag_description: f.description,
+                transcript_excerpt: f.transcript_excerpt,
+                conversation_link: r.conversation_link || null,
+                supervisor_name: 'Team Leader',
+                supervisor_email_address: '',
+            }),
+        });
+        if (!res.ok) {
+            const body = await res.json().catch(() => ({ detail: res.statusText }));
+            throw new Error(body.detail || res.statusText);
+        }
+    } catch (err) {
+        console.error('[escalate] DB write failed:', err);
+        showToast('⚠️ Escalation saved locally, but the database update failed.', 'error');
         return;
     }
 

@@ -31,11 +31,17 @@ from app.models.output import QAAnalysisResult
 
 logger = logging.getLogger(__name__)
 
+
+class DatabaseWritePermissionError(PermissionError):
+    """Raised when the configured DB account cannot write to the QA results table."""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 ANALYSIS_VERSION = 1
+_UNSET = object()
 
 _APP_DIR = Path(__file__).resolve().parent.parent
 
@@ -70,10 +76,12 @@ def _weighted_score(result: QAAnalysisResult) -> float:
     Passed_Threshold is a computed column in the DB derived from this value.
     """
     perf = result.agent_performance
+    accuracy_score = perf.accuracy_score if perf.accuracy_score is not None else 0.0
+    resolution_score = perf.resolution_score if perf.resolution_score is not None else 0.0
     return round(
         perf.professionalism_score * 0.40
-        + perf.accuracy_score      * 0.30
-        + perf.resolution_score    * 0.30,
+        + accuracy_score * 0.30
+        + resolution_score * 0.30,
         4,
     )
 
@@ -97,23 +105,102 @@ def _call_level_params(
         "Channel_Name":          channel_name,
         "Call_Date":             call.call_date,
         "Call_Duration_Seconds": call.call_duration_seconds,
+        "Conversation_Link":     call.conversation_link,
         "Overall_Assessment":    result.overall_assessment,
         "Assessment_Reasoning":  result.assessment_reasoning,
         "Professionalism_Score": perf.professionalism_score,
-        "Accuracy_Score":        perf.accuracy_score,
-        "Resolution_Score":      perf.resolution_score,
+        "Accuracy_Score":        perf.accuracy_score if perf.accuracy_score is not None else 0.0,
+        "Resolution_Score":      perf.resolution_score if perf.resolution_score is not None else 0.0,
         "Strengths":             json.dumps(perf.strengths,    ensure_ascii=False),
         "Improvements":          json.dumps(perf.improvements, ensure_ascii=False),
         "Escalation_Required":   1 if result.escalation_required else 0,
         "Escalation_Reason":     result.escalation_reason,
         "Weighted_Score":        weighted,
         "Created_at":            created_at,
+        "Agent_Classification":  perf.agent_classification,
+        "Profiling_Comment":     perf.profiling_comment,
+        "BU":                    result.business_unit,
+        "Agent_Email_Address":   result.agent_email_address,
+        "Supervisor_Name":       result.supervisor_name,
+        "Supervisor_Email_Address": result.supervisor_email_address,
+        "Coaching_Status":       result.coaching_status,
+        "Escalated":             1 if result.escalated else 0,
+        "QA_Reviewed":           1 if result.qa_reviewed else 0,
+        "QA_Review_Comment":     result.qa_review_comment,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
+
+def update_escalation_row(
+    call_id: str,
+    *,
+    escalated: Optional[bool] = None,
+    qa_reviewed: Optional[bool] = None,
+    qa_review_comment: object = _UNSET,
+    supervisor_name: Optional[str] = None,
+    supervisor_email_address: Optional[str] = None,
+    coaching_status: Optional[str] = None,
+    flag_description: Optional[str] = None,
+    transcript_excerpt: Optional[str] = None,
+    conversation_link: Optional[str] = None,
+) -> int:
+    """Update the matching QA result row(s) with escalation-review state."""
+    engine = _build_engine()
+    with engine.begin() as conn:
+        params: dict[str, object] = {"call_id": call_id}
+        where_clauses = ["Call_ID = :call_id"]
+        if flag_description is not None:
+            where_clauses.append("COALESCE(Flag_Description, '') = :flag_description")
+            params["flag_description"] = flag_description
+        if transcript_excerpt is not None:
+            where_clauses.append("COALESCE(Transcript_Excerpt, '') = :transcript_excerpt")
+            params["transcript_excerpt"] = transcript_excerpt
+
+        select_sql = sa_text(
+            f"SELECT TOP 1 ID FROM [DWH].[AI].[Call_QA_Results] WHERE {' AND '.join(where_clauses)} ORDER BY Created_at DESC, ID DESC"
+        )
+        row = conn.execute(select_sql, params).fetchone()
+        if row is None:
+            return 0
+
+        values: dict[str, object] = {}
+        if escalated is not None:
+            values["Escalated"] = 1 if escalated else 0
+        if qa_reviewed is not None:
+            values["QA_Reviewed"] = 1 if qa_reviewed else 0
+        if qa_review_comment is not _UNSET:
+            values["QA_Review_Comment"] = qa_review_comment
+        if supervisor_name is not None:
+            values["Supervisor_Name"] = supervisor_name
+        if supervisor_email_address is not None:
+            values["Supervisor_Email_Address"] = supervisor_email_address
+        if coaching_status is not None:
+            values["Coaching_Status"] = coaching_status
+        if conversation_link is not None:
+            values["Conversation_Link"] = conversation_link
+
+        if not values:
+            return 0
+
+        assignments = ", ".join(f"{k} = :{k}" for k in values)
+        update_sql = sa_text(
+            f"UPDATE [DWH].[AI].[Call_QA_Results] SET {assignments} WHERE ID = :row_id"
+        )
+        params.update({"row_id": row[0], **values})
+        try:
+            result = conn.execute(update_sql, params)
+        except Exception as exc:
+            message = str(exc)
+            if "permission was denied" in message.lower() or "update permission" in message.lower() or "229" in message:
+                raise DatabaseWritePermissionError(
+                    "The configured database account does not have UPDATE permission on DWH.AI.Call_QA_Results."
+                ) from exc
+            raise
+        return result.rowcount or 0
+
 
 def insert_qa_result(
     result: QAAnalysisResult,
