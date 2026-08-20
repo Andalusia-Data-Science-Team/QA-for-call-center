@@ -88,6 +88,7 @@ def build_behavioral_prompt(
 Evaluate the agent's BEHAVIORAL performance in the call below.
 Focus exclusively on: tone, professionalism, empathy, active listening, prohibited phrases, and red-flag language.
 Do NOT evaluate compliance pillars, script adherence, or scoring weights here.
+If there is no response from the patient agent can use the script to greet and close the call. 
 
 ## SEVERITY REMINDER
 - critical   → patient safety risk ONLY (wrong drug, wrong dose, aggression ignored).
@@ -164,6 +165,14 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
   If the agent acknowledged the patient's issue and gave a concrete next step (callback, escalation,
   transfer), troubleshooting was NOT failed — even if the root cause was not resolved in this call.
 
+## AUTOMATED SYSTEM MESSAGES & CLOSING PROTOCOL
+  System-generated messages (e.g., "The call has ended due to inactivity") are NOT violations if:
+  - The agent used proper closing script before patient became unresponsive
+  - The patient did not respond for an extended period (30+ seconds)
+  - The agent attempted to re-engage or used proper farewell before system timeout
+  Do NOT flag automated closings or system messages as violations when the agent followed proper protocol.
+  This includes: "Close the call on time", "Didn't Commit to call script", "Professional Closing" violations.
+
 DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT over-evaluate.
 
 ════════════════════════════════════════════════════════════
@@ -233,6 +242,14 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
   If the agent acknowledged the patient's issue and gave a concrete next step (callback, escalation,
   transfer), troubleshooting was NOT failed — even if the root cause was not resolved in this call.
 
+## AUTOMATED SYSTEM MESSAGES & CLOSING PROTOCOL
+  System-generated messages (e.g., "The call has ended due to inactivity") are NOT violations if:
+  - The agent used proper closing script before patient became unresponsive
+  - The patient did not respond for an extended period (30+ seconds)
+  - The agent attempted to re-engage or used proper farewell before system timeout
+  Do NOT flag automated closings or system messages as violations when the agent followed proper protocol.
+  This includes: "Close the call on time", "Didn't Commit to call script", "Professional Closing" violations.
+
 DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT over-evaluate.
 
 ════════════════════════════════════════════════════════════
@@ -286,8 +303,9 @@ def build_script_prompt(
 ) -> str:
     return f"""\
 Evaluate the agent's adherence to the APPROVED SCRIPT TEMPLATES in the call below.
-Evaluate only the greeting and closing sections. Do not strictly enforce the exact scripts provided; instead, assess whether the conversation aligns with their intended purpose and conveys the expected concepts.
+Do not strictly enforce the exact scripts provided; instead, assess whether the conversation aligns with their intended purpose and conveys the expected concepts.
 Do NOT evaluate compliance pillars, behavioral tone, or scoring weights here.
+If there is no response from the patient agent can use the script to greet and close the call.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA

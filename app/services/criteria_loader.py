@@ -241,25 +241,30 @@ class CriteriaLoader:
 
     def script_templates(self) -> str:
         """
-        Return a compact greeting / closing script reference.
+        Return DCC script compliance criteria from the unified DCC_scripts.yaml file.
         """
-        greetings = _load_yaml("scripts/greetings.yaml")
-        closings  = _load_yaml("scripts/closings.yaml")
+        dcc_scripts = _load_yaml("scripts/DCC_scripts.yaml")
         lines: list[str] = ["# SCRIPT TEMPLATES"]
-
-        def _render_scripts(data: dict, label: str) -> None:
-            std = data.get(f"standard_{label}s") or data.get("standard_closings") or data.get("standard_greetings")
-            if not std:
-                return
-            lines.append(f"\n## {label.capitalize()} Scripts")
-            for lang, phrases in std.items():
-                lines.append(f"  [{lang.upper()}]")
-                for p in phrases:
-                    formatted = _fix_arabic(p) if lang.lower() == "arabic" else p
-                    lines.append(f"    • {formatted}")
-
-        _render_scripts(greetings, "greeting")
-        _render_scripts(closings, "closing")
+        
+        # Render DCC script compliance evaluation criteria
+        script_compliance = dcc_scripts.get("script_compliance", {})
+        eval_criteria = script_compliance.get("evaluation_criteria", [])
+        if eval_criteria:
+            lines.append("\n## DCC Script Compliance Evaluation Criteria")
+            for item in eval_criteria:
+                order = item.get("order", "")
+                stage = item.get("stage", "")
+                script = item.get("script", "")
+                notes = item.get("notes", "")
+                
+                lines.append(f"\n  [{order}] {stage}")
+                if script:
+                    formatted_script = _fix_arabic(script)
+                    lines.append(f"    Script: {formatted_script}")
+                if notes:
+                    formatted_notes = _fix_arabic(notes)
+                    lines.append(f"    Notes: {formatted_notes}")
+        
         return "\n".join(lines)
 
     # ── 5. Scoring weights ────────────────────────────────────────────────

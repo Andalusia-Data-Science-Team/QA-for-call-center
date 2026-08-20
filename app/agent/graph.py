@@ -179,16 +179,16 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         "infer_compliance_evaluation",
         functools.partial(infer_compliance_evaluation, llm_client=llm_client),
     )
-    # infer_script_matching is currently disabled (returns pass) — excluded
-    # from the graph so it does not corrupt the inference_ready barrier count.
-    # Re-add it here + wire it when the script-matching LLM call is enabled.
-
+    builder.add_node(
+        "infer_script_matching",
+        functools.partial(infer_script_matching, llm_client=llm_client),
+    )
     builder.add_node(
         "infer_reservation_evaluation",
         functools.partial(infer_reservation_evaluation, llm_client=llm_client),
     )
 
-    # Stage 4: scoring synthesis (fan-in barrier — waits for all 4 focused nodes)
+    # Stage 4: scoring synthesis (fan-in barrier — waits for all 3 focused nodes)
     builder.add_node(
         "infer_overall_scoring",
         functools.partial(infer_overall_scoring, llm_client=llm_client),
@@ -198,15 +198,16 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_node("criteria_ready", lambda state: {})
 
     # Barrier node 1b — fan-in that waits for the booking/skip branch to
-    # fully complete before the two parallel LLM calls start.  This is the
-    # SINGLE entry point into behavioral + compliance, preventing any second
+    # fully complete before the three parallel LLM calls start.  This is the
+    # SINGLE entry point into behavioral + compliance + script_matching, preventing any second
     # trigger from arriving via a different path.
     builder.add_node("inference_gate", lambda state: {})
 
     # Barrier node 2 — fan-in that waits for:
     #   • infer_behavioral_evaluation
     #   • infer_compliance_evaluation
-    # Exactly 2 unconditional predecessors — both come from inference_gate.
+    #   • infer_script_matching
+    # Exactly 3 unconditional predecessors — all come from inference_gate.
     builder.add_node("inference_ready", lambda state: {})
 
     # Stage 5: aggregate + validate merged result
@@ -240,7 +241,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         {"continue": "load_behavioral_criteria", "handle_error": "handle_error"},
     )
     builder.add_edge("load_call", "load_compliance_pillars")
-    #builder.add_edge("load_call", "load_script_templates")
+    builder.add_edge("load_call", "load_script_templates")
     builder.add_edge("load_call", "load_reservation_pillars")
     builder.add_edge("load_call", "load_scoring_weights")
 
@@ -252,7 +253,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # This replaces the previous 5×5 = 25 repeated edges with 5 + 5 = 10.
     builder.add_edge("load_behavioral_criteria", "criteria_ready")
     builder.add_edge("load_compliance_pillars",  "criteria_ready")
-    #builder.add_edge("load_script_templates",    "criteria_ready")
+    builder.add_edge("load_script_templates",    "criteria_ready")
     builder.add_edge("load_reservation_pillars", "criteria_ready")
     builder.add_edge("load_scoring_weights",     "criteria_ready")
 
@@ -293,18 +294,18 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         {"continue": "inference_gate", "handle_error": "handle_error"},
     )
 
-    # ── Step 3: inference_gate → behavioral + compliance (parallel) ────────
+    # ── Step 3: inference_gate → behavioral + compliance + script_matching (parallel) ────────
     #
-    # Both nodes have exactly ONE incoming edge: from inference_gate.
+    # All three nodes have exactly ONE incoming edge: from inference_gate.
     # No other node feeds them, so inference_ready can only fire once.
     builder.add_edge("inference_gate", "infer_behavioral_evaluation")
     builder.add_edge("inference_gate", "infer_compliance_evaluation")
-    # infer_script_matching excluded (disabled) — add back here when re-enabled
+    builder.add_edge("inference_gate", "infer_script_matching")
 
-    # ── Step 4: behavioral + compliance fan-in → inference_ready ──────────
+    # ── Step 4: behavioral + compliance + script_matching fan-in → inference_ready ──────────
     #
-    # Exactly 2 unconditional predecessors: behavioral + compliance.
-    # LangGraph fires inference_ready only after both complete.
+    # Exactly 3 unconditional predecessors: behavioral + compliance + script_matching.
+    # LangGraph fires inference_ready only after all three complete.
     builder.add_conditional_edges(
         "infer_behavioral_evaluation",
         _error_router,
@@ -312,6 +313,11 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     )
     builder.add_conditional_edges(
         "infer_compliance_evaluation",
+        _error_router,
+        {"continue": "inference_ready", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "infer_script_matching",
         _error_router,
         {"continue": "inference_ready", "handle_error": "handle_error"},
     )
