@@ -15,7 +15,8 @@ class AgentState(TypedDict, total=False):
     # ── Criteria blocks (loaded in parallel) ──────────────────────────────
     behavioral_criteria: str        # written by load_behavioral_criteria
     compliance_pillars: str         # written by load_compliance_pillars
-    reservation_pillars: str        # written by load_reservation_pillars  ← was "reservation_criteria"
+    reservation_pillars: str        # written by load_reservation_pillars
+    offer_pillars: str              # written by load_offer_pillars
     script_templates: str           # written by load_script_templates
     scoring_weights: str            # written by load_scoring_weights
 
@@ -25,6 +26,7 @@ class AgentState(TypedDict, total=False):
     behavioral_eval: dict[str, Any]   # from infer_behavioral_evaluation
     compliance_eval: dict[str, Any]   # from infer_compliance_evaluation
     reservation_eval: dict[str, Any]  # from infer_reservation_evaluation
+    offer_eval: dict[str, Any]        # from infer_offer_evaluation
     script_eval: dict[str, Any]       # from infer_script_matching
     scoring_eval: dict[str, Any]      # from infer_overall_scoring
 
@@ -41,6 +43,7 @@ class AgentState(TypedDict, total=False):
     intent_label: Optional[str]
     appointment_details: Optional[dict[str, Any]]
     appointment_verification: Optional[dict[str, Any]]
+    crm_offers_context: Optional[str]   # written by fetch_crm_offers_for_call
 
     # ── Error handling ────────────────────────────────────────────────────
     error: Optional[str]

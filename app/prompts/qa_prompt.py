@@ -453,6 +453,137 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NODE E — Offer Recommendation Evaluation Prompt
+#   Focus: did the agent correctly identify, present, and handle a relevant
+#          CRM promotional offer for the patient's specialty?
+#
+#   Four possible outcomes (one must be chosen):
+#     SUITABLE_OFFER_RECOMMENDED   — agent did the right thing (positive flag)
+#     OFFER_SKIPPED                — offer existed but agent did not mention it (C2B)
+#     UNRELATED_OFFER_RECOMMENDED  — agent mentioned an irrelevant offer (C2B)
+#     NO_OFFER_AVAILABLE           — no active offer for this specialty (no flag)
+#     OFFER_NOT_APPLICABLE         — call type does not warrant offer check (no flag)
+#     OFFER_MISREPRESENTED         — wrong price / date / specialty details (C2B)
+#     INCOMPLETE_OFFER_PRESENTATION — offer mentioned but key details omitted (NC)
+#     MISSING_OFFER_CONFIRMATION_ASK — offer shown but patient not asked to book (NC)
+#
+#   Output fields: offer_outcome, offer_flags, offer_reasoning.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_offer_prompt(
+    call: "CallTranscript",
+    offer_pillars: str = "",
+    crm_offers_context: str = "",
+) -> str:
+    """
+    Evaluate whether the agent correctly handled CRM promotional offers during
+    the call.
+
+    Parameters
+    ----------
+    call : CallTranscript
+        The call being evaluated.
+    offer_pillars : str
+        Compact text block from CriteriaLoader.offer_pillars() — contains the
+        pillar definitions and evaluation guidance.
+    crm_offers_context : str
+        Optional: a JSON-serialised list of active CRM offers that were
+        available for the patient's specialty at the time of the call.
+        When provided, the LLM can compare what the agent said against the
+        actual available offers.  Pass "" when offers cannot be fetched.
+    """
+    crm_section = (
+        f"""\
+════════════════════════════════════════════════════════════
+AVAILABLE CRM OFFERS  (active offers for this specialty at call time)
+════════════════════════════════════════════════════════════
+{crm_offers_context}
+"""
+        if crm_offers_context
+        else """\
+════════════════════════════════════════════════════════════
+AVAILABLE CRM OFFERS
+════════════════════════════════════════════════════════════
+(CRM offer data not available for this evaluation — infer from transcript only)
+"""
+    )
+
+    return f"""\
+Evaluate whether the agent correctly identified and presented a relevant promotional
+offer to the patient during the call below.
+
+## YOUR TASK
+1. Read the transcript and determine whether the call type warrants an offer check
+   (booking call, service inquiry, or explicit offer question from patient).
+2. Identify whether the agent mentioned any promotional offer.
+3. Compare what the agent said (if anything) against the available CRM offers
+   provided below.
+4. Choose exactly ONE outcome from the list and produce the appropriate flags.
+
+## OUTCOME DEFINITIONS
+- SUITABLE_OFFER_RECOMMENDED   : Agent identified and correctly presented a matching offer → positive flag.
+- OFFER_SKIPPED                : A relevant offer existed (visible in CRM context or inferable) but the
+                                 agent never mentioned it → C2B flag (moderate).
+- UNRELATED_OFFER_RECOMMENDED  : Agent presented an offer that does not match the patient's specialty,
+                                 service request, or gender → C2B flag (moderate).
+- OFFER_MISREPRESENTED         : Agent stated incorrect price, discount percentage, expiry date, or
+                                 specialty for an offer → C2B flag (moderate).
+- INCOMPLETE_OFFER_PRESENTATION: Agent mentioned the offer correctly but omitted price or expiry date → NC flag (minor).
+- MISSING_OFFER_CONFIRMATION_ASK: Agent presented the offer but did not ask the patient whether they
+                                  want to proceed with it → NC flag (minor).
+- NO_OFFER_AVAILABLE           : No active CRM offer exists for this specialty → no flag, no penalisation.
+- OFFER_NOT_APPLICABLE         : Call is a complaint, emergency, admin, or follow-up with no booking
+                                 intent → no flag, no penalisation.
+
+## IMPORTANT RULES
+- Do NOT penalise the agent when CRM offers context is absent — choose NO_OFFER_AVAILABLE or
+  OFFER_NOT_APPLICABLE in ambiguous cases rather than guessing.
+- Do NOT penalise when the patient explicitly declined an offer the agent correctly presented.
+- Short calls (< 90 seconds) and calls with no specialty signal → OFFER_NOT_APPLICABLE.
+- Report at most 1 offer flag per call.
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Department: {call.department}
+
+════════════════════════════════════════════════════════════
+OFFER RECOMMENDATION PILLARS  (evaluate strictly against these)
+════════════════════════════════════════════════════════════
+{offer_pillars or "(not loaded)"}
+
+{crm_section}
+════════════════════════════════════════════════════════════
+TRANSCRIPT
+════════════════════════════════════════════════════════════
+{call.transcript}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "offer_outcome": "<SUITABLE_OFFER_RECOMMENDED | OFFER_SKIPPED | UNRELATED_OFFER_RECOMMENDED | OFFER_MISREPRESENTED | INCOMPLETE_OFFER_PRESENTATION | MISSING_OFFER_CONFIRMATION_ASK | NO_OFFER_AVAILABLE | OFFER_NOT_APPLICABLE>",
+  "offer_reasoning": "<2-3 sentences citing specific transcript evidence for your choice>",
+  "offer_flags": [
+    {{
+      "type": "<C2B | NC | positive>",
+      "severity": "<moderate | minor | positive>",
+      "description": "<1-2 sentences referencing the exact pillar name and outcome>",
+      "transcript_excerpt": "<verbatim excerpt or 'N/A' when no mention in transcript>"
+    }}
+  ]
+}}
+
+IMPORTANT: offer_flags must be an EMPTY LIST [] when the outcome is
+NO_OFFER_AVAILABLE or OFFER_NOT_APPLICABLE.
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LEGACY — build_user_prompt()
 #   Kept for backward-compatibility with the non-graph CallAnalyzer path.
 #   The new graph pipeline uses the four focused builders above instead.

@@ -106,11 +106,14 @@ from app.agent.nodes import (
     load_behavioral_criteria,
     load_compliance_pillars,
     load_reservation_pillars,
+    load_offer_pillars,
     load_script_templates,
     load_scoring_weights,
     infer_behavioral_evaluation,
     infer_compliance_evaluation,
     infer_reservation_evaluation,
+    infer_offer_evaluation,
+    fetch_crm_offers_for_call,
     infer_script_matching,
     infer_overall_scoring,
     aggregate_results,
@@ -167,6 +170,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_node("load_behavioral_criteria", load_behavioral_criteria)
     builder.add_node("load_compliance_pillars",  load_compliance_pillars)
     builder.add_node("load_reservation_pillars", load_reservation_pillars)
+    builder.add_node("load_offer_pillars",       load_offer_pillars)
     builder.add_node("load_script_templates",    load_script_templates)
     builder.add_node("load_scoring_weights",     load_scoring_weights)
 
@@ -187,6 +191,11 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         "infer_reservation_evaluation",
         functools.partial(infer_reservation_evaluation, llm_client=llm_client),
     )
+    builder.add_node("fetch_crm_offers_for_call", fetch_crm_offers_for_call)
+    builder.add_node(
+        "infer_offer_evaluation",
+        functools.partial(infer_offer_evaluation, llm_client=llm_client),
+    )
 
     # Stage 4: scoring synthesis (fan-in barrier — waits for all 3 focused nodes)
     builder.add_node(
@@ -204,10 +213,11 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_node("inference_gate", lambda state: {})
 
     # Barrier node 2 — fan-in that waits for:
-    #   • infer_behavioral_evaluation
-    #   • infer_compliance_evaluation
-    #   • infer_script_matching
-    # Exactly 3 unconditional predecessors — all come from inference_gate.
+    #   • infer_behavioral_evaluation     (direct from inference_gate)
+    #   • infer_compliance_evaluation     (direct from inference_gate)
+    #   • infer_offer_evaluation          (via fetch_crm_offers_for_call)
+    #   • infer_script_matching           (direct from inference_gate)
+    # Exactly 4 unconditional predecessors.
     builder.add_node("inference_ready", lambda state: {})
 
     # Stage 5: aggregate + validate merged result
@@ -234,7 +244,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Entry
     builder.add_edge(START, "load_call")
 
-    # load_call → error check (conditional) then fan-out to all 5 criteria loaders.
+    # load_call → error check (conditional) then fan-out to all 6 criteria loaders.
     builder.add_conditional_edges(
         "load_call",
         _error_router,
@@ -243,18 +253,19 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_edge("load_call", "load_compliance_pillars")
     builder.add_edge("load_call", "load_script_templates")
     builder.add_edge("load_call", "load_reservation_pillars")
+    builder.add_edge("load_call", "load_offer_pillars")
     builder.add_edge("load_call", "load_scoring_weights")
 
-    # ── All 5 loaders fan-in to the barrier node ──────────────────────────
+    # ── All 6 loaders fan-in to the barrier node ──────────────────────────
     #
     # criteria_ready is a no-op that LangGraph uses as a synchronisation
     # point: it fires only after every loader has written its state key.
-    # From there we fan-out to the 4 parallel inference nodes + detect_intent.
-    # This replaces the previous 5×5 = 25 repeated edges with 5 + 5 = 10.
+    # From there we fan-out to the inference nodes + detect_intent.
     builder.add_edge("load_behavioral_criteria", "criteria_ready")
     builder.add_edge("load_compliance_pillars",  "criteria_ready")
     builder.add_edge("load_script_templates",    "criteria_ready")
     builder.add_edge("load_reservation_pillars", "criteria_ready")
+    builder.add_edge("load_offer_pillars",       "criteria_ready")
     builder.add_edge("load_scoring_weights",     "criteria_ready")
 
     # ── Step 1: detect_intent runs first (sequential, after all loaders) ──
@@ -294,18 +305,23 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         {"continue": "inference_gate", "handle_error": "handle_error"},
     )
 
-    # ── Step 3: inference_gate → behavioral + compliance + script_matching (parallel) ────────
+    # ── Step 3: inference_gate fan-out ────────────────────────────────────
     #
-    # All three nodes have exactly ONE incoming edge: from inference_gate.
-    # No other node feeds them, so inference_ready can only fire once.
+    # Three nodes run in PARALLEL directly from inference_gate:
+    #   behavioral, compliance, script_matching.
+    #
+    # The offer path has one extra sequential step:
+    #   inference_gate → fetch_crm_offers_for_call → infer_offer_evaluation
+    # This ensures live CRM data is fetched BEFORE the offer LLM prompt runs.
     builder.add_edge("inference_gate", "infer_behavioral_evaluation")
     builder.add_edge("inference_gate", "infer_compliance_evaluation")
     builder.add_edge("inference_gate", "infer_script_matching")
+    builder.add_edge("inference_gate", "fetch_crm_offers_for_call")
+    builder.add_edge("fetch_crm_offers_for_call", "infer_offer_evaluation")
 
-    # ── Step 4: behavioral + compliance + script_matching fan-in → inference_ready ──────────
+    # ── Step 4: all four evaluations fan-in → inference_ready ─────────────
     #
-    # Exactly 3 unconditional predecessors: behavioral + compliance + script_matching.
-    # LangGraph fires inference_ready only after all three complete.
+    # LangGraph fires inference_ready only after all four complete.
     builder.add_conditional_edges(
         "infer_behavioral_evaluation",
         _error_router,
@@ -313,6 +329,11 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     )
     builder.add_conditional_edges(
         "infer_compliance_evaluation",
+        _error_router,
+        {"continue": "inference_ready", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "infer_offer_evaluation",
         _error_router,
         {"continue": "inference_ready", "handle_error": "handle_error"},
     )

@@ -1,0 +1,125 @@
+version: "1.0"
+effective_date: "2026-08-20"
+last_updated: "2026-08-20"
+source: "Andalusia QA Offer Evaluation Policy"
+department: "general"
+category: "offer_regulations"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OFFER RECOMMENDATION EVALUATION PILLARS
+#
+# Purpose: Evaluate whether the call-center agent proactively checked for and
+#          presented relevant CRM promotional offers to the patient.
+#
+# Possible agent outcomes (evaluated by the LLM using transcript evidence):
+#   SUITABLE_OFFER_RECOMMENDED   — Agent found and presented the correct offer.
+#   UNRELATED_OFFER_RECOMMENDED  — Agent mentioned an offer that does not match
+#                                  the patient's specialty / service request.
+#   OFFER_SKIPPED                — A suitable offer existed but the agent did not
+#                                  mention it (or clearly skipped it).
+#   NO_OFFER_AVAILABLE           — No active CRM offer existed for this specialty;
+#                                  agent is not penalised.
+#   OFFER_NOT_APPLICABLE         — The call type (complaint, info only, emergency
+#                                  etc.) does not warrant an offer check.
+# ─────────────────────────────────────────────────────────────────────────────
+
+pillars:
+
+  Offer_Recommendation_Quality:
+    original_name: "Offer Recommendation Quality"
+    severity: "C2B"
+    description: >
+      The agent must proactively check for and present any active promotional
+      offer that matches the patient's specialty and service request during
+      booking or inquiry calls. Failing to do so, or presenting an unrelated
+      offer, is a business-critical deviation.
+    items:
+
+      - id: "C2B_OFF_001"
+        violation: "Agent skipped offer recommendation — a suitable active offer existed for the patient's specialty but was not mentioned"
+        severity: "Critical to Business"
+        type: "C2B"
+        outcome: "OFFER_SKIPPED"
+
+      - id: "C2B_OFF_002"
+        violation: "Agent recommended an unrelated offer — the offer presented does not match the patient's specialty, service, or gender"
+        severity: "Critical to Business"
+        type: "C2B"
+        outcome: "UNRELATED_OFFER_RECOMMENDED"
+
+      - id: "C2B_OFF_003"
+        violation: "Agent presented the offer incorrectly — price, discount, validity date, or specialty details were communicated inaccurately"
+        severity: "Critical to Business"
+        type: "C2B"
+        outcome: "OFFER_MISREPRESENTED"
+
+  Offer_Handling_Process:
+    original_name: "Offer Handling Process"
+    severity: "NC"
+    description: >
+      Even when an offer is found and correctly matched, the agent must follow
+      the standard presentation flow: state the offer name, price before/after
+      discount, expiry date, and ask the patient whether they wish to book with
+      the offer.
+    items:
+
+      - id: "NC_OFF_001"
+        violation: "Agent mentioned the offer but did not state the discounted price or expiry date"
+        severity: "Non-Critical"
+        type: "NC"
+        outcome: "INCOMPLETE_OFFER_PRESENTATION"
+
+      - id: "NC_OFF_002"
+        violation: "Agent did not ask the patient whether they want to book with the offer"
+        severity: "Non-Critical"
+        type: "NC"
+        outcome: "MISSING_OFFER_CONFIRMATION_ASK"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATION GUIDANCE FOR THE QA ANALYST (LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+evaluation_guidance:
+
+  when_to_check:
+    - "Booking calls (حجز, موعد, احجز) where a specialty is confirmed"
+    - "Inquiry calls where the patient asks about services under a specific specialty"
+    - "Calls where the patient explicitly asks about offers (عروض, خصم, باقة)"
+
+  when_NOT_to_penalise:
+    - "Complaint calls, follow-up calls, or administrative calls not related to booking"
+    - "Calls where the CRM returned no active offer for the patient's specialty"
+    - "Calls where the patient explicitly declined an offer that was correctly presented"
+    - "Emergency or urgent-care routing calls"
+    - "Short calls (under 90 seconds) where the agent had no reasonable opportunity to mention offers"
+    - "Calls where the transcript contains no specialty or service signal"
+
+  scoring_outcomes:
+    SUITABLE_OFFER_RECOMMENDED:
+      flag_type: "positive"
+      description: "Agent correctly identified and presented the matching offer — no violation."
+    UNRELATED_OFFER_RECOMMENDED:
+      flag_type: "C2B"
+      severity: "moderate"
+      description: "Agent presented an offer that does not match the patient's specialty or service request."
+    OFFER_SKIPPED:
+      flag_type: "C2B"
+      severity: "moderate"
+      description: "A suitable offer existed but the agent failed to mention it."
+    NO_OFFER_AVAILABLE:
+      flag_type: null
+      description: "No active offer found for this specialty — no penalisation."
+    OFFER_NOT_APPLICABLE:
+      flag_type: null
+      description: "Call type does not require offer recommendation — no penalisation."
+    OFFER_MISREPRESENTED:
+      flag_type: "C2B"
+      severity: "moderate"
+      description: "Agent communicated incorrect offer details (price, date, specialty)."
+    INCOMPLETE_OFFER_PRESENTATION:
+      flag_type: "NC"
+      severity: "minor"
+      description: "Offer was presented but key details (price/expiry) were omitted."
+    MISSING_OFFER_CONFIRMATION_ASK:
+      flag_type: "NC"
+      severity: "minor"
+      description: "Agent did not ask the patient whether they want to proceed with the offer."

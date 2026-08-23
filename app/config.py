@@ -31,5 +31,19 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 2048
     llm_timeout_seconds: float = 60.0
 
+     
+    # --- Dynamics 365 CRM (doctor reference data incl. walk-in / cash price) ---
+    # Accessed via the CRM TDS endpoint (SQL protocol) with Azure AD auth.
+    CRM_SERVER: str = os.getenv("CRM_SERVER", "")                 # e.g. "org2f45e702.crm4.dynamics.com,5558"
+    CRM_CLIENT_ID: str = os.getenv("CRM_CLIENT_ID", "51f81489-12ee-4a9e-aaae-a2591f45987d")
+    CRM_TENANT: str = os.getenv("CRM_TENANT", "organizations")
+    CRM_USERNAME: str = os.getenv("CRM_USERNAME", "")
+    CRM_PASSWORD: str = os.getenv("CRM_PASSWORD", "")
+    CRM_DOCTOR_TABLE: str = os.getenv("CRM_DOCTOR_TABLE", "dbo.cr301_newdoctordataset")
+    CRM_OFFER_TABLE: str = os.getenv("CRM_OFFER_TABLE", "new_offer_equest")
+    CRM_FEE_TABLE: str = os.getenv("CRM_FEE_TABLE", "dbo.cr301_table1")
+    CRM_PRICE_CACHE_TTL_SECONDS: int = int(os.getenv("CRM_PRICE_CACHE_TTL_SECONDS", "86400"))  # 24h
+    DB_DRIVER: str = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
+
 
 settings = Settings()

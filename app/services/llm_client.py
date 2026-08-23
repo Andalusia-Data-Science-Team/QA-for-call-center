@@ -237,8 +237,10 @@ class LLMClient:
             if not data.get("choices") or len(data["choices"]) == 0:
                 raise LLMError(f"OpenRouter returned no choices: {data}")
             
-            text = data["choices"][0]["message"]["content"]
-            
+            text = data["choices"][0]["message"]["content"] or ""
+            if not text:
+                raise LLMError(f"OpenRouter returned empty content: {data}")
+
             usage = {}
             if "usage" in data:
                 usage = {

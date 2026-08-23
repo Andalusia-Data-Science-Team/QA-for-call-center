@@ -45,6 +45,7 @@ from app.prompts.qa_prompt import (
     build_behavioral_prompt,
     build_compliance_prompt,
     build_reservation_prompt,
+    build_offer_prompt,
     build_script_prompt,
     build_scoring_prompt,
     build_user_prompt,   # kept for legacy path
@@ -366,6 +367,28 @@ async def infer_compliance_evaluation(
     }
 
 # ---------------------------------------------------------------------------
+# Node 2f – load_offer_pillars
+#   Loads the offer recommendation evaluation pillars from offer_regulations.yaml.
+#   Isolated so offer policy can be updated independently.
+# ---------------------------------------------------------------------------
+
+async def load_offer_pillars(state: AgentState) -> dict:
+    """
+    Fetch and compact the offer recommendation pillar checklist.
+    Includes evaluation guidance (when to check, when not to penalise, outcomes).
+    """
+    block = _criteria.offer_pillars()
+    logger.debug(
+        "load_offer_pillars | call_id=%s chars=%d",
+        state["call"].call_id, len(block),
+    )
+    return {
+        "offer_pillars": block,
+        "node_trace": _trace(state, "load_offer_pillars"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Node C – infer_reservation_evaluation
 #   Focused LLM call: 6 reservation pillars (C2Com / C2C / C2B / NC).
 #   Runs in PARALLEL with infer_behavioral_evaluation & infer_script_matching.
@@ -401,6 +424,190 @@ async def infer_reservation_evaluation(
         "usage_list": [data.get("_usage", {})],
         "node_trace": _trace(state, "infer_reservation_evaluation"),
     }
+
+# ---------------------------------------------------------------------------
+# Node G – fetch_crm_offers_for_call
+#   Looks up active CRM offers for the patient's specialty using the same
+#   crm_offers layer used by the booking chatbot.  Runs AFTER inference_gate
+#   (so appointment_details.specialty_name is already in state) and BEFORE
+#   infer_offer_evaluation so the LLM can cross-check what the agent said
+#   against what was actually available in the CRM at call time.
+#
+#   Uses get_offers_for_specialty() from crm_offers.py with:
+#     • specialty_en   — from appointment_details or call.department
+#     • patient_gender — inferred from the patient's name (Arabic suffix heuristic)
+#
+#   On any failure (CRM unreachable, specialty missing, etc.) it stores ""
+#   so infer_offer_evaluation falls back gracefully to transcript-only mode.
+# ---------------------------------------------------------------------------
+
+async def fetch_crm_offers_for_call(state: AgentState) -> dict:
+    """
+    Fetch live CRM offers for the call's specialty and serialise them as a
+    compact JSON string for injection into the offer evaluation prompt.
+
+    Specialty resolution priority:
+      1. appointment_details["specialty_name"]  (extracted by LLM from transcript)
+      2. call.department                         (metadata fallback)
+
+    Gender is inferred from appointment_details["patient_name"] using the
+    same Arabic suffix heuristic used by the chatbot.
+    """
+    call = state.get("call")
+    call_id = call.call_id if call else "UNKNOWN"
+
+    # ── Resolve specialty ────────────────────────────────────────────────
+    details: dict = state.get("appointment_details") or {}
+    specialty_en: str = (
+        details.get("specialty_name")
+        or (call.department if call else "")
+        or ""
+    ).strip()
+
+    if not specialty_en:
+        logger.info(
+            "fetch_crm_offers_for_call | call_id=%s — no specialty resolved, skipping CRM fetch",
+            call_id,
+        )
+        return {
+            "crm_offers_context": "",
+            "node_trace": _trace(state, "fetch_crm_offers_for_call"),
+        }
+
+    # ── Infer patient gender from name (Arabic suffix heuristic) ────────
+    patient_name: str = details.get("patient_name") or ""
+    patient_gender: str | None = None
+    if patient_name:
+        first = patient_name.strip().split()[0]
+        if first.endswith(("اء", "ية", "ّة", "ة", "ى", "يه")):
+            patient_gender = "female"
+        # names that don't match the female suffixes → leave as None (unknown)
+
+    logger.info(
+        "fetch_crm_offers_for_call | call_id=%s specialty=%r gender=%s",
+        call_id, specialty_en, patient_gender or "unknown",
+    )
+
+    # ── Fetch from CRM ───────────────────────────────────────────────────
+    try:
+        # Import here (not at module top) so the QA pipeline doesn't hard-fail
+        # when the CRM is not configured — the node just returns empty context.
+        from app.offers_node.crm_offers import get_offers_for_specialty, format_offer_card
+
+        offers = get_offers_for_specialty(
+            specialty_en=specialty_en,
+            service_hint="",          # no service hint at QA time
+            specialty_only=True,      # proactive check — specialty-specific only
+            patient_gender=patient_gender,
+        )
+    except Exception as exc:
+        logger.warning(
+            "fetch_crm_offers_for_call | call_id=%s — CRM fetch failed (non-fatal): %s",
+            call_id, exc,
+        )
+        return {
+            "crm_offers_context": "",
+            "node_trace": _trace(state, "fetch_crm_offers_for_call"),
+        }
+
+    if not offers:
+        logger.info(
+            "fetch_crm_offers_for_call | call_id=%s — no active offers found for specialty=%r",
+            call_id, specialty_en,
+        )
+        return {
+            "crm_offers_context": f"No active CRM offers found for specialty: {specialty_en!r}",
+            "node_trace": _trace(state, "fetch_crm_offers_for_call"),
+        }
+
+    # ── Serialise offers as compact human-readable cards ─────────────────
+    # Use the same format_offer_card formatter the chatbot uses so the LLM
+    # sees the same representation the agent would have seen.
+    lines: list[str] = [
+        f"Active CRM offers for specialty: {specialty_en!r}  "
+        f"(patient_gender={patient_gender or 'unknown'})",
+        f"Total: {len(offers)} offer(s) returned",
+        "",
+    ]
+    for i, offer in enumerate(offers, 1):
+        status    = offer.get("Offer_Status", "")
+        is_alt    = offer.get("_is_alternative", False)
+        card      = format_offer_card(offer, lang="ar")
+        flag      = " [PRIMARY]" if not is_alt else " [ALTERNATIVE]"
+        lines.append(f"--- Offer {i}{flag}  status={status} ---")
+        lines.append(card)
+        lines.append("")
+
+    crm_context = "\n".join(lines)
+    logger.info(
+        "fetch_crm_offers_for_call | call_id=%s — serialised %d offer(s) (%d chars)",
+        call_id, len(offers), len(crm_context),
+    )
+    return {
+        "crm_offers_context": crm_context,
+        "node_trace": _trace(state, "fetch_crm_offers_for_call"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node F – infer_offer_evaluation
+#   Focused LLM call: did the agent correctly identify, present, and handle a
+#   relevant CRM promotional offer?
+#   Runs AFTER fetch_crm_offers_for_call (sequential dependency) so it
+#   always has real CRM data to cross-check against.
+# ---------------------------------------------------------------------------
+
+async def infer_offer_evaluation(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    Call the LLM with an offer-evaluation-only prompt.
+
+    Evaluates the agent's offer recommendation behaviour against the four
+    possible outcomes:
+      • SUITABLE_OFFER_RECOMMENDED   — positive flag
+      • OFFER_SKIPPED                — C2B moderate flag
+      • UNRELATED_OFFER_RECOMMENDED  — C2B moderate flag
+      • OFFER_MISREPRESENTED         — C2B moderate flag
+      • INCOMPLETE_OFFER_PRESENTATION — NC minor flag
+      • MISSING_OFFER_CONFIRMATION_ASK — NC minor flag
+      • NO_OFFER_AVAILABLE           — no flag
+      • OFFER_NOT_APPLICABLE         — no flag
+
+    Result stored in state["offer_eval"].
+    """
+    call = state["call"]
+
+    user_prompt = build_offer_prompt(
+        call,
+        offer_pillars=state.get("offer_pillars", ""),
+        crm_offers_context=state.get("crm_offers_context") or "",
+    )
+    logger.debug(
+        "infer_offer_evaluation | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_offer_evaluation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
+    outcome = data.get("offer_outcome", "OFFER_NOT_APPLICABLE")
+    logger.info(
+        "infer_offer_evaluation | call_id=%s outcome=%s flags=%d",
+        call.call_id,
+        outcome,
+        len(data.get("offer_flags", [])),
+    )
+
+    return {
+        "offer_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_offer_evaluation"),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Node C – infer_script_matching
@@ -521,14 +728,28 @@ async def aggregate_results(state: AgentState) -> dict:
     behavioral  = state.get("behavioral_eval")  or {}
     compliance  = state.get("compliance_eval")  or {}
     reservation = state.get("reservation_eval") or {}
+    offer       = state.get("offer_eval")       or {}
     script      = state.get("script_eval")      or {}
     scoring     = state.get("scoring_eval")     or {}
+
+    # Normalise offer_flags: the offer node uses "C2B"/"NC"/"positive" as type
+    # but the ComplianceFlag schema expects type in {C2Com,C2C,C2B,NC}.
+    # Map "positive" type to "NC" with severity "positive" so Pydantic validates.
+    _raw_offer_flags: list[dict] = offer.get("offer_flags", [])
+    _offer_flags: list[dict] = []
+    for f in _raw_offer_flags:
+        flag = dict(f)
+        if flag.get("type") == "positive":
+            flag["type"] = "NC"
+            flag["severity"] = "positive"
+        _offer_flags.append(flag)
 
     # Merge all compliance flag lists from all focused evaluations
     all_flags: list[dict] = (
         behavioral.get("behavioral_flags", [])
         + compliance.get("compliance_flags", [])
         + reservation.get("reservation_flags", [])
+        + _offer_flags
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
@@ -579,12 +800,13 @@ async def aggregate_results(state: AgentState) -> dict:
     }
 
     logger.debug(
-        "aggregate_results | call_id=%s flags=%d assessment=%s classification=%s profiling=%s",
+        "aggregate_results | call_id=%s flags=%d assessment=%s classification=%s profiling=%s offer_outcome=%s",
         call_id,
         len(deduped_flags),
         merged["overall_assessment"],
         merged["agent_performance"].get("Agent Classification"),
         merged["agent_performance"].get("Profiling Comment"),
+        offer.get("offer_outcome", "N/A"),
     )
 
     try:

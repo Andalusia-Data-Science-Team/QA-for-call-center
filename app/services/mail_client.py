@@ -7,7 +7,7 @@ SMTP_SERVER   = "mail.andalusiagroup.net"    # Your internal Exchange SMTP host
 SMTP_PORT     = 587                     # 25 (relay) or 587 (TLS) or 465 (SSL)
 SENDER_EMAIL  = "rafik.atallah@andalusiagroup.net"
 SMTP_USER     = "andalusia\\rafik.atallah"      # Or just "username@andalusia.com"
-SMTP_PASSWORD = "rafik123"        # Leave empty if using anonymous relay
+SMTP_PASSWORD = "refa2001"        # Leave empty if using anonymous relay
 
 
 def build_html_body(body_text: str, review_link: str) -> str:
@@ -140,7 +140,7 @@ def send_email(to: str, subject: str, body_text: str, review_link: str):
 
 # ── Usage ───────────────────────────────────────────────────────────
 send_email(
-    to="Yasser.Hamed@Andalusiagroup.net",
+    to="rafik.atallah@Andalusiagroup.net",
     subject="QA mail",
     body_text="testing for qa agents.",
     review_link="https://your-internal-system.com/review?token=abc123"

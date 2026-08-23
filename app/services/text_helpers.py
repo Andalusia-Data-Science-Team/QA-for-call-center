@@ -35,7 +35,7 @@ def _strip_markdown_fences(text: str) -> str:
     """Remove ```json ... ``` wrappers and thinking-model preambles.
 
     Handles:
-    * ``\`\`\`json ... \`\`\`` code fences
+    * `` ```json ... ``` `` code fences
     * ``<think>...</think>`` / ``<thought>...</thought>`` XML tags
     * Bare ``thought\n{...}`` prefix emitted by some Gemma / DeepSeek builds
     """
@@ -90,6 +90,32 @@ _ARABIC_CHAR_MAP: dict[str, str] = {
 _DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]")
 
 
+# Regex that strips Arabic doctor-name prefixes such as:
+#   "د "  "د."  "د/"  "د\"  "دكتور "  "دكتورة "  "Dr."  "Dr "
+# followed by optional whitespace, before the actual name.
+_DR_PREFIX_RE = re.compile(
+    r"^(?:دكتور[ة]?|د(?:\s*[./\\\-])?)\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_dr_prefix(text: str) -> str:
+    """Strip Arabic doctor-name prefixes from *text* before any name.
+
+    The prefix form is detected and removed; the remainder (the actual name)
+    is returned unchanged.  Examples::
+
+        "د <name>"      → "<name>"   bare د followed by space
+        "د. <name>"     → "<name>"   د with full-stop
+        "د/ <name>"     → "<name>"   د with slash
+        "د\\ <name>"    → "<name>"   د with backslash
+        "د- <name>"     → "<name>"   د with dash
+        "دكتور <name>"  → "<name>"   full masculine title
+        "دكتورة <name>" → "<name>"   full feminine title
+    """
+    return _DR_PREFIX_RE.sub("", text.strip()).strip()
+
+
 def _normalize_arabic(text: str | None) -> str | None:
     """
     Normalise an Arabic name/word so that visually equivalent spellings
@@ -107,6 +133,10 @@ def _normalize_arabic(text: str | None) -> str | None:
     Returns ``None`` when the input is ``None`` or an empty string after
     stripping so callers can still detect "no value" cleanly.
     """
+    if not text:
+        return None
+    # Strip doctor-name prefix (د / د. / دكتور …)
+    text = _strip_dr_prefix(text)
     if not text:
         return None
     # Remove diacritics
@@ -141,7 +171,7 @@ def _arabic_like_pattern(text: str | None, first_word_only: bool = False) -> str
     the input is used — useful for doctor-name queries where the DB stores the
     full name but we only extracted the first name.
     """
-    normalised = _normalize_arabic(text)
+    normalised = _normalize_arabic(text)  # already strips dr prefix
     if not normalised:
         return None
 

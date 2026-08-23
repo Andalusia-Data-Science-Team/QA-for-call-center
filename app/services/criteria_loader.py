@@ -237,7 +237,69 @@ class CriteriaLoader:
                 lines.append(_list_bullets(violations))
         return "\n".join(lines)
 
-    # ── 4. Script templates ───────────────────────────────────────────────
+    # ── 4. Offer recommendation pillars ──────────────────────────────────
+
+    def offer_pillars(self) -> str:
+        """
+        Return a compact offer-recommendation pillar checklist from
+        offer_regulations.yaml.  Strips ids, type repetitions, and 'Other'
+        items.  Also appends the evaluation-guidance section so the LLM knows
+        exactly when to penalise and when not to.
+        """
+        data = _load_yaml("policies/regulations/offer_regulations.yaml")
+        pillars = data.get("pillars", {})
+        guidance = data.get("evaluation_guidance", {})
+        if not pillars:
+            return "# OFFER RECOMMENDATION PILLARS\n(none loaded)"
+
+        lines: list[str] = ["# OFFER RECOMMENDATION PILLARS (Andalusia Hospitals)"]
+        groups: dict[str, list[tuple[str, list[str]]]] = {
+            "C2Com": [], "C2C": [], "C2B": [], "NC": []
+        }
+        for pillar_key, pillar in pillars.items():
+            ptype = pillar.get("severity", "NC")
+            violations = [
+                item["violation"]
+                for item in pillar.get("items", [])
+                if item.get("violation", "Other") != "Other"
+            ]
+            if violations:
+                groups.setdefault(ptype, []).append(
+                    (pillar.get("original_name", pillar_key), violations)
+                )
+
+        labels = {
+            "C2Com": "C2Com — Critical to Compliance",
+            "C2C":   "C2C   — Critical to Client / End-User",
+            "C2B":   "C2B   — Critical to Business",
+            "NC":    "NC    — Non-Critical",
+        }
+        for ptype, label in labels.items():
+            group = groups.get(ptype, [])
+            if not group:
+                continue
+            lines.append(f"\n## {label}")
+            for pillar_name, violations in group:
+                lines.append(f"\n### {pillar_name}")
+                lines.append(_list_bullets(violations))
+
+        # Append evaluation guidance
+        if guidance:
+            lines.append("\n## WHEN TO CHECK FOR OFFERS")
+            for item in guidance.get("when_to_check", []):
+                lines.append(f"  • {item}")
+            lines.append("\n## WHEN NOT TO PENALISE")
+            for item in guidance.get("when_NOT_to_penalise", []):
+                lines.append(f"  • {item}")
+            lines.append("\n## SCORING OUTCOMES")
+            for outcome, cfg in guidance.get("scoring_outcomes", {}).items():
+                flag_type = cfg.get("flag_type") or "none"
+                desc = cfg.get("description", "")
+                lines.append(f"  {outcome}: flag_type={flag_type} — {desc}")
+
+        return "\n".join(lines)
+
+    # ── 5. Script templates ───────────────────────────────────────────────
 
     def script_templates(self) -> str:
         """
