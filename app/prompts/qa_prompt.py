@@ -538,6 +538,7 @@ offer to the patient during the call below.
 ## IMPORTANT RULES
 - Do NOT penalise the agent when CRM offers context is absent — choose NO_OFFER_AVAILABLE or
   OFFER_NOT_APPLICABLE in ambiguous cases rather than guessing.
+- If any miss presented information is present mention the correct information in the reasoning section.
 - Do NOT penalise when the patient explicitly declined an offer the agent correctly presented.
 - Short calls (< 90 seconds) and calls with no specialty signal → OFFER_NOT_APPLICABLE.
 - Report at most 1 offer flag per call.
@@ -571,7 +572,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "offer_flags": [
     {{
       "type": "<C2B | NC | positive>",
-      "severity": "<moderate | minor | positive>",
+      "severity": "<critical | positive>",
       "description": "<1-2 sentences referencing the exact pillar name and outcome>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A' when no mention in transcript>"
     }}
@@ -684,13 +685,14 @@ You are a medical-call data extractor. Given the following call transcript, extr
 2. The doctor's full name (exactly as mentioned, or null if not mentioned).
 3. The medical specialty name (e.g. "cardiology", "dermatology", or null if not mentioned).
 4. Patient Name for the reservation (exactly as mentioned, or null if not mentioned).
+5. The name of any promotional offer explicitly mentioned by name (e.g. "باقة الصحة المتكاملة", "عرض الليزر"), or null if no specific offer name was mentioned.
 
 Do not guess or infer information that is not explicitly stated in the transcript.
 Do not refine any information
 Do Not include any additional commentary or explanation.
 If there is not a clear date provided map between the call date :{date} and the nearest date of the week day mentioned for reservation from the call date in 2026. If the date is not mentioned, return null.
 
-Respond ONLY with a valid JSON object with keys:"appointment_date", "doctor_name", "specialty_name","Patient_name".
+Respond ONLY with a valid JSON object with keys:"appointment_date", "doctor_name", "specialty_name","Patient_name","offer_name".
 
 Transcript:
 {transcript}

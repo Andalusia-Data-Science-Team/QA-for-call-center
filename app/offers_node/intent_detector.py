@@ -1,13 +1,18 @@
 """
 intent_detector.py — Offer Intent Detection
 ============================================
+Standalone extraction of the offer-intent helper functions from
+nodes/offers_check.py in the main contact-center-chatbot project.
+
+No LangGraph / state-machine dependencies — safe to import anywhere.
+
 Purpose: Determine whether the patient's message is:
 
   1. PROACTIVE CHECK   — Mid-booking automatic check (slot already confirmed).
                          Runs silently without any patient keyword trigger.
 
   2. INQUIRY          — Patient explicitly asked about offers/promotions in
-                        their message (e.g. "هل في عروض على الأسنان؟").
+                         their message (e.g. "هل في عروض على الأسنان؟").
 
   3. NONE             — No offer intent detected; skip the offer flow.
 
@@ -69,6 +74,8 @@ _NO_EN = re.compile(
     r"^(no|nope|skip|without|continue|no thanks|not interested)",
     re.IGNORECASE,
 )
+
+# Implicit-no signals: price too high, want a different offer, etc.
 _IMPLICIT_NO_AR = re.compile(
     r"(اقل|أقل|ارخص|أرخص|اوفر|ارخص|غالي|غالية|مافي.*اقل|محتاج.*اقل|محتاجة.*اقل"
     r"|عرض.*اخر|عرض.*ثاني|عرض.*تاني|في.*عروض.*ثانية|في.*عروض.*تانية"
@@ -78,10 +85,10 @@ _IMPLICIT_NO_AR = re.compile(
 
 # ── Exit-intent: patient wants to end the session ────────────────────────────
 _EXIT_INTENT = re.compile(
-    r"\b(شكرا|شكراً|مشكور|سلام|مع السلامة|ما بدي|مش محتاج"
+    r" (شكرا|شكراً|مشكور|سلام|مع السلامة|ما بدي|مش محتاج"
     r"|لا شكرا|بدون حجز|no thanks|goodbye|thats all|thanks"
     r"|never mind|nevermind|لا مشكورك|مشكوره"
-    r"|ما (ابي|ابغى|أبي|أبغى) احجز|ما أبغى احجز|ما اريد احجز)\b",
+    r"|ما (ابي|ابغى|أبي|أبغى) احجز|ما أبغى احجز|ما اريد احجز) ",
     re.IGNORECASE,
 )
 
@@ -137,13 +144,16 @@ def _contains_booking_info(text: str) -> bool:
     Escape hatch: when the patient gives "cash 01245782245" instead of yes/no
     to an offer prompt, skip the offer gate and let patient_info handle it.
     """
+    # Phone number: 7+ consecutive digits
     if re.search(r"\d{7,}", text):
         return True
+    # Payment method keywords
     payment_words = {
         "cash", "كاش", "تامين", "تأمين", "insurance", "visa",
         "card", "نقد", "insured", "مؤمن", "credit", "بطاقة",
     }
-    return bool(set(text.lower().split()) & payment_words)
+    words = set(text.lower().split())
+    return bool(words & payment_words)
 
 
 def detect_offer_intent(user_text: str, state: dict) -> str:
@@ -160,7 +170,7 @@ def detect_offer_intent(user_text: str, state: dict) -> str:
     "none"
         No offer intent detected — caller should skip the offer node entirely.
     """
-    booking_stage = state.get("booking_stage", "routing")
+    booking_stage  = state.get("booking_stage", "routing")
     slot_confirmed = bool(state.get("slot_confirmed"))
 
     # ── Case A: mid-booking proactive check ──────────────────────────────────

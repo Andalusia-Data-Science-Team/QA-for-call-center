@@ -1,8 +1,10 @@
 """
 offer_search.py — Offer Lookup by Specialty + Service Hint
 ============================================================
-Purpose: Given a specialty name (EN) and an optional service hint from the
-patient's message, find and return the best-matching active CRM offer.
+Standalone extraction of the offer-search helpers from
+nodes/offers_check.py in the main contact-center-chatbot project.
+
+No LangGraph / state-machine dependencies — safe to import anywhere.
 
 This module handles:
   1. Specialty resolution   — free Arabic/English text → EN specialty name
@@ -13,7 +15,7 @@ This module handles:
 
 Public API
 ----------
-    resolve_specialty(text) -> str
+    resolve_specialty(text, known_specialties_en=None) -> str
         Map a free-text patient message → EN specialty name (or "" if unknown).
 
     extract_service_hint(text) -> str
@@ -28,11 +30,6 @@ Public API
 
     format_offer_response(offer, lang) -> str
         Format an active offer as a patient-facing card string.
-
-Dependencies
-------------
-    pip install requests pyodbc
-    # crm_offers.py must be importable (same directory or installed as package)
 """
 from __future__ import annotations
 import re
@@ -80,7 +77,7 @@ _AR_ALIAS: dict[str, str] = {
     "عيون":              "Ophthalmology",
     "العيون":            "Ophthalmology",
     "طب عيون":           "Ophthalmology",
-    # ── IVF / Fertility (MUST come before Pediatrics) ────────────────────────
+    # ── IVF / Fertility — MUST come before Pediatrics ────────────────────────
     "حقن مجهري":         "IVF",
     "الحقن المجهري":     "IVF",
     "الحقن مجهري":       "IVF",
@@ -195,11 +192,30 @@ _AR_ALIAS: dict[str, str] = {
     "اشعة":              "Radiology",
     "سونار":             "Radiology",
     "رنين":              "Radiology",
-    # ── Cosmetic (unambiguous) ───────────────────────────────────────────────
+    # ── Cosmetic — unambiguous (always Dermatology) ──────────────────────────
     "كوزميتولوجي":       "Dermatology",
     "ليزر جلدي":         "Dermatology",
     "ازاله شعر":         "Dermatology",
-    # NOTE: "ليزر" / "تجميل" are intentionally NOT here — see _AMBIGUOUS_SERVICES
+    "جنتل ليزر":        "Dermatology",
+    "الجنتل ليزر":      "Dermatology",
+    "ليزر للجسم":       "Dermatology",
+    "ليزر الجسم":       "Dermatology",
+    "ليزر البشرة":      "Dermatology",
+    "ليزر الشعر":       "Dermatology",
+    # NOTE: bare "ليزر" / "تجميل" are intentionally NOT here —
+    # they are ambiguous and handled by _AMBIGUOUS_SERVICES below.
+    # ── Physiotherapy ────────────────────────────────────────────────────────
+    "علاج طبيعي":        "Physiotherapy",
+    "العلاج الطبيعي":    "Physiotherapy",
+    "طبيعي":             "Physiotherapy",
+    "فيزيوثيرابي":       "Physiotherapy",
+    "تأهيل":             "Physiotherapy",
+    "اعادة تاهيل":       "Physiotherapy",
+    # ── Plastic Surgery ──────────────────────────────────────────────────────
+    "جراحة تجميل":       "Plastic Surgery",
+    "جراحة تجميليه":     "Plastic Surgery",
+    "جراحة تجميلية":     "Plastic Surgery",
+    "تجميل جراحي":       "Plastic Surgery",
 }
 
 
@@ -228,12 +244,14 @@ _OFFER_STOP_RE = re.compile(
     r"هل|في|فى|يوجد|عندكم|عندك|لديكم|عندنا|"
     r"عروض|عرض|خصم|خصومات|تخفيض|تنزيل|بروموشن|باقة|"
     r"بخصوص|على|عن|بشأن|تخص|هناك|توجد|"
-    r"جلسه|جلسة|عملية|عمليه|علاج|خدمة|خدمه|تخصص|"
+    r"عملية|عمليه|خدمة|خدمه|تخصص|"
     r"تمام|اوكيه|صح|واضح|نفسها|نفسه|نفس|ذاتها|ذاته|النفس|تبغي|تبغى|"
     r"موافق|موافقه|موافقة|نعم|ايوه|ايه|اه|اها|ابشر|طيب|ماشي|اكيد|زين|"
     r"حابب|حابه|حابة|بقولك|ابغى|ابي|عايز|عايزه|اريد|محتاج|محتاجه|"
     r"مافيش|مافيهش|مافي|يعنى|يعني|ليه|ليها|ياعنى|ولا|ولالا|إذا|اذا|"
     r"تفاصيل|تفاضيل|معلومات|تفصيل|وصف|وصفي|اشرح|شرح|وضح|فسر|اخبرني|خبرني|"
+    r"رقم|رقمي|رقمى|الرقم|نمره|نمرة|تليفون|موبايل|جوال|هاتف|فون|"
+    r"الحالي|الحالى|حالي|حالى|كده|كذا|بتاعي|بتاعى|ده|دي|دى|هو|هي|هى|"
     r"offer[s]?|discount|deal|package|for|about|on|any|the|a|an|is|are|there|details|info"
     r")\b"
     r"|[؟?!،,.\u060c]",
@@ -285,8 +303,7 @@ def resolve_specialty(text: str, known_specialties_en: list[str] | None = None) 
 
     Strategy (priority order):
       1. Direct EN specialty name substring match
-      2. Official Arabic display name match (if SPECIALTY_EN_TO_AR provided)
-      3. Colloquial Arabic alias table (_AR_ALIAS)
+      2. Colloquial Arabic alias table (_AR_ALIAS)
 
     Parameters
     ----------
@@ -349,7 +366,17 @@ def extract_service_hint(text: str) -> str:
     """
     cleaned = _OFFER_STOP_RE.sub(" ", text or "").strip()
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned.lower()
+    hint = cleaned.lower()
+    if not hint:
+        return ""
+    # Optionally validate hint using CRM offer vocabulary (requires crm_offers)
+    try:
+        from crm_offers import is_valid_service_hint  # type: ignore
+        if not is_valid_service_hint(hint):
+            return ""
+    except ImportError:
+        pass  # crm_offers not available — return hint as-is
+    return hint
 
 
 def search_offers(

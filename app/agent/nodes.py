@@ -494,10 +494,14 @@ async def fetch_crm_offers_for_call(state: AgentState) -> dict:
         # when the CRM is not configured — the node just returns empty context.
         from app.offers_node.crm_offers import get_offers_for_specialty, format_offer_card
 
+        # If the transcript explicitly named an offer, use it as the service hint
+        # so get_offers_for_specialty performs a direct-name lookup first.
+        offer_name_hint: str = (details.get("offer_name") or "").strip()
+
         offers = get_offers_for_specialty(
             specialty_en=specialty_en,
-            service_hint="",          # no service hint at QA time
-            specialty_only=True,      # proactive check — specialty-specific only
+            service_hint=offer_name_hint,  # direct offer name if mentioned, else ""
+            specialty_only=not bool(offer_name_hint),  # skip specialty-only guard when name is known
             patient_gender=patient_gender,
         )
     except Exception as exc:
@@ -1159,15 +1163,17 @@ async def extract_appointment_details(
         "doctor_name":      data_lower.get("doctor_name"),
         "specialty_name":   data_lower.get("specialty_name"),
         "patient_name":     data_lower.get("patient_name"),
+        "offer_name":       data_lower.get("offer_name"),
     }
 
     logger.info(
-        "extract_appointment_details | call_id=%s date=%s doctor=%s specialty=%s patient=%s",
+        "extract_appointment_details | call_id=%s date=%s doctor=%s specialty=%s patient=%s offer=%s",
         call.call_id,
         details["appointment_date"],
         details["doctor_name"],
         details["specialty_name"],
         details["patient_name"],
+        details["offer_name"],
     )
 
     return {
