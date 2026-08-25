@@ -21,7 +21,12 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     huggingface_api_key: str = ""
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY")
+    # Match the sibling *_api_key fields above: default to "" and let
+    # pydantic_settings populate it from the env var itself. The previous
+    # `os.getenv("OPENROUTER_API_KEY")` default evaluated to None whenever
+    # that var was unset, which fails validation against the `str` type and
+    # crashes Settings() (and therefore the whole app) at import time.
+    openrouter_api_key: str = ""
 
     # Retry config 
     llm_max_retries: int = 5

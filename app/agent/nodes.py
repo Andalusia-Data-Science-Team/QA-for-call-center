@@ -53,6 +53,8 @@ from app.prompts.qa_prompt import (
 from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
 from app.services.sql_helpers import insert_qa_result
+from app.bank_node.bank_validation import bank_validation_needed, validate_ksa_bank_information, detect_bank_signals
+from app.location_node.location_validation import detect_location_signals, validate_location_request
 from app.services.text_helpers import (
     _normalize_arabic,
     _arabic_like_pattern, 
@@ -674,6 +676,11 @@ async def infer_overall_scoring(
     compliance_summary = json.dumps(state.get("compliance_eval") or {}, ensure_ascii=False)    
     reservation_summary = json.dumps(state.get("reservation_eval") or {}, ensure_ascii=False)
     script_summary     = json.dumps(state.get("script_eval") or {},     ensure_ascii=False)
+    # Include the masked deterministic outcomes in scoring; otherwise these
+    # graph nodes would run without being able to influence the final
+    # assessment. Bank and location are independent nodes/state keys now.
+    bank_summary       = json.dumps(state.get("bank_validation") or {}, ensure_ascii=False)
+    location_summary   = json.dumps(state.get("location_validation") or {}, ensure_ascii=False)
 
     user_prompt = build_scoring_prompt(
         call,
@@ -682,6 +689,8 @@ async def infer_overall_scoring(
         compliance_summary=compliance_summary,
         reservation_summary=reservation_summary,
         script_summary=script_summary,
+        bank_summary=bank_summary,
+        location_summary=location_summary,
     )
     logger.debug(
         "infer_overall_scoring | call_id=%s prompt_len=%d",
@@ -735,6 +744,8 @@ async def aggregate_results(state: AgentState) -> dict:
     offer       = state.get("offer_eval")       or {}
     script      = state.get("script_eval")      or {}
     scoring     = state.get("scoring_eval")     or {}
+    bank        = state.get("bank_validation") or {}
+    location    = state.get("location_validation") or {}
 
     # Normalise offer_flags: the offer node uses "C2B"/"NC"/"positive" as type
     # but the ComplianceFlag schema expects type in {C2Com,C2C,C2B,NC}.
@@ -748,12 +759,33 @@ async def aggregate_results(state: AgentState) -> dict:
             flag["severity"] = "positive"
         _offer_flags.append(flag)
 
+    # Persist masked C2B findings through the existing DWH flag path. Both
+    # comparisons were already completed deterministically — bank and
+    # location are independent nodes, so each gets its own flag when it
+    # independently flags a violation.
+    bank_flags = []
+    if bank.get("is_violation"):
+        bank_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": bank.get("reason", "KSA bank-account validation failed."),
+            "transcript_excerpt": "Bank information supplied by agent (identifier masked).",
+        })
+    location_flags = []
+    if location.get("is_violation"):
+        location_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": location.get("reason", "KSA branch/location validation failed."),
+            "transcript_excerpt": "Location information supplied by agent.",
+        })
+
     # Merge all compliance flag lists from all focused evaluations
     all_flags: list[dict] = (
         behavioral.get("behavioral_flags", [])
         + compliance.get("compliance_flags", [])
         + reservation.get("reservation_flags", [])
         + _offer_flags
+        + bank_flags
+        + location_flags
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
@@ -801,6 +833,8 @@ async def aggregate_results(state: AgentState) -> dict:
         "escalation_required": scoring.get("escalation_required", False),
         "escalation_reason":   scoring.get("escalation_reason"),
         "conversation_link":   state["call"].conversation_link,
+        "bank_validation":  bank,
+        "location_validation": location,
     }
 
     logger.debug(
@@ -855,6 +889,15 @@ async def integrity_check(state: AgentState) -> dict:
             call_id,
         )
         result = result.model_copy(update={"overall_assessment": "escalate"})
+
+    # A bank or location violation cannot remain a pass even if the LLM
+    # overlooks the deterministic scoring context; severity/escalation stay
+    # policy-driven. Bank and location are independent checks — either one
+    # alone is enough to trigger this.
+    bank_violation = (state.get("bank_validation") or {}).get("is_violation")
+    location_violation = (state.get("location_validation") or {}).get("is_violation")
+    if (bank_violation or location_violation) and result.overall_assessment == "pass":
+        result = result.model_copy(update={"overall_assessment": "needs_review"})
 
     if result.overall_assessment == "escalate" and not result.escalation_required:
         logger.warning(
@@ -1356,3 +1399,99 @@ async def verify_appointment_in_db(state: AgentState) -> dict:
             "node_trace": _trace(state, "verify_appointment_in_db"),
         }
 
+
+# ---------------------------------------------------------------------------
+# Node – validate_bank_information (app.bank_node)
+#   Fully independent of validate_location — separate graph node, separate
+#   CRM fetch/cache (app.bank_node.crm_bank), separate state key
+#   (bank_validation). The only thing the two share is the transcript-turn
+#   splitter in app.services.text_helpers.
+# ---------------------------------------------------------------------------
+async def validate_bank_information_node(state: AgentState) -> dict:
+    """Run deterministic KSA-only bank validation after cheap Arabic gating.
+
+    Business-Unit resolution (app.bank_node.bank_validation.resolve_business_unit)
+    is keyword-map-driven, not CRM-location-based — this node no longer
+    depends on app.location_node's CRM fetch at all, unlike before.
+    """
+    call = state["call"]
+    signals = detect_bank_signals(call)
+    # Avoid CRM access for conversations with no supported BU / no bank
+    # request / no agent-provided financial identifier; keeps unrelated
+    # flows (and out-of-scope BUs) untouched.
+    if not bank_validation_needed(call, signals):
+        result = {
+            "outcome": "NOT_APPLICABLE", "applicable": False,
+            "request_detected": False, "requested_business_unit": signals[4],
+            "provided_identifiers": [], "is_violation": False,
+            "reason": "No bank request within bank-validation scope (AFW/AHJ/AKW/ALW) was detected.",
+        }
+    else:
+        try:
+            from app.bank_node.crm_bank import fetch_bank_accounts
+            banks = fetch_bank_accounts()
+            # Missing reference data is non-punitive: correctness cannot be
+            # verified safely, so report an unresolved system-data condition.
+            if not banks:
+                result = {
+                    "outcome": "BUSINESS_UNIT_UNRESOLVED", "applicable": False,
+                    "request_detected": True, "requested_business_unit": signals[4],
+                    "provided_identifiers": [], "is_violation": False,
+                    "reason": "Authoritative CRM bank data is unavailable; no agent violation was inferred.",
+                }
+            else:
+                result = validate_ksa_bank_information(call, banks, signals)
+        except Exception as exc:  # Reference-data failures are non-punitive.
+            logger.warning("bank validation unavailable | call_id=%s | %s", call.call_id, exc)
+            result = {
+                "outcome": "BUSINESS_UNIT_UNRESOLVED", "applicable": False,
+                "request_detected": True, "requested_business_unit": signals[4],
+                "provided_identifiers": [], "is_violation": False,
+                "reason": "Authoritative CRM bank data could not be read; no agent violation was inferred.",
+            }
+    logger.info("bank validation | call_id=%s outcome=%s bu=%s", call.call_id, result["outcome"], signals[4])
+    return {"bank_validation": result, "node_trace": _trace(state, "validate_bank_information")}
+
+
+# ---------------------------------------------------------------------------
+# Node – validate_location (app.location_node)
+#   Fully independent of validate_bank_information — see above.
+# ---------------------------------------------------------------------------
+async def validate_location_node(state: AgentState) -> dict:
+    """Run deterministic KSA-only branch/location validation after cheap
+    Arabic gating. Runs in parallel with validate_bank_information — neither
+    depends on the other's result."""
+    call = state["call"]
+    requested, patient_text, agent_text = detect_location_signals(call)
+    if not requested:
+        result = {
+            "outcome": "NOT_APPLICABLE", "applicable": False,
+            "request_detected": False, "requested_branch": None,
+            "match_confidence": None, "is_violation": False,
+            "reason": "No location/address request was detected.",
+        }
+    else:
+        try:
+            from app.location_node.crm_location import fetch_ksa_locations
+            locations = fetch_ksa_locations()
+            if not locations:
+                result = {
+                    "outcome": "BRANCH_UNRESOLVED", "applicable": False,
+                    "request_detected": True, "requested_branch": None,
+                    "match_confidence": None, "is_violation": False,
+                    "reason": "Authoritative CRM location data is unavailable; no agent violation was inferred.",
+                }
+            else:
+                result = validate_location_request(
+                    call, locations, patient_text=patient_text, agent_text=agent_text,
+                )
+        except Exception as exc:  # Reference-data failures are non-punitive.
+            logger.warning("location validation unavailable | call_id=%s | %s", call.call_id, exc)
+            result = {
+                "outcome": "BRANCH_UNRESOLVED", "applicable": False,
+                "request_detected": True, "requested_branch": None,
+                "match_confidence": None, "is_violation": False,
+                "reason": "Authoritative CRM location data could not be read; no agent violation was inferred.",
+            }
+    logger.info("location validation | call_id=%s outcome=%s", call.call_id, result["outcome"])
+    return {"location_validation": result, "node_trace": _trace(state, "validate_location")}

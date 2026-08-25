@@ -44,10 +44,24 @@ class AgentState(TypedDict, total=False):
     appointment_details: Optional[dict[str, Any]]
     appointment_verification: Optional[dict[str, Any]]
     crm_offers_context: Optional[str]   # written by fetch_crm_offers_for_call
+    # Bank and location are separate graph nodes (app/bank_node/,
+    # app/location_node/) with separate state keys — each is independently
+    # NOT_APPLICABLE when its own request type isn't present in the call.
+    bank_validation: Optional[dict[str, Any]]      # written by validate_bank_information_node
+    location_validation: Optional[dict[str, Any]]  # written by validate_location_node
+    # Masked deterministic results retained so scoring and aggregation share
+    # the same conclusion without passing financial identifiers to the LLM.
 
     # ── Error handling ────────────────────────────────────────────────────
-    error: Optional[str]
-    error_node: Optional[str]
+    # Last-write-wins, for the same reason `result` above needs it: when
+    # multiple parallel LLM nodes (behavioral/compliance/offer/script) fail
+    # in the same graph step — e.g. no LLM API key configured at all, so
+    # every concurrent LLM call fails together — they each try to write
+    # `error`/`error_node` in that same step. Without a reducer here,
+    # LangGraph raises InvalidUpdateError ("Can receive only one value per
+    # step") instead of cleanly routing to handle_error.
+    error: Annotated[Optional[str], lambda _old, new: new]
+    error_node: Annotated[Optional[str], lambda _old, new: new]
 
     # ── Booking / intent sub-flow ─────────────────────────────────────────
     # is_booking_intent / intent_label  — written by detect_intent

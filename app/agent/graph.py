@@ -19,6 +19,12 @@ Graph topology (happy path):
                                    │                                        │
     └──→ detect_intent                                                        │
               │                                                               │
+              │  fan-out: 2 parallel, fully independent deterministic nodes   │
+              ├──→ validate_bank_information ──┐                              │
+              └──→ validate_location         ──┤ fan-in                       │
+                                               │                               │
+                                       loc_bank_ready  (barrier / no-op)       │
+                                               │                               │
               ├──(booking)──→ extract_appointment_details                     │
               │                        │                                      │
               │               verify_appointment_in_db                       │
@@ -124,6 +130,8 @@ from app.agent.nodes import (
     detect_intent,
     extract_appointment_details,
     verify_appointment_in_db,
+    validate_bank_information_node,
+    validate_location_node,
 )
 from app.services.llm_client import LLMClient
 
@@ -238,6 +246,15 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         functools.partial(extract_appointment_details, llm_client=llm_client),
     )
     builder.add_node("verify_appointment_in_db", verify_appointment_in_db)
+    # Two fully independent deterministic nodes — each cheaply gates on its
+    # own Arabic detection before reading CRM data, and each runs in
+    # parallel with the other (neither depends on the other's result).
+    builder.add_node("validate_bank_information", validate_bank_information_node)
+    builder.add_node("validate_location", validate_location_node)
+    # Barrier — fan-in for the two parallel nodes above, fan-out to the
+    # booking router. Neither is on the booking-detection critical path
+    # individually; the router just needs both to have finished.
+    builder.add_node("loc_bank_ready", lambda state: {})
 
     # ── Edges ─────────────────────────────────────────────────────────────
 
@@ -289,8 +306,15 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Nothing else feeds into infer_behavioral_evaluation or
     # infer_compliance_evaluation — this guarantees inference_ready receives
     # exactly 2 triggers per run, preventing duplicate tail execution.
+    # Route through bank + location validation (parallel) before the booking
+    # split. Both states survive both branches and are included in final
+    # scoring and aggregation.
+    builder.add_edge("detect_intent", "validate_bank_information")
+    builder.add_edge("detect_intent", "validate_location")
+    builder.add_edge("validate_bank_information", "loc_bank_ready")
+    builder.add_edge("validate_location", "loc_bank_ready")
     builder.add_conditional_edges(
-        "detect_intent",
+        "loc_bank_ready",
         _booking_router,
         {
             "booking":      "extract_appointment_details",

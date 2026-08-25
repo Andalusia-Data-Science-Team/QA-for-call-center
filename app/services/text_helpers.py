@@ -188,3 +188,93 @@ def _arabic_like_pattern(text: str | None, first_word_only: bool = False) -> str
 
     pattern_chars: list[str] = [_VARIANTS.get(ch, ch) for ch in token]
     return "".join(pattern_chars) + "%"
+
+# These helpers extend the existing Arabic normalisation instead of creating a
+# second implementation, while keeping financial identifiers on a stricter path.
+# Public Arabic/numeric comparison helpers used by deterministic validators.
+# Natural language and financial identifiers intentionally have separate paths.
+_FINANCIAL_DIGIT_TRANSLATION = str.maketrans(
+    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"
+)
+
+
+def normalize_arabic_text(text: str | None) -> str:
+    """Normalise Arabic prose using the existing project normaliser."""
+    # Use this for chat semantics only; financial values use the separate exact
+    # normaliser below so account formatting is not over-normalised.
+    if not text:
+        return ""
+    value = _normalize_arabic(str(text).translate(_FINANCIAL_DIGIT_TRANSLATION)) or ""
+    value = re.sub(r"[^\w\s]", " ", value.lower(), flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_financial_identifier(value: str | None) -> str:
+    """Normalise layout/digits only; never coerce an identifier to an integer."""
+    # Translate digit glyphs and remove layout characters, but retain every
+    # meaningful alphanumeric character and leading zero.
+    if not value:
+        return ""
+    value = unicodedata.normalize("NFKC", str(value)).translate(_FINANCIAL_DIGIT_TRANSLATION)
+    return re.sub(r"[\s\-‐‑‒–—―]", "", value).upper()
+
+
+_AGENT_SPEAKER_LABELS = {"agent", "الموظف", "موظف", "ممثل", "خدمه العملاء", "خدمة العملاء"}
+_PATIENT_SPEAKER_LABELS = {"patient", "relation", "caller", "customer", "المريض", "العميل", "المتصل"}
+
+
+def split_transcript_turns(transcript: str | None) -> list[tuple[str, str]]:
+    """Split a persisted "Speaker: text" transcript into (speaker_kind, text)
+    turns, where speaker_kind is 'agent' | 'patient'. Lines with an
+    unrecognised speaker label are dropped; a bare continuation line (no
+    "Label:" prefix) is appended to whichever speaker's turn is currently
+    open.
+
+    Shared by app.bank_node.bank_validation and
+    app.location_node.location_validation (Step 20: bank and location
+    validation are logically separate features but both need the same
+    transcript-turn split — that parsing belongs in one neutral place, not
+    duplicated in each feature, and not owned by either one of them).
+    """
+    turns: list[tuple[str, str]] = []
+    speaker, parts = "", []
+
+    def flush():
+        if speaker and parts:
+            turns.append((speaker, "\n".join(parts).strip()))
+
+    for line in (transcript or "").splitlines():
+        m = re.match(r"^\s*([^:：]{1,32})\s*[:：]\s*(.*)$", line)
+        label = normalize_arabic_text(m.group(1)) if m else ""
+        kind = "agent" if label in _AGENT_SPEAKER_LABELS else "patient" if label in _PATIENT_SPEAKER_LABELS else ""
+        if kind:
+            flush()
+            speaker, parts = kind, [m.group(2)]
+        elif speaker:
+            parts.append(line)
+    flush()
+    return turns
+
+
+def split_transcript_by_speaker(transcript: str | None) -> tuple[str, str]:
+    """Convenience wrapper: return (patient_text, agent_text) joined from
+    split_transcript_turns() — the shape both bank_validation and
+    location_validation actually consume."""
+    turns = split_transcript_turns(transcript)
+    patient = "\n".join(t for s, t in turns if s == "patient")
+    agent = "\n".join(t for s, t in turns if s == "agent")
+    return patient, agent
+
+
+def mask_financial_identifier(value: str | None) -> str:
+    """Return a log/API-safe identifier representation."""
+    # API responses, QA findings, and logs must never reveal full bank values.
+    value = normalize_financial_identifier(value)
+    if not value:
+        return ""
+    # Identifiers of 4 chars or fewer must be fully masked — the unclamped
+    # "len - 4" formula previously returned these completely unredacted
+    # (0 asterisks + the whole value as the "last 4 chars").
+    if len(value) <= 4:
+        return "*" * len(value)
+    return "*" * (len(value) - 4) + value[-4:]

@@ -360,6 +360,12 @@ def build_scoring_prompt(
     compliance_summary: str = "",
     reservation_summary: str = "",
     script_summary: str = "",
+    # Masked deterministic bank/location outputs are scoring context, not an
+    # LLM decision about whether an account number or address is correct —
+    # each comes from its own independent graph node (app.bank_node /
+    # app.location_node).
+    bank_summary: str = "",
+    location_summary: str = "",
 ) -> str:
     """
     Prompt that synthesizes the three focused sub-evaluations into a final score.
@@ -422,6 +428,16 @@ SUB-EVALUATION 3 — RESERVATION PILLARS
 SUB-EVALUATION 4 — SCRIPT MATCHING
 ════════════════════════════════════════════════════════════
 {script_summary or "(not available)"}
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 5 — DETERMINISTIC KSA BANK VALIDATION
+════════════════════════════════════════════════════════════
+{bank_summary or "(not applicable)"}
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 6 — DETERMINISTIC KSA LOCATION VALIDATION
+════════════════════════════════════════════════════════════
+{location_summary or "(not applicable)"}
 
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences

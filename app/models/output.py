@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 OverallAssessment = Literal["pass", "needs_review", "escalate", "error"]
@@ -62,6 +62,12 @@ class QAAnalysisResult(BaseModel):
     escalated: bool = False
     qa_reviewed: bool = False
     qa_review_comment: Optional[str] = None
+    # Expose the masked deterministic outcomes to API consumers alongside
+    # compliance flags; no raw IBAN/account number is included. Bank and
+    # location are independent checks (separate graph nodes) — each is None
+    # when its own request type wasn't present in the call.
+    bank_validation: Optional[dict[str, Any]] = None
+    location_validation: Optional[dict[str, Any]] = None
 
     # monitoring only — not part of the public schema
     _latency_ms: Optional[float] = None
@@ -95,6 +101,8 @@ class QAAnalysisResult(BaseModel):
             escalated=False,
             qa_reviewed=False,
             qa_review_comment=None,
+            bank_validation=None,
+            location_validation=None,
         )
 
 

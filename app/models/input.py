@@ -30,13 +30,51 @@ TAG1_TO_BU: dict[str, str] = {
     "LIVE": "LIVE", "SNB": "SNB", "ALW": "ALW", "AKW": "AKW",
 }
 
+# BUSINESS_UNIT_KEYWORD_MAP: dict[str, str] = {
+#     "فرع سلطان": "LCH", "مكرونة": "MKR", "المكرونة": "MKR",
+#     "سلطان": "LCH", "جدة": "LIVE", "حي الجامعة": "LIVE",
+#     "سنابل": "SNB", "السنابل": "SNB", "صحة المرأة": "ALW",
+#     "المرأة": "ALW", "صحة الطفل": "AKW", "الطفل": "AKW",
+#     "BU-AKW":"AKW","BU-ALW":"ALW","BU-LCH":"LCH","BU-AHJ":"LIVE",
+#     "BU-MKR":"MKR","BU-SNB":"SNB",
+#     # AFW has no Arabic colloquial alias anywhere in the project (verified —
+#     # app/SQL/packages_query.sql / service_query.sql and a live CRM query
+#     # both confirm "AFW" as a real BU code, but no chat-facing Arabic name
+#     # for it exists to alias here). Both explicit forms are supported —
+#     # "BU-AFW" matches the convention already used for BU-AKW etc., and bare
+#     # "AFW" since that's the literal value observed in real CRM/SQL data with
+#     # no "BU-" prefix in evidence anywhere for this particular code.
+#     "BU-AFW":"AFW", "AFW":"AFW",
+# }
+
 BUSINESS_UNIT_KEYWORD_MAP: dict[str, str] = {
-    "فرع سلطان": "LCH", "مكرونة": "MKR", "المكرونة": "MKR",
-    "سلطان": "LCH", "جدة": "LIVE", "حي الجامعة": "LIVE",
-    "سنابل": "SNB", "السنابل": "SNB", "صحة المرأة": "ALW",
-    "المرأة": "ALW", "صحة الطفل": "AKW", "الطفل": "AKW",
-    "BU-AKW":"AKW","BU-ALW":"ALW","BU-LCH":"LCH","BU-AHJ":"LIVE",
-    "BU-MKR":"MKR","BU-SNB":"SNB"
+    "فرع سلطان": "LCH",
+    "مكرونة": "MKR",
+    "المكرونة": "MKR",
+    "سلطان": "LCH",
+    "جدة": "LIVE",
+    "حي الجامعة": "LIVE",
+    "سنابل": "SNB",
+    "السنابل": "SNB",
+    "صحة المرأة": "ALW",
+    "المرأة": "ALW",
+    "صحة الطفل": "AKW",
+    "الطفل": "AKW",
+
+    # Explicit BU labels
+    "AKW": "AKW",
+    "ALW": "ALW",
+    "AHJ": "LIVE",
+    "AFW": "AFW",
+
+    # Attribution/tag forms
+    "BU-AKW": "AKW",
+    "BU-ALW": "ALW",
+    "BU-LCH": "LCH",
+    "BU-AHJ": "LIVE",
+    "BU-AFW": "AFW",
+    "BU-MKR": "MKR",
+    "BU-SNB": "SNB",
 }
 
 SENDER_LABEL: dict[str, str] = {

@@ -1,7 +1,22 @@
+# ── TEMPORARY: direct-execution import bootstrap ────────────────────────────
+# Only takes effect when this file is run directly (`python main.py` from
+# inside app/, or `python app/main.py`) — in that case Python puts this
+# file's own directory on sys.path[0] instead of the project root, so the
+# `from app.xxx import yyy` absolute imports below would fail. `__package__`
+# is None/"" only for direct script execution — it's "app" when loaded
+# normally via `uvicorn app.main:app` or `python -m app.main`, so this is a
+# no-op (and therefore safe) for every other way of running the app.
+if __package__ in (None, ""):
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
 import json                          # ← was missing; needed by upload_analyze
 import time
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query, Form, status
@@ -304,6 +319,48 @@ async def retrieve_and_analyze(
     return BatchQAAnalysisResult(results=list(results), summary=summary)
 
 
+# ── Upload-and-test convenience helpers ──────────────────────────────────────
+#
+# /upload-analyze (below) requires the uploaded JSON to already satisfy the
+# full CallTranscript schema. That's correct for production use, but makes it
+# awkward to quickly try a hand-written or partially-extracted transcript
+# (e.g. missing Patient_Phone, or call_date/department left null) without
+# editing the file to add boilerplate that has nothing to do with what's
+# actually being tested. _fill_test_defaults() patches ONLY the in-memory
+# dict used for this one request — it never writes back to the uploaded file.
+
+TEST_DEFAULT_DEPARTMENT = "Helpdesk"   # a generic bucket valid under VALID_DEPARTMENTS
+TEST_DEFAULT_PHONE = "500000000"       # placeholder — passes the 9–15 digit validator
+
+
+def _fill_test_defaults(data: dict) -> tuple[dict, list[str]]:
+    """
+    Return a copy of `data` with missing/null required CallTranscript fields
+    replaced by clearly-fake placeholder values, plus the list of field names
+    that were defaulted (so the caller can log/report exactly what was faked).
+
+    `transcript` is intentionally NOT defaulted — it's the one field a test
+    can't meaningfully fake, so a missing/blank transcript still fails
+    validation with a normal 422.
+    """
+    patched = dict(data)
+    defaulted: list[str] = []
+
+    def _default(key: str, value):
+        if patched.get(key) in (None, ""):
+            patched[key] = value
+            defaulted.append(key)
+
+    _default("call_id", f"TEST-{uuid.uuid4().hex[:8].upper()}")
+    _default("agent_name", "Test Agent")
+    _default("Patient_Phone", TEST_DEFAULT_PHONE)
+    _default("call_date", date.today().isoformat())
+    _default("call_duration_seconds", 0)
+    _default("department", TEST_DEFAULT_DEPARTMENT)
+
+    return patched, defaulted
+
+
 # ── Single / batch analysis endpoints ────────────────────────────────────────
 
 @app.post("/upload-analyze", response_model=QAAnalysisResult)
@@ -328,6 +385,56 @@ async def upload_analyze(file: UploadFile = File(...)):
         raise HTTPException(status_code=502, detail=f"LLM analysis failed: {exc}")
 
     logger.info("upload-analyze done | call_id=%s assessment=%s",
+                payload.call_id, result.overall_assessment)
+    return result
+
+
+@app.post("/upload-analyze-test", response_model=QAAnalysisResult)
+async def upload_analyze_test(file: UploadFile = File(...)):
+    """
+    Dev/testing convenience: upload ANY transcript-shaped JSON file — even one
+    with missing or null fields (call_date, call_duration_seconds, department,
+    Patient_Phone) — and run it through the same analysis pipeline as
+    /upload-analyze. Missing/null fields are filled with obvious placeholder
+    values (see _fill_test_defaults) for THIS request only; the uploaded file
+    itself is never modified. `transcript` is still required — it's the one
+    field a real test needs actual content for.
+
+    NOT intended for production data entry — use /upload-analyze or
+    /analyze-call for that, where the caller is expected to supply the real,
+    complete CallTranscript fields.
+    """
+    try:
+        raw  = await file.read()
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON file: {exc}")
+
+    patched, defaulted = _fill_test_defaults(data)
+    if defaulted:
+        logger.info(
+            "upload-analyze-test | filename=%s | defaulted fields (placeholder values, "
+            "not from the file): %s",
+            file.filename, defaulted,
+        )
+
+    try:
+        payload = CallTranscript(**patched)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"JSON does not match CallTranscript schema even after filling test defaults {defaulted}: {exc}",
+        )
+
+    logger.info("upload-analyze-test | call_id=%s agent=%s dept=%s (defaulted=%s)",
+                payload.call_id, payload.agent_name, payload.department, defaulted)
+    try:
+        result = await analyzer.analyze(payload)
+    except Exception as exc:
+        logger.exception("upload-analyze-test failed | call_id=%s", payload.call_id)
+        raise HTTPException(status_code=502, detail=f"LLM analysis failed: {exc}")
+
+    logger.info("upload-analyze-test done | call_id=%s assessment=%s",
                 payload.call_id, result.overall_assessment)
     return result
 
@@ -370,3 +477,122 @@ async def batch_analyze(payload: BatchCallTranscripts) -> BatchQAAnalysisResult:
     }
     logger.info("batch-analyze done | summary=%s", summary)
     return BatchQAAnalysisResult(results=list(results), summary=summary)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPORARY / DIRECT-EXECUTION TESTING BLOCK
+# ─────────────────────────────────────────────────────────────────────────────
+# Lets you run this file directly to push one local JSON transcript through
+# the EXACT SAME validation + analysis path /upload-analyze uses — no
+# FastAPI server, no HTTP call, no uvicorn — so you can quickly exercise the
+# Location (app/location_node/) and Bank Account (app/bank_node/) features —
+# two fully independent nodes, each with its own graph node, state key, and
+# output field.
+#
+# It deliberately does NOT re-implement any analysis logic: it calls the
+# same `CallTranscript` schema and the same module-level `analyzer`
+# (QAAgent) instance that every HTTP endpoint above already uses.
+#
+# Change which file gets analyzed by editing TEST_JSON_PATH below. A
+# relative path is resolved against this file's own directory (app/), so it
+# works the same regardless of which of the two run commands you use.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TEST_JSON_PATH = "chats/fayrouz_ahmed.json"   # ← change this to test a different file
+
+
+def _resolve_test_json_path(raw_path: str) -> Path:
+    """Relative paths are resolved against app/ (this file's directory), not cwd."""
+    p = Path(raw_path)
+    return p if p.is_absolute() else (Path(__file__).parent / p)
+
+
+async def _run_local_test(json_path: Path) -> None:
+    """Direct-execution counterpart of /upload-analyze — same validation,
+    same analyzer, same result type — just reading from disk and printing
+    to the terminal instead of going through FastAPI."""
+    print(f"\n{'=' * 70}\nLoading test transcript: {json_path}\n{'=' * 70}")
+
+    if not json_path.exists():
+        print(f"ERROR: file not found: {json_path}")
+        print(f"       (edit TEST_JSON_PATH near the bottom of {__file__} to point at your file)")
+        return
+
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        print(f"ERROR: invalid JSON file: {exc}")
+        return
+
+    # Same schema validation /upload-analyze performs — via the same
+    # CallTranscript model, not a re-implementation of it.
+    try:
+        payload = CallTranscript(**data)
+    except Exception as exc:
+        print(f"ERROR: JSON does not match CallTranscript schema: {exc}")
+        return
+
+    print(f"call_id       : {payload.call_id}")
+    print(f"agent_name    : {payload.agent_name}")
+    print(f"department    : {payload.department}")
+    print(f"business_unit : {payload.business_unit}")
+
+    # Cheap, read-only preview of the two independent deterministic gates —
+    # reuses the real detectors from app.bank_node / app.location_node (two
+    # separate features/nodes, not a combined one) so you can confirm
+    # detection is firing correctly even before a full, LLM-backed analysis
+    # completes.
+    from app.bank_node.bank_validation import detect_bank_signals, is_supported_bank_bu
+    from app.location_node.location_validation import detect_location_signals
+    bank_requested, supplied, _patient_text, _agent_text, resolved_bu = detect_bank_signals(payload)
+    location_requested, _loc_patient_text, _loc_agent_text = detect_location_signals(payload)
+    print(f"bank request detected in patient text     : {bank_requested}")
+    print(f"resolved business unit                    : {resolved_bu} (in bank scope: {is_supported_bank_bu(resolved_bu)})")
+    print(f"location request detected in patient text : {location_requested}")
+    print(f"financial identifiers found in agent text : {len(supplied)}")
+
+    print("\nRunning full analysis via the same QAAgent instance /upload-analyze uses...\n")
+    try:
+        result = await analyzer.analyze(payload)   # identical call to every endpoint above
+    except Exception as exc:
+        print(f"ERROR: analysis failed: {exc}")
+        return
+
+    print(f"{'=' * 70}\nRESULT\n{'=' * 70}")
+    print(result.model_dump_json(indent=2))
+
+    print(f"\noverall_assessment : {result.overall_assessment}")
+    # Bank and location are independent nodes/fields now — printed separately.
+    if result.bank_validation:
+        print("bank_validation (app.bank_node):")
+        print(json.dumps(result.bank_validation, indent=2, ensure_ascii=False))
+    else:
+        print("bank_validation : None (gate did not detect a bank request in this transcript)")
+    if result.location_validation:
+        print("location_validation (app.location_node):")
+        print(json.dumps(result.location_validation, indent=2, ensure_ascii=False))
+    else:
+        print("location_validation : None (gate did not detect a location request in this transcript)")
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    if "--serve" in _sys.argv:
+        # Preserves the previous "start the real server" behaviour, now opt-in
+        # via `python main.py --serve`, since the default direct-execution
+        # behaviour is now the local JSON test above.
+        # `reload=True` is intentionally NOT set: uvicorn's auto-reload only
+        # works when the app is passed as an import string ("app.main:app"),
+        # not an already-instantiated object. Use
+        # `uvicorn app.main:app --reload` from the CLI for that.
+        import os
+        import uvicorn
+
+        port = int(os.getenv("PORT", "8000"))
+        uvicorn.run(app, host="127.0.0.1", port=port)
+    else:
+        import asyncio
+
+        asyncio.run(_run_local_test(_resolve_test_json_path(TEST_JSON_PATH)))
+
