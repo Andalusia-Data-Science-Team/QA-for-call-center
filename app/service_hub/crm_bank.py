@@ -1,15 +1,17 @@
 """
-CRM Bank-Account Reference Data — bank_node/crm_bank.py
+CRM Bank-Account Reference Data — app/service_hub/crm_bank.py
 
 Fetches + caches the authoritative KSA bank-account reference rows
 (cr301_bankaccounts) from Dynamics 365, independently of location data —
-see app/location_node/crm_location.py for the location-only equivalent.
+see app/service_hub/crm_location.py for the location-only equivalent.
 They used to be fetched together by one function in a shared
 "locbank_node" package; splitting them lets bank and location be entirely
 separate graph nodes/features (each with its own cache, its own failure
 mode) while still sharing only the generic, domain-agnostic connector in
-app/services/crm_connector.py — the same one app/offers_node/crm_offers.py
-uses.
+app/services/crm_connector.py — the same one app/service_hub/crm_offers.py
+uses. (bank_node/location_node were later merged with offers_node into
+this single app/service_hub/ package; the modules themselves stayed
+independent.)
 
 Public API:
     fetch_bank_accounts(force_refresh=False) -> list[dict]
@@ -26,7 +28,7 @@ from pathlib import Path
 from app.config import settings
 
 # Reference data changes slowly — reuse the same TTL as the doctor-price
-# cache in app/offers_node/crm_database.py rather than inventing a new policy.
+# cache in app/service_hub/crm_database.py rather than inventing a new policy.
 _CACHE_TTL_SECONDS = settings.CRM_PRICE_CACHE_TTL_SECONDS
 
 _SQL_FILE = Path(__file__).resolve().parent.parent / "SQL" / "bank_accounts_query.sql"
@@ -39,7 +41,7 @@ _lock = threading.Lock()
 def fetch_bank_accounts(force_refresh: bool = False) -> list[dict]:
     """
     Return the active KSA bank-account reference rows used by
-    app.bank_node.bank_validation for deterministic QA checks.
+    app.service_hub.bank_validation for deterministic QA checks.
 
     Cached for _CACHE_TTL_SECONDS. Thread-safe single-flight fetch. Never
     raises — degrades to whatever is cached (or []) on failure, backing off

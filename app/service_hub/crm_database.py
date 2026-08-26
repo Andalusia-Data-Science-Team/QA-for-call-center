@@ -3,10 +3,10 @@ CRM doctor reference data — walk-in/cash price, specialty, etc. — pulled
 from Dynamics 365 via the shared connector in app/services/crm_connector.py.
 
 Location/bank reference data used to be fetched from this module too; that
-now lives in its own independent nodes — app/bank_node/crm_bank.py and
-app/location_node/crm_location.py — and the generic auth/connection/retry
+now lives in its own independent modules — app/service_hub/crm_bank.py and
+app/service_hub/crm_location.py — and the generic auth/connection/retry
 primitives all three depend on live in app/services/crm_connector.py
-(no domain package owns them).
+(no domain module owns them).
 
 Cache: in-memory dict with a TTL (default 24h) — CRM data changes slowly
 and we never want to block the booking flow on CRM latency.

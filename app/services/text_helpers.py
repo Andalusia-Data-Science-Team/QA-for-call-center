@@ -230,8 +230,8 @@ def split_transcript_turns(transcript: str | None) -> list[tuple[str, str]]:
     "Label:" prefix) is appended to whichever speaker's turn is currently
     open.
 
-    Shared by app.bank_node.bank_validation and
-    app.location_node.location_validation (Step 20: bank and location
+    Shared by app.service_hub.bank_validation and
+    app.service_hub.location_validation (Step 20: bank and location
     validation are logically separate features but both need the same
     transcript-turn split — that parsing belongs in one neutral place, not
     duplicated in each feature, and not owned by either one of them).

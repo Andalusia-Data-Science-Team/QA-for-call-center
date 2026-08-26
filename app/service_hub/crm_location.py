@@ -1,11 +1,11 @@
 """
-CRM Branch/Location Reference Data — location_node/crm_location.py
+CRM Branch/Location Reference Data — app/service_hub/crm_location.py
 
 Fetches + caches the authoritative KSA branch/location reference rows
 (cr301_andalusialocations) from Dynamics 365, independently of bank data —
-see app/bank_node/crm_bank.py for the bank-only equivalent. Split out of what
-used to be one shared "locbank_node" package so bank and location can be
-entirely separate graph nodes/features (each with its own cache, its own
+see app/service_hub/crm_bank.py for the bank-only equivalent. Split out of
+what used to be one shared "locbank_node" package so bank and location can
+be entirely separate graph nodes/features (each with its own cache, its own
 failure mode) while still sharing only the generic, domain-agnostic
 connector in app/services/crm_connector.py.
 
@@ -35,7 +35,7 @@ _lock = threading.Lock()
 def fetch_ksa_locations(force_refresh: bool = False) -> list[dict]:
     """
     Return the active KSA branch/location reference rows used by
-    app.location_node.location_validation for deterministic QA checks.
+    app.service_hub.location_validation for deterministic QA checks.
 
     Cached for _CACHE_TTL_SECONDS. Thread-safe single-flight fetch. Never
     raises — degrades to whatever is cached (or []) on failure, backing off

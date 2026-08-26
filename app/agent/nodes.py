@@ -53,8 +53,8 @@ from app.prompts.qa_prompt import (
 from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
 from app.services.sql_helpers import insert_qa_result
-from app.bank_node.bank_validation import bank_validation_needed, validate_ksa_bank_information, detect_bank_signals
-from app.location_node.location_validation import detect_location_intent, detect_location_signals, is_home_service_location_text, location_validation_needed, validate_location_request
+from app.service_hub.bank_validation import bank_validation_needed, validate_ksa_bank_information, detect_bank_signals
+from app.service_hub.location_validation import detect_location_intent, detect_location_signals, is_home_service_location_text, location_validation_needed, validate_location_request
 from app.services.text_helpers import (
     _normalize_arabic,
     _arabic_like_pattern, 
@@ -494,7 +494,7 @@ async def fetch_crm_offers_for_call(state: AgentState) -> dict:
     try:
         # Import here (not at module top) so the QA pipeline doesn't hard-fail
         # when the CRM is not configured — the node just returns empty context.
-        from app.offers_node.crm_offers import get_offers_for_specialty, format_offer_card
+        from app.service_hub.crm_offers import get_offers_for_specialty, format_offer_card
 
         # If the transcript explicitly named an offer, use it as the service hint
         # so get_offers_for_specialty performs a direct-name lookup first.
@@ -1401,9 +1401,9 @@ async def verify_appointment_in_db(state: AgentState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node – validate_bank_information (app.bank_node)
+# Node – validate_bank_information (app.service_hub)
 #   Fully independent of validate_location — separate graph node, separate
-#   CRM fetch/cache (app.bank_node.crm_bank), separate state key
+#   CRM fetch/cache (app.service_hub.crm_bank), separate state key
 #   (bank_validation). The only thing the two share is the transcript-turn
 #   splitter in app.services.text_helpers.
 # ---------------------------------------------------------------------------
@@ -1444,7 +1444,7 @@ async def validate_bank_information_node(state: AgentState) -> dict:
     Under normal graph execution this node is only reached at all when
     app.agent.graph's bank-intent router (_bank_intent_router) has already
     confirmed bank_validation_needed — see
-    app.bank_node.bank_validation.bank_validation_needed /
+    app.service_hub.bank_validation.bank_validation_needed /
     detect_bank_signals, which the router reuses directly rather than
     duplicating. The gate below is kept as a defensive fallback (not the
     primary mechanism any more): it re-checks the same condition so that
@@ -1452,9 +1452,9 @@ async def validate_bank_information_node(state: AgentState) -> dict:
     it would still degrade to a safe, non-punitive NOT_APPLICABLE instead
     of running CRM lookups it has no real signal to justify.
 
-    Business-Unit resolution (app.bank_node.bank_validation.resolve_business_unit)
+    Business-Unit resolution (app.service_hub.bank_validation.resolve_business_unit)
     is keyword-map-driven, not CRM-location-based — this node no longer
-    depends on app.location_node's CRM fetch at all, unlike before.
+    depends on app.service_hub's location CRM fetch at all, unlike before.
     """
     call = state["call"]
     signals = detect_bank_signals(call)
@@ -1465,7 +1465,7 @@ async def validate_bank_information_node(state: AgentState) -> dict:
         result = _not_applicable_bank_result(signals[4])
     else:
         try:
-            from app.bank_node.crm_bank import fetch_bank_accounts
+            from app.service_hub.crm_bank import fetch_bank_accounts
             banks = fetch_bank_accounts()
             # Missing reference data is non-punitive: correctness cannot be
             # verified safely, so report an unresolved system-data condition.
@@ -1524,7 +1524,7 @@ def skip_location_validation(state: AgentState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node – validate_location (app.location_node)
+# Node – validate_location (app.service_hub)
 #   Fully independent of validate_bank_information — see above.
 # ---------------------------------------------------------------------------
 async def validate_location_node(state: AgentState) -> dict:
@@ -1534,7 +1534,7 @@ async def validate_location_node(state: AgentState) -> dict:
     app.agent.graph's location-intent router (_location_intent_router) has
     already confirmed patient_has_location_intent OR
     agent_has_location_information — see
-    location_node.location_validation.detect_location_intent /
+    app.service_hub.location_validation.detect_location_intent /
     location_validation_needed, which the router reuses directly rather
     than duplicating. The gate below is kept as a defensive fallback (not
     the primary mechanism any more): it re-checks the same condition so
@@ -1555,7 +1555,7 @@ async def validate_location_node(state: AgentState) -> dict:
         result = _not_applicable_location_result()
     else:
         try:
-            from app.location_node.crm_location import fetch_ksa_locations
+            from app.service_hub.crm_location import fetch_ksa_locations
             locations = fetch_ksa_locations()
             if not locations:
                 logger.warning("[location_validation] CRM location lookup failed | call_id=%s reason=empty_result", call.call_id)

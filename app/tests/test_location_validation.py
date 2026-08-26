@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from app.models.input import CallTranscript
-from app.location_node.location_validation import (
+from app.service_hub.location_validation import (
     detect_location_intent,
     detect_location_request,
     location_validation_needed,
@@ -369,7 +369,7 @@ def test_intent_false_skips_crm_fetch_entirely(monkeypatch):
     """When neither side shows location intent, fetch_ksa_locations() must
     never even be called — no CRM lookup, no branch resolution, no address
     matching."""
-    import app.location_node.crm_location as crm_location
+    import app.service_hub.crm_location as crm_location
     from app.agent.nodes import validate_location_node
 
     calls = {"count": 0}
@@ -392,7 +392,7 @@ def test_intent_true_still_runs_full_validation_flow(monkeypatch):
     """When intent IS present, the existing CRM-backed validation flow still
     runs exactly as before — the intent layer is a gate in front of it, not
     a replacement for it."""
-    import app.location_node.crm_location as crm_location
+    import app.service_hub.crm_location as crm_location
     from app.agent.nodes import validate_location_node
 
     monkeypatch.setattr(crm_location, "fetch_ksa_locations", lambda *a, **k: ALL_LOCATIONS)
@@ -405,9 +405,10 @@ def test_intent_true_still_runs_full_validation_flow(monkeypatch):
 
 
 def test_intent_layer_does_not_affect_bank_validation():
-    """The location-intent layer only touches app.location_node — bank
-    validation, an independent sibling feature, must behave identically."""
-    from app.bank_node.bank_validation import bank_validation_needed
+    """The location-intent layer only touches location_validation.py — bank
+    validation, an independent sibling feature (same app.service_hub
+    package), must behave identically."""
+    from app.service_hub.bank_validation import bank_validation_needed
 
     transcript = call("Patient: فين فرع السنابل؟\nAgent: العنوان فرع السنابل شارع السنابل حي السنابل")
     assert bank_validation_needed(transcript) is False
@@ -805,3 +806,147 @@ def test_short_single_word_address_still_qualifies_after_overlap_fix():
     result = validate("Patient: عنوان فرع صاري؟\nAgent: شارع صارى")
     assert result["outcome"] == "INCOMPLETE_ADDRESS"
     assert result["is_violation"] is True
+
+
+# ── Regression: Agent evidence must dominate weaker/older Patient context ──
+# Root cause: the resolution-attempt loop tried Patient-side sources
+# (explicit anchor, then whole patient_text) BEFORE Agent-side sources, and
+# stopped at the first non-empty (even ambiguous) match — so an ambiguous
+# or stale Patient signal could win before the Agent's own unambiguous
+# evidence was ever tried. Fixed by reordering to Agent-anchor → Patient-
+# anchor → Agent-address (now also resolvable via address CONTENT, not
+# just branch NAME — see resolve_branch_by_address_content) → Patient
+# whole-text, plus recognizing that Patient's EXPLICIT branch anchor still
+# must catch a genuinely WRONG bare Agent address (existing Sanabil/Prince
+# Sultan/Hospital wrong-branch tests, unaffected below).
+
+def test_5c2d54e5_regression_agent_address_overrides_patient_locality_alias():
+    """Real regression (call 5C2D54E5): the Patient never uses an explicit
+    branch-anchor phrase, only locality/area aliases ("اندلسية جدة",
+    "اندلسية السنابل") — historical context that must not override the
+    Agent's later, concrete branch + address."""
+    transcript = (
+        "Patient: انتوا في حي الجامعه ؟ لاني اخترت اندلسية جده\n"
+        "Agent: بالفعل\n"
+        "Agent: العنوان: تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة\n"
+        "Agent: الموقع : https://maps.app.goo.gl/VpKdwFauiiubFmVi7\n"
+        "Patient: في اندلسية السنابل كنت\n"
+        "Agent: انا كدة اكدت لحضرتك الحجز في فرع مستشفي اندلسية جدة يوم الاربعاء"
+    )
+    result = validate(transcript, locations=ALL_LOCATIONS)
+    assert result["outcome"] == "PASS"
+    assert result["requested_branch"] == "مستشفى أندلسية جدة"
+    assert result["match_confidence"] >= 0.6
+    assert result["is_violation"] is False
+    assert "السنابل" not in result["provided_location"]
+
+
+def test_af7e_regression_agent_branch_redirection_overrides_patient_branch():
+    """Real regression (call 4B77DCA1-AF7E-F111-B337-000D3AA9D4A7): the
+    Patient explicitly names one branch ("فرع المحمديه") but the Agent
+    redirects to the main hospital and gives its address — the Agent's
+    redirection must win."""
+    transcript = (
+        "Agent: السلام عليكم مع حضرتك د محمد من قسم الرعاية المنزلية والاشعة\n"
+        "Patient: اهلا دكتور\n"
+        "Patient: هذا في فرع المحمديه\n"
+        "Agent: في فرع المستشفى الرئيسي فقط\n"
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+    )
+    result = validate(transcript, locations=ALL_LOCATIONS + [LOC_WITH_COINCIDENTAL_NAME])
+    assert result["outcome"] == "PASS"
+    assert result["requested_branch"] == "مستشفى أندلسية جدة"
+    assert result["match_confidence"] >= 0.6
+    assert result["is_violation"] is False
+    assert "الرعاية المنزلية" not in result["provided_location"]
+
+
+def test_agent_textual_address_plus_map_url_resolves_correctly():
+    """A map link supplied alongside a textual address must stay associated
+    with the same block but never become (or pollute) provided_location —
+    the textual address alone must resolve and score correctly."""
+    transcript = (
+        "Agent: العنوان: تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة\n"
+        "Agent: الموقع : https://maps.app.goo.gl/VpKdwFauiiubFmVi7"
+    )
+    result = validate(transcript, locations=ALL_LOCATIONS)
+    assert result["outcome"] == "PASS"
+    assert result["requested_branch"] == "مستشفى أندلسية جدة"
+    assert "https://" not in result["provided_location"]
+    assert "maps.app.goo.gl" not in result["provided_location"]
+
+
+def test_ambiguous_patient_text_becomes_unambiguous_via_agent_address():
+    """Patient text alone ties between two branches (each contributes
+    exactly one matching distinctive token); the Agent's concrete address
+    must resolve it uniquely rather than reporting AMBIGUOUS_BRANCH."""
+    assert len(resolve_branch_candidates("مش متاكد السنابل ولا صاري", ALL_LOCATIONS, ksa_only=True)) == 2
+    transcript = "Patient: مش متاكد السنابل ولا صاري\nAgent: العنوان شارع صارى متفرع من الخطيب التبريزى حي البوادي جدة"
+    result = validate(transcript, locations=ALL_LOCATIONS)
+    assert result["outcome"] == "PASS"
+    assert result["requested_branch"] == "عيادات أندلسية فرع صاري"
+
+
+def test_department_introduction_is_never_extracted_as_location():
+    transcript = (
+        "Agent: السلام عليكم مع حضرتك د محمد من قسم الرعاية المنزلية والاشعة\n"
+        "Agent: في فرع المستشفى الرئيسي فقط\n"
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+    )
+    result = validate(transcript, locations=ALL_LOCATIONS)
+    assert "قسم الرعاية المنزلية" not in result["provided_location"]
+    assert "د محمد" not in result["provided_location"]
+    assert result["outcome"] == "PASS"
+
+
+def test_patient_home_map_location_still_skips_branch_validation():
+    result = validate("Agent: ممكن لوكيشن المنزل؟\nPatient: https://maps.google.com/?q=21.606500,39.240455")
+    assert result["outcome"] == "NOT_APPLICABLE"
+    assert result["applicable"] is False
+
+
+def test_agent_branch_address_in_home_care_conversation_still_validates():
+    """Home-service vocabulary earlier in the call must never hard-stop
+    validation of a real branch address given later — the decision is
+    based on WHO provided the actual location, not on stop words."""
+    transcript = (
+        "Agent: السلام عليكم انا من قسم الرعاية المنزلية\n"
+        "Agent: العنوان شارع الأمير سلطان حي المحمدية جدة"
+    )
+    result = validate(transcript, locations=ALL_LOCATIONS)
+    assert result["outcome"] == "PASS"
+    assert result["requested_branch"] == "عيادات أندلسية فرع الأمير سلطان"
+
+
+def test_sanabil_prince_sultan_hospital_cases_remain_unchanged():
+    """Section 8: existing wrong-branch detection must still work — a
+    Patient's EXPLICIT branch anchor still catches a genuinely wrong bare
+    Agent address (no explicit facility naming of its own)."""
+    wrong = validate("Patient: فين فرع السنابل؟\nAgent: العنوان شارع الأمير سلطان، حي المحمدية، جدة")
+    assert wrong["requested_branch"] == "عيادات أندلسية فرع السنابل"
+    assert wrong["is_violation"] is True
+
+    sultan = validate("Patient: عنوان فرع الأمير سلطان؟\nAgent: شارع الامير سلطان حي المحمديه جده")
+    assert sultan["outcome"] == "PASS"
+    assert sultan["requested_branch"] == "عيادات أندلسية فرع الأمير سلطان"
+
+    sanabil = validate("Patient: فين فرع السنابل؟\nAgent: شارع السنابل العام بعد محطه نفط حي السنابل جده")
+    assert sanabil["outcome"] == "PASS"
+    assert sanabil["requested_branch"] == "عيادات أندلسية فرع السنابل"
+
+    hospital = validate(
+        "Agent: في فرع المستشفى الرئيسي فقط\n"
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة",
+    )
+    assert hospital["outcome"] == "PASS"
+    assert hospital["requested_branch"] == "مستشفى أندلسية جدة"
+
+
+def test_no_regression_in_graph_level_skip_behavior():
+    """Section 9: the graph-level location-intent gate (used by
+    app.agent.graph's router) must remain unaffected by this resolution-
+    priority change — home-service text still yields no intent at all."""
+    patient_intent, agent_intent = detect_location_intent("", "ممكن لوكيشن المنزل؟")
+    assert patient_intent is False
+    assert agent_intent is False
+    assert location_validation_needed(call("Agent: ممكن لوكيشن المنزل؟\nPatient: https://maps.google.com/?q=1,2")) is False

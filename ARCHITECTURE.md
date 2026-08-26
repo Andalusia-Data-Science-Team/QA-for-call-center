@@ -2,10 +2,13 @@
 
 *Reflects the current state of the codebase, including the config fixes, the
 graph concurrency fix, the `upload-analyze-test` / direct-execution testing
-tools, and the full bank/location feature build-out and separation into
-`app/bank_node/` and `app/location_node/`. Written to replace the drift
-between `README.md` / `diagram.md` and the actual code — treat this file as
-the one to keep current going forward.*
+tools, and the full bank/location feature build-out — bank, location, and
+offers now live together in the shared `app/service_hub/` package (bank
+and location used to be their own `app/bank_node/` and `app/location_node/`
+folders; offers used to be `app/offers_node/`) while remaining independent
+features/graph nodes. Written to replace the drift between `README.md` /
+`diagram.md` and the actual code — treat this file as the one to keep
+current going forward.*
 
 ---
 
@@ -60,15 +63,15 @@ app/
 │   ├── sql_helpers.py               DB writes for QA results
 │   ├── text_helpers.py              Arabic normalization, financial-ID masking, transcript-turn splitter
 │   └── slots_check.py               ad-hoc script
-├── bank_node/                    Bank feature — fully self-contained
+├── service_hub/                  Shared package for the three QA-validation features below —
+│   │                                each module is still fully self-contained/independent;
+│   │                                only the package/folder is shared, not the logic.
 │   ├── crm_bank.py                  Cached fetch of cr301_bankaccounts
 │   ├── bank_validation.py           BU resolution + detection + validation (deterministic, no LLM)
-│   └── README.md
-├── location_node/                Location feature — fully self-contained
+│   ├── README_bank.md
 │   ├── crm_location.py              Cached fetch of cr301_andalusialocations
 │   ├── location_validation.py       Detection + branch resolution + address validation
-│   └── README.md
-├── offers_node/                  CRM promotional-offers feature (partly inherited/dead code)
+│   ├── README_location.md
 │   ├── crm_offers.py                Offer fetch + fuzzy/semantic matching
 │   ├── crm_database.py              Doctor walk-in-price fetch (shrunk to just this)
 │   ├── intent_detector.py, offer_search.py   orphaned — not imported by the app
@@ -134,8 +137,8 @@ load_call ──(error)───────────────────
                        detect_intent  (Arabic booking-keyword scan)   │
                               │                                       │
      fan-out: 2 PARALLEL, fully independent deterministic nodes       │
-     ├→ validate_bank_information  (app.bank_node)                    │
-     └→ validate_location          (app.location_node)                │
+     ├→ validate_bank_information  (app.service_hub.bank_validation)   │
+     └→ validate_location          (app.service_hub.location_validation)│
                     │        │                                        │
                     └───┬────┘                                        │
                   loc_bank_ready  (barrier)                           │
@@ -189,10 +192,11 @@ load_call ──(error)───────────────────
 ## 6. Bank & Location — Two Fully Independent Features
 
 Originally one merged deterministic check, now two parallel graph nodes,
-each self-contained like `offers_node`:
+each self-contained like the offers feature (all three live in
+`app/service_hub/`, but remain fully independent modules):
 
 ```
-app/bank_node/bank_validation.py          app/location_node/location_validation.py
+app/service_hub/bank_validation.py        app/service_hub/location_validation.py
    │ BU resolved FIRST, via                   │ detection: address/branch request
    │  BUSINESS_UNIT_KEYWORD_MAP                    (context-aware — "مكان" alone
    │  (app.models.input) — exact match             doesn't trigger; needs a place-noun)
@@ -211,16 +215,16 @@ app/bank_node/bank_validation.py          app/location_node/location_validation.
    │ WRONG_FIELD_TYPE_PROVIDED when a
    │  valid-but-wrong-field answer is given
    ▼                                          ▼
-app/bank_node/crm_bank.py                  app/location_node/crm_location.py
+app/service_hub/crm_bank.py                app/service_hub/crm_location.py
    │ cached fetch: cr301_bankaccounts           │ cached fetch: cr301_andalusialocations
    ▼                                           ▼
 app/services/crm_connector.py  ◄────────────────┘
    (shared, domain-agnostic: MSAL auth, connection, retry —
-    also used by app/offers_node/crm_offers.py)
+    also used by app/service_hub/crm_offers.py)
 ```
 
 Bank validation resolves its Business Unit from `BUSINESS_UNIT_KEYWORD_MAP`
-directly — it does **not** depend on `location_node`'s CRM fetch at all
+directly — it does **not** depend on location's CRM fetch at all
 (an earlier design routed BU resolution through location records; that
 cross-dependency has been removed). The BU vocabularies differ between
 layers and are bridged in exactly one place

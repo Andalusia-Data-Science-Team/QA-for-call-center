@@ -155,8 +155,8 @@ from app.agent.nodes import (
     skip_location_validation,
     skip_bank_validation,
 )
-from app.bank_node.bank_validation import detect_bank_signals, bank_validation_needed
-from app.location_node.location_validation import detect_location_signals, location_validation_needed
+from app.service_hub.bank_validation import detect_bank_signals, bank_validation_needed
+from app.service_hub.location_validation import detect_location_signals, location_validation_needed
 from app.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -182,7 +182,7 @@ def _booking_router(state: AgentState) -> Literal["booking", "skip_booking"]:
 
 def _bank_intent_router(state: AgentState) -> Literal["validate_bank_information", "skip_bank"]:
     """Route to validate_bank_information only when there is actual bank
-    intent — reusing app.bank_node.bank_validation.bank_validation_needed /
+    intent — reusing app.service_hub.bank_validation.bank_validation_needed /
     detect_bank_signals, the SAME deterministic gate the node itself uses
     internally, not a second copy of the logic (supported business unit AND
     a bank request or agent-supplied financial identifier). When it doesn't
@@ -202,7 +202,7 @@ def _bank_intent_router(state: AgentState) -> Literal["validate_bank_information
 def _location_intent_router(state: AgentState) -> Literal["validate_location", "skip_location"]:
     """Route to validate_location only when there is actual location
     intent — patient_has_location_intent OR
-    agent_has_location_information (app.location_node.location_validation.
+    agent_has_location_information (app.service_hub.location_validation.
     location_validation_needed / detect_location_intent) — reusing the
     SAME deterministic gate the node itself uses internally, not a second
     copy of the logic. When neither holds, validate_location is skipped

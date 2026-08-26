@@ -85,7 +85,7 @@ def test_no_intent_both_validations_skipped_but_state_present():
 # ── 3. No location intent → CRM location fetch is not called ───────────────
 
 def test_no_intent_crm_fetch_never_called(monkeypatch):
-    import app.location_node.crm_location as crm_location
+    import app.service_hub.crm_location as crm_location
 
     calls = {"count": 0}
 
@@ -126,7 +126,7 @@ def test_proactive_agent_location_routes_to_validate_location():
 # ── 7. Customer/home-care location phrasing does not execute validate_location ──
 
 def test_home_care_customer_location_does_not_execute_validate_location(monkeypatch):
-    import app.location_node.crm_location as crm_location
+    import app.service_hub.crm_location as crm_location
 
     calls = {"count": 0}
     monkeypatch.setattr(crm_location, "fetch_ksa_locations", lambda *a, **k: calls.__setitem__("count", calls["count"] + 1) or [])
@@ -208,7 +208,7 @@ def test_no_bank_intent_skip_node_present_instead():
 # ── 3. No bank intent → CRM bank fetch is not called ────────────────────────
 
 def test_no_bank_intent_crm_fetch_never_called(monkeypatch):
-    import app.bank_node.crm_bank as crm_bank
+    import app.service_hub.crm_bank as crm_bank
 
     calls = {"count": 0}
 
@@ -263,7 +263,7 @@ def test_agent_proactive_bank_identifier_routes_to_validate_bank_information():
 # ── 9. Generic unrelated numbers do not trigger bank validation ────────────
 
 def test_generic_unrelated_numbers_do_not_trigger_bank_validation(monkeypatch):
-    import app.bank_node.crm_bank as crm_bank
+    import app.service_hub.crm_bank as crm_bank
 
     calls = {"count": 0}
     monkeypatch.setattr(crm_bank, "fetch_bank_accounts", lambda *a, **k: calls.__setitem__("count", calls["count"] + 1) or [])
@@ -373,7 +373,7 @@ def test_normal_conversation_skips_location_validation():
 
 
 def test_home_service_crm_location_fetch_never_called(monkeypatch):
-    import app.location_node.crm_location as crm_location
+    import app.service_hub.crm_location as crm_location
 
     calls = {"count": 0}
     monkeypatch.setattr(crm_location, "fetch_ksa_locations", lambda *a, **k: calls.__setitem__("count", calls["count"] + 1) or [])

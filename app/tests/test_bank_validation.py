@@ -1,5 +1,5 @@
 from app.models.input import CallTranscript
-from app.bank_node.bank_validation import (
+from app.service_hub.bank_validation import (
     bank_validation_needed,
     detect_arabic_bank_request,
     is_supported_bank_bu,

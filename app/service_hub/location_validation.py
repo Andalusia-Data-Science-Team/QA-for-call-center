@@ -1,12 +1,13 @@
 """Deterministic, Arabic-first validation of KSA branch/location requests.
 
-Location validation as its own node/feature — see app/bank_node/ for the
-independent (but sibling) bank validator. They only share the transcript-
-turn split (app.services.text_helpers.split_transcript_by_speaker) and
-Arabic text normalisation, not any bank/location-specific logic.
+Location validation as its own feature — see bank_validation.py (same
+app/service_hub/ package) for the independent (but sibling) bank
+validator. They only share the transcript-turn split
+(app.services.text_helpers.split_transcript_by_speaker) and Arabic text
+normalisation, not any bank/location-specific logic.
 
-Mirrors the layered-matching philosophy in app/offers_node/crm_offers.py
-(exact match → fuzzy match, with ubiquitous/generic words excluded from
+Mirrors the layered-matching philosophy in crm_offers.py (same package —
+exact match → fuzzy match, with ubiquitous/generic words excluded from
 scoring) instead of inventing a separate matching strategy.
 """
 from __future__ import annotations
@@ -114,6 +115,22 @@ _HOME_SERVICE_LOCATION_RE = re.compile(
     r"(?:موقع|لوكيشن|لوكشن|location|address|عنوان)\s*(?:ال)?(?:منزل|بيت|مريض)", re.I,
 )
 
+# A map link (Google Maps or similar) — kept associated with the same
+# location block it appears in, but never allowed to stand in for a
+# stronger textual address (see _split_address_and_map()).
+_MAP_URL_RE = re.compile(r"https?://\S+", re.I)
+
+# Structural address-line markers — a turn built entirely out of these
+# (street/district/intersection/road wording) is genuine address evidence
+# even with no "عنوان"/"موقع" preface at all. Used only for EXTRACTION's
+# per-turn "is this turn worth keeping" qualification
+# (_extract_agent_location_text), never for the location-intent gate
+# (detect_location_request) — the gate deliberately stays vocabulary-only
+# so a coincidental "شارع"/"حي" fragment can't flip intent on its own; here
+# we already know a location is being discussed and just need to identify
+# which turn actually carries it.
+_ADDRESS_LINE_RE = re.compile(r"شارع|حي\s|طريق|تقاطع|بلازا", re.I)
+
 
 def detect_location_request(text: str) -> bool:
     """Context-aware detection — avoids matching bare 'فرع'/'مكان' with no
@@ -174,7 +191,7 @@ def is_home_service_location_text(patient_text: str, agent_text: str) -> bool:
 def detect_location_signals(call: CallTranscript) -> tuple[bool, str, str]:
     """Parse the transcript once into (patient_requested, patient_text,
     agent_text) — the location-side equivalent of
-    app.bank_node.bank_validation.detect_bank_signals(), independent of it
+    app.service_hub.bank_validation.detect_bank_signals(), independent of it
     (both call the same shared split_transcript_by_speaker(), neither
     depends on the other's module)."""
     patient, agent = split_transcript_by_speaker(call.transcript)
@@ -348,6 +365,52 @@ def resolve_branch_candidates(
     return winners if len(winners) == 1 else []
 
 
+def resolve_branch_by_address_content(
+    query_text: str, locations: list[dict[str, Any]], *, ksa_only: bool = True,
+) -> list[dict[str, Any]]:
+    """Resolve a branch from CONCRETE ADDRESS content — street/district/
+    intersection wording — rather than a branch NAME.
+
+    resolve_branch_candidates() only ever matches against a branch's NAME
+    (_name_distinctive_tokens); a bare address with no facility name in it
+    at all (e.g. "تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول
+    الجامعة بلازا" — no "مستشفى"/"فرع" word anywhere) can never resolve
+    through that path no matter how uniquely identifying the address is.
+    This is the companion resolver for exactly that case: same count-then-
+    ratio ranking and the same 0.5 floor as resolve_branch_candidates, but
+    against the BROADER _distinctive_tokens (name+area+description+region,
+    ubiquity-filtered) — the same token set validate_location_answer()
+    already scores against once a branch is resolved, just used here to
+    resolve identity in the first place. No fuzzy step: a genuine address
+    match should share real distinctive words, not an approximate spelling
+    guess. A tie is returned as multiple candidates, same as
+    resolve_branch_candidates.
+    """
+    pool = _ksa_pool(locations) if ksa_only else [r for r in locations if _active(r)]
+    query_tokens = set(_tokenize(query_text))
+    if not query_tokens or not pool:
+        return []
+
+    scored: list[tuple[int, float, dict]] = []
+    for record in pool:
+        distinctive = _distinctive_tokens(record, locations)
+        if not distinctive:
+            continue
+        overlap = distinctive & query_tokens
+        if not overlap:
+            continue
+        ratio = len(overlap) / len(distinctive)
+        if ratio >= 0.5:
+            scored.append((len(overlap), ratio, record))
+
+    if not scored:
+        return []
+    best_count = max(count for count, _, _ in scored)
+    top_by_count = [(ratio, record) for count, ratio, record in scored if count == best_count]
+    best_ratio = max(ratio for ratio, _ in top_by_count)
+    return [record for ratio, record in top_by_count if ratio == best_ratio]
+
+
 # ── Address-answer validation ─────────────────────────────────────────────────
 
 # Structural/filler words that appear in nearly every Arabic street address
@@ -456,6 +519,27 @@ def _agent_mentions_known_location(text: str, all_locations: list[dict[str, Any]
     return False
 
 
+def _split_address_and_map(text: str) -> tuple[str, str | None]:
+    """Pull a map URL out of extracted location text, returning
+    (address_only_text, map_url_or_None). The map URL stays logically
+    associated with the same location block (same turn/run) but must never
+    replace or dilute a stronger textual address — token-based matching
+    only ever runs against the address-only text; the URL is display-only
+    (see the 'extracted chat location' log section)."""
+    urls = _MAP_URL_RE.findall(text or "")
+    if not urls:
+        return text, None
+    address_only = _MAP_URL_RE.sub("", text or "").strip()
+    # Drop the now-empty "الموقع :" label line the URL was attached to (and
+    # any other blank line left behind) rather than keeping a bare label
+    # with nothing after it.
+    address_only = "\n".join(
+        line for line in address_only.splitlines()
+        if line.strip() and line.strip().strip(":ـ ") not in {"الموقع", "موقع", "لوكيشن", "location"}
+    )
+    return address_only, urls[0]
+
+
 def _extract_agent_location_text(
     call: CallTranscript, locations: list[dict[str, Any]], patient_text: str,
 ) -> str:
@@ -477,13 +561,15 @@ def _extract_agent_location_text(
        merged.
     3. Starting from the first run at/after the trigger point, take the
        first run containing at least one turn with a genuine location
-       signal (detect_location_request or _agent_gives_address_details).
-       Earlier/unrelated runs are never searched once a qualifying one is
-       found, and no run beyond it is considered either.
+       signal (detect_location_request, _agent_mentions_known_location, or
+       an explicit address-line marker — شارع/حي/طريق/تقاطع/بلازا — see
+       _ADDRESS_LINE_RE). Earlier/unrelated runs are never searched once a
+       qualifying one is found, and no run beyond it is considered either.
     4. Within that run, keep only the turns that themselves carry a
-       location signal OR mention a branch/place-noun (local context, e.g.
-       "في فرع المستشفى الرئيسي فقط" right before the address turn) — an
-       unrelated turn in the same run ("يلزم وصفة طبية") is dropped.
+       location signal, an address-line marker, OR mention a branch/place-
+       noun (local context, e.g. "في فرع المستشفى الرئيسي فقط" right
+       before the address turn) — an unrelated turn in the same run
+       ("يلزم وصفة طبية", a department introduction/greeting) is dropped.
 
     Returns "" when no agent turn anywhere at/after the trigger point
     carries a location signal (callers treat this the same as "no address
@@ -509,13 +595,19 @@ def _extract_agent_location_text(
 
     candidate_runs = [run for run in runs if run[0][0] > trigger_index] or runs
 
+    def _is_location_bearing(t: str) -> bool:
+        norm = normalize_arabic_text(t)
+        return bool(
+            detect_location_request(t)
+            or _agent_mentions_known_location(t, locations)
+            or _ADDRESS_LINE_RE.search(norm)
+        )
+
     for run in candidate_runs:
-        if any(detect_location_request(t) or _agent_mentions_known_location(t, locations) for _i, t in run):
+        if any(_is_location_bearing(t) for _i, t in run):
             kept = [
                 t for _i, t in run
-                if detect_location_request(t)
-                or _agent_mentions_known_location(t, locations)
-                or _PLACE_NOUN.search(normalize_arabic_text(t))
+                if _is_location_bearing(t) or _PLACE_NOUN.search(normalize_arabic_text(t))
             ]
             return "\n".join(kept).strip()
 
@@ -627,52 +719,102 @@ def validate_location_request(
     # unrelated later turn being picked up as if it answered an earlier,
     # different request.
     agent_location_text = _extract_agent_location_text(call, locations, patient_text)
-    if agent_location_text:
-        loc_lines = agent_location_text.split("\n")
+    # A map link (if any) stays associated with this same location block
+    # for display, but never stands in for — or gets mixed into — the
+    # textual address used for resolution/scoring/provided_location below.
+    agent_location_text, agent_map_url = _split_address_and_map(agent_location_text)
+    if agent_location_text or agent_map_url:
+        loc_lines = agent_location_text.split("\n") if agent_location_text else []
+        section_fields: dict[str, Any] = {}
         if len(loc_lines) > 1:
-            _loc_print_section("extracted chat location", **{
-                "branch/context": "\n".join(loc_lines[:-1]), "address": loc_lines[-1],
-            })
-        else:
-            _loc_print_section("extracted chat location", address=agent_location_text)
+            section_fields["branch/context"] = "\n".join(loc_lines[:-1])
+            section_fields["address"] = loc_lines[-1]
+        elif loc_lines:
+            section_fields["address"] = agent_location_text
+        if agent_map_url:
+            section_fields["map"] = agent_map_url
+        _loc_print_section("extracted chat location", **section_fields)
 
-    # Resolve the branch. Priority: an explicit "فرع/عيادة/مستشفى X" mention
-    # in the PATIENT's own request (anchored — the words right after the
-    # place-noun, before any address detail starts) beats token overlap,
-    # which a WRONG address can otherwise win — a branch is sometimes named
-    # after its own street ("فرع الأمير سلطان" on "شارع الأمير سلطان"), so a
-    # patient naming the right branch must still resolve to it even if the
-    # agent's reply describes a different branch's street. Falls back to
-    # the rest of the patient's text, then to the extracted agent location
-    # text (never the raw whole transcript — that was the source of the
-    # stale/cross-contaminated alias bug: joining anchor matches from
-    # unrelated turns anywhere in the conversation). `resolution_source` is
-    # tracked for visibility only; it does not change which candidates are
-    # returned.
-    # The agent's own proactive text can suffer the exact same problem in
-    # reverse: an agent naming the RIGHT branch while describing a
-    # different, WRONG branch's street ("فرع السنابل موجود في شارع الأمير
-    # سلطان") would otherwise let that wrong street's token count outrank
-    # the correct explicit self-naming under plain whole-text overlap — so
-    # the agent's own anchor is tried before falling back to the whole
-    # extracted text, exactly mirroring the patient-side priority above.
+    # Resolve the branch. Priority order (Agent evidence FIRST): a later,
+    # explicit Agent correction/redirection must never lose to older or
+    # weaker Patient context — a real regression showed a Patient mention
+    # ("انا في اندلسية السنابل كنت" / "هذا في فرع المحمديه") resolving the
+    # branch even though the Agent had already given a completely
+    # different, concrete branch + address (e.g. "العنوان : تقاطع شارع
+    # عبدالله سليمان..." for the main hospital). The old order tried
+    # Patient text FIRST and stopped at the first non-empty (even
+    # ambiguous) match, so a stale/weaker Patient signal could win before
+    # the Agent's own unambiguous evidence was ever tried.
+    #   1. Agent's own explicit "فرع/عيادة/مستشفى X" anchor (non-fuzzy —
+    #      a short, weakly-distinctive fragment shouldn't win on a fuzzy
+    #      guess when the fuller address text below can resolve it better).
+    #      This is the strongest possible signal: the Agent named a SPECIFIC
+    #      facility outright.
+    #   2. Patient's own explicit branch-name anchor ("فين فرع السنابل؟") —
+    #      still tried before the Agent's bare address text. This is what
+    #      lets an Agent's WRONG bare address (no explicit facility naming
+    #      of its own, just a street/district) still be caught as a
+    #      mismatch against the branch the Patient explicitly asked about,
+    #      instead of the Agent's raw text silently resolving to whatever
+    #      branch its own words happen to overlap.
+    #   3. Agent's concrete address / local branch context (the full
+    #      extracted text — covers both an explicit address line and a
+    #      "في فرع X" context line kept alongside it) when NEITHER side
+    #      gave an explicit branch anchor — this is what lets a later,
+    #      concrete Agent address override an earlier Patient mention that
+    #      was only ever a locality/area alias (tier 4), never an explicit
+    #      branch request.
+    #   4. Patient's text as a whole (locality/area alias, fuzzy allowed) —
+    #      the weakest, most easily-overridden signal.
+    # `resolution_source` is tracked for visibility only; it does not
+    # change which candidates a given attempt returns.
     anchor_text = _branch_anchor_text(patient_text)
     agent_anchor_text = _branch_anchor_text(agent_location_text)
     candidates: list[dict[str, Any]] = []
     resolution_source = "none"
     query_used = ""
     for source, text, allow_fuzzy in (
+        ("agent_branch_name", agent_anchor_text, False),
         ("branch_name", anchor_text, True),
-        ("patient_text", patient_text, True),
-        ("branch_name", agent_anchor_text, False),
         ("provided_address", agent_location_text, True),
+        ("patient_text", patient_text, True),
     ):
         if not text:
             continue
         found = resolve_branch_candidates(text, locations, ksa_only=True, allow_fuzzy=allow_fuzzy)
+        if not found and source == "provided_address":
+            # A bare address with no facility name in it at all (e.g.
+            # "تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة
+            # بلازا") can never resolve via name-based matching alone —
+            # fall back to matching the address CONTENT itself against
+            # each branch's known street/district wording.
+            found = resolve_branch_by_address_content(text, locations, ksa_only=True)
         if found:
             candidates, resolution_source, query_used = found, source, text
             break
+
+    # Diagnostic only: if Agent evidence won, check (read-only, doesn't
+    # affect the result above) whether Patient text alone would have
+    # pointed somewhere else — makes it obvious in the log/terminal that
+    # older/weaker Patient context was deliberately not used, rather than
+    # silently ignored.
+    if candidates and resolution_source in ("agent_branch_name", "provided_address"):
+        patient_only: list[dict[str, Any]] = []
+        for p_source, p_text, p_fuzzy in (("branch_name", anchor_text, True), ("patient_text", patient_text, True)):
+            if not p_text:
+                continue
+            p_found = resolve_branch_candidates(p_text, locations, ksa_only=True, allow_fuzzy=p_fuzzy)
+            if p_found:
+                patient_only = p_found
+                break
+        agent_branch_names = {c.get("cr301_branchname") for c in candidates}
+        if patient_only and {c.get("cr301_branchname") for c in patient_only} != agent_branch_names:
+            logger.info(
+                "location patient context overridden | call_id=%s reason=agent_evidence_stronger "
+                "patient_would_resolve=%s agent_resolved=%s",
+                call_id, sorted(c.get("cr301_branchname") for c in patient_only), sorted(agent_branch_names),
+            )
+            _loc_print("patient context ignored because stronger agent-provided branch/address exists")
 
     if not candidates:
         logger.info(

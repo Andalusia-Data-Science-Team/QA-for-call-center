@@ -1,10 +1,12 @@
-# Bank Node
+# Bank Validation
 
-Fully self-contained feature: deterministic KSA bank-account QA validation.
-Mirrors `app/offers_node/`'s self-containment (data access + detection +
-matching logic living together) and is a sibling of, not nested inside,
-`app/location_node/` — the two features are independent graph nodes, not one
-merged node, and this one has no CRM dependency on the other.
+Fully self-contained feature: deterministic KSA bank-account QA validation,
+living in `app/service_hub/` alongside the sibling offers and location
+features. Mirrors the offers feature's self-containment (data access +
+detection + matching logic living together) and is independent of, not
+merged with, location validation (`location_validation.py`, same
+package) — the two are separate graph nodes, and this one has no CRM
+dependency on the other.
 
 ## Files
 

@@ -1,9 +1,10 @@
-# Location Node
+# Location Validation
 
 Fully self-contained feature: deterministic KSA branch/location QA
-validation. Mirrors `app/offers_node/`'s self-containment and is a sibling
-of, not nested inside, `app/bank_node/` — the two features are independent
-graph nodes, not one merged node.
+validation, living in `app/service_hub/` alongside the sibling offers and
+bank features. Mirrors the offers feature's self-containment and is
+independent of, not merged with, bank validation (`bank_validation.py`,
+same package) — the two are separate graph nodes.
 
 ## Files
 
@@ -18,23 +19,24 @@ graph nodes, not one merged node.
 app/agent/nodes.py::validate_location_node            (graph node)
               │
               ▼  calls
-app/location_node/location_validation.py               (detection + resolution + validation)
+app/service_hub/location_validation.py                  (detection + resolution + validation)
               │
               ▼  calls
-app/location_node/crm_location.py                       (cached CRM fetch)
+app/service_hub/crm_location.py                          (cached CRM fetch)
               │
               ▼  calls
 app/services/crm_connector.py                            (shared, domain-agnostic:
                                                             MSAL auth, connection,
                                                             retry — also used by
-                                                            app/offers_node/crm_offers.py
-                                                            and app/bank_node/crm_bank.py)
+                                                            app/service_hub/crm_offers.py
+                                                            and app/service_hub/crm_bank.py)
 ```
 
 `app/services/text_helpers.py` supplies the only things this module shares
-with `bank_node`: `split_transcript_by_speaker()` (turn splitting) and
-Arabic text normalisation. Everything location-specific — branch resolution,
-address-token matching, ubiquity filtering — lives here and nowhere else.
+with `bank_validation.py`: `split_transcript_by_speaker()` (turn splitting)
+and Arabic text normalisation. Everything location-specific — branch
+resolution, address-token matching, ubiquity filtering — lives here and
+nowhere else.
 
 ## Entry point
 
@@ -75,7 +77,7 @@ flagging home-care/delivery calls as Andalusia branch-location requests.
 ## Debug visibility
 
 `validate_location_request()` logs the full resolution/comparison chain at
-`INFO` level (`logger = logging.getLogger("app.location_node.location_validation")`)
+`INFO` level (`logger = logging.getLogger("app.service_hub.location_validation")`)
 so a run can be inspected without a debugger — in order: how many KSA
 records were considered, why a specific branch was resolved
 (`resolution_source` — `branch_name`, `patient_text`, or `provided_address` —
@@ -128,7 +130,41 @@ This is also why a real CRM address that happens to be mentioned in a
 later, unrelated agent turn can never be picked up as if it answered an
 earlier, different request — branch resolution's `provided_address`
 fallback and the final comparison both use this same extracted text, not
-the raw transcript.
+the raw transcript. A map link (`https://maps...`) found in that text is
+split out (`_split_address_and_map()`) and shown separately in the debug
+log (`map:`) — it stays associated with the same location block but never
+becomes, or dilutes, `provided_location` itself.
+
+## Branch resolution priority (Agent evidence first)
+
+A later, explicit Agent correction/redirection must never lose to older or
+weaker Patient context. Two real regressions drove this: a Patient's
+locality/area aliases ("اندلسية جدة", "اندلسية السنابل" — no "فرع" anchor
+at all) resolving the branch even though the Agent had already given a
+completely different, concrete address; and a Patient's explicit branch
+mention ("فرع المحمديه") outranking the Agent's explicit redirection to a
+different facility ("في فرع المستشفى الرئيسي فقط"). The resolution
+attempts run in this order, stopping at the first that finds a candidate:
+
+1. **Agent's own explicit branch/facility anchor** (`agent_branch_name`,
+   non-fuzzy) — the Agent named a specific facility outright.
+2. **Patient's own explicit branch anchor** (`branch_name`) — kept ahead of
+   the Agent's bare address so a Patient's clear request can still catch
+   the Agent giving a real-but-wrong branch's address (existing Sanabil /
+   Prince Sultan wrong-branch tests depend on this).
+3. **Agent's concrete address / local branch context** (`provided_address`)
+   — tried when neither side gave an explicit anchor. Resolves first by
+   branch NAME, then — new — by matching the address CONTENT itself
+   (`resolve_branch_by_address_content()`) against each branch's
+   description/area, so a bare address with no facility name in it at all
+   ("تقاطع شارع عبدالله سليمان مع طريق الجامعة...") can still resolve.
+4. **Patient's text as a whole** (`patient_text`) — locality/area alias,
+   the weakest signal, fuzzy allowed.
+
+When Agent evidence wins, the log/terminal shows *"patient context ignored
+because stronger agent-provided branch/address exists"* whenever Patient
+text would independently have pointed somewhere else — a read-only check
+that never changes the actual resolution.
 
 ## Matching approach (why it isn't a simple substring check)
 

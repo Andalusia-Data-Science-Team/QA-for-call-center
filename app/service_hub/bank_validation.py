@@ -1,9 +1,10 @@
 """Deterministic, Arabic-first validation of KSA bank account information.
 
-Bank validation as its own node/feature — see app/location_node/ for the
-independent (but sibling) location-request validator. They only share the
-transcript-turn split (app.services.text_helpers.split_transcript_by_speaker)
-and financial-identifier normalisation (app.services.text_helpers), not any
+Bank validation as its own feature — see location_validation.py (same
+app/service_hub/ package) for the independent (but sibling) location-
+request validator. They only share the transcript-turn split
+(app.services.text_helpers.split_transcript_by_speaker) and financial-
+identifier normalisation (app.services.text_helpers), not any
 bank/location-specific logic.
 
 Flow (Business Unit first):
@@ -132,7 +133,7 @@ _BANK_NAME_CANON: dict[str, str] = {
 
 def _canon_bank_name(text: str | None) -> str | None:
     """Longest-alias-wins canonicalisation (same pattern as
-    offers_node/offer_search.py's resolve_specialty) — falls back to the
+    offer_search.py's resolve_specialty, same package) — falls back to the
     plain normalised string so an unlisted bank name still compares via
     substring equality against the DB value rather than being ignored."""
     norm = normalize_arabic_text(text or "")
@@ -350,7 +351,7 @@ def validate_ksa_bank_information(
     """Validate agent-supplied bank information against CRM-authoritative
     records for the business unit resolved from the conversation.
 
-    Flow (Business Unit first, per app/bank_node's design):
+    Flow (Business Unit first, per this module's design):
       resolve BU -> in scope? -> bank intent detected? -> filter CRM by BU ->
       narrow by named bank -> detect requested field -> exact validation.
     """

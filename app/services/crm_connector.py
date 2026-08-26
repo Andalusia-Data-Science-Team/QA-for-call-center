@@ -4,13 +4,13 @@ for the CRM SQL/TDS endpoint using Azure AD auth.
 
 This module is intentionally domain-agnostic: it knows nothing about offers,
 doctors, locations, or bank accounts — it just gets a token and runs a query.
-app/offers_node/crm_offers.py (promotional offers), app/bank_node/crm_bank.py
-(KSA bank-account reference data), app/location_node/crm_location.py (KSA
-branch/location reference data), and app/offers_node/crm_database.py (doctor
+app/service_hub/crm_offers.py (promotional offers), app/service_hub/crm_bank.py
+(KSA bank-account reference data), app/service_hub/crm_location.py (KSA
+branch/location reference data), and app/service_hub/crm_database.py (doctor
 walk-in prices) all depend on it. Keeping it neutral and shared here avoids
-any of those domain packages importing from one another just to reach
-connection primitives — this used to live inside offers_node/crm_database.py,
-which made every other CRM-backed domain reach into an "offers" module for
+those domains reaching into one another's modules just to get connection
+primitives — this used to live inside what's now crm_database.py, which
+made every other CRM-backed domain reach into an "offers" module for
 something that has nothing to do with offers.
 
 Auth strategy (MSAL, public client):

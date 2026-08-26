@@ -362,8 +362,8 @@ def build_scoring_prompt(
     script_summary: str = "",
     # Masked deterministic bank/location outputs are scoring context, not an
     # LLM decision about whether an account number or address is correct —
-    # each comes from its own independent graph node (app.bank_node /
-    # app.location_node).
+    # each comes from its own independent graph node (both backed by
+    # app.service_hub).
     bank_summary: str = "",
     location_summary: str = "",
 ) -> str:

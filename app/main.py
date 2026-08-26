@@ -485,7 +485,7 @@ async def batch_analyze(payload: BatchCallTranscripts) -> BatchQAAnalysisResult:
 # Lets you run this file directly to push one local JSON transcript through
 # the EXACT SAME validation + analysis path /upload-analyze uses — no
 # FastAPI server, no HTTP call, no uvicorn — so you can quickly exercise the
-# Location (app/location_node/) and Bank Account (app/bank_node/) features —
+# Location and Bank Account features (both in app/service_hub/) —
 # two fully independent nodes, each with its own graph node, state key, and
 # output field.
 #
@@ -498,101 +498,101 @@ async def batch_analyze(payload: BatchCallTranscripts) -> BatchQAAnalysisResult:
 # works the same regardless of which of the two run commands you use.
 # ─────────────────────────────────────────────────────────────────────────────
 
-TEST_JSON_PATH = "chats/fayrouz_ahmed_loc.json"   # ← change this to test a different file
+# TEST_JSON_PATH = "chats/fayrouz_ahmed_loc.json"   # ← change this to test a different file
 
 
-def _resolve_test_json_path(raw_path: str) -> Path:
-    """Relative paths are resolved against app/ (this file's directory), not cwd."""
-    p = Path(raw_path)
-    return p if p.is_absolute() else (Path(__file__).parent / p)
+# def _resolve_test_json_path(raw_path: str) -> Path:
+#     """Relative paths are resolved against app/ (this file's directory), not cwd."""
+#     p = Path(raw_path)
+#     return p if p.is_absolute() else (Path(__file__).parent / p)
 
 
-async def _run_local_test(json_path: Path) -> None:
-    """Direct-execution counterpart of /upload-analyze — same validation,
-    same analyzer, same result type — just reading from disk and printing
-    to the terminal instead of going through FastAPI."""
-    print(f"\n{'=' * 70}\nLoading test transcript: {json_path}\n{'=' * 70}")
+# async def _run_local_test(json_path: Path) -> None:
+#     """Direct-execution counterpart of /upload-analyze — same validation,
+#     same analyzer, same result type — just reading from disk and printing
+#     to the terminal instead of going through FastAPI."""
+#     print(f"\n{'=' * 70}\nLoading test transcript: {json_path}\n{'=' * 70}")
 
-    if not json_path.exists():
-        print(f"ERROR: file not found: {json_path}")
-        print(f"       (edit TEST_JSON_PATH near the bottom of {__file__} to point at your file)")
-        return
+#     if not json_path.exists():
+#         print(f"ERROR: file not found: {json_path}")
+#         print(f"       (edit TEST_JSON_PATH near the bottom of {__file__} to point at your file)")
+#         return
 
-    try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        print(f"ERROR: invalid JSON file: {exc}")
-        return
+#     try:
+#         data = json.loads(json_path.read_text(encoding="utf-8"))
+#     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+#         print(f"ERROR: invalid JSON file: {exc}")
+#         return
 
-    # Same schema validation /upload-analyze performs — via the same
-    # CallTranscript model, not a re-implementation of it.
-    try:
-        payload = CallTranscript(**data)
-    except Exception as exc:
-        print(f"ERROR: JSON does not match CallTranscript schema: {exc}")
-        return
+#     # Same schema validation /upload-analyze performs — via the same
+#     # CallTranscript model, not a re-implementation of it.
+#     try:
+#         payload = CallTranscript(**data)
+#     except Exception as exc:
+#         print(f"ERROR: JSON does not match CallTranscript schema: {exc}")
+#         return
 
-    print(f"call_id       : {payload.call_id}")
-    print(f"agent_name    : {payload.agent_name}")
-    print(f"department    : {payload.department}")
-    print(f"business_unit : {payload.business_unit}")
+#     print(f"call_id       : {payload.call_id}")
+#     print(f"agent_name    : {payload.agent_name}")
+#     print(f"department    : {payload.department}")
+#     print(f"business_unit : {payload.business_unit}")
 
-    # Cheap, read-only preview of the two independent deterministic gates —
-    # reuses the real detectors from app.bank_node / app.location_node (two
-    # separate features/nodes, not a combined one) so you can confirm
-    # detection is firing correctly even before a full, LLM-backed analysis
-    # completes.
-    from app.bank_node.bank_validation import detect_bank_signals, is_supported_bank_bu
-    from app.location_node.location_validation import detect_location_signals
-    bank_requested, supplied, _patient_text, _agent_text, resolved_bu = detect_bank_signals(payload)
-    location_requested, _loc_patient_text, _loc_agent_text = detect_location_signals(payload)
-    print(f"bank request detected in patient text     : {bank_requested}")
-    print(f"resolved business unit                    : {resolved_bu} (in bank scope: {is_supported_bank_bu(resolved_bu)})")
-    print(f"location request detected in patient text : {location_requested}")
-    print(f"financial identifiers found in agent text : {len(supplied)}")
+#     # Cheap, read-only preview of the two independent deterministic gates —
+#     # reuses the real detectors from app.service_hub (two separate
+#     # features/nodes, not a combined one) so you can confirm
+#     # detection is firing correctly even before a full, LLM-backed analysis
+#     # completes.
+#     from app.service_hub.bank_validation import detect_bank_signals, is_supported_bank_bu
+#     from app.service_hub.location_validation import detect_location_signals
+#     bank_requested, supplied, _patient_text, _agent_text, resolved_bu = detect_bank_signals(payload)
+#     location_requested, _loc_patient_text, _loc_agent_text = detect_location_signals(payload)
+#     print(f"bank request detected in patient text     : {bank_requested}")
+#     print(f"resolved business unit                    : {resolved_bu} (in bank scope: {is_supported_bank_bu(resolved_bu)})")
+#     print(f"location request detected in patient text : {location_requested}")
+#     print(f"financial identifiers found in agent text : {len(supplied)}")
 
-    print("\nRunning full analysis via the same QAAgent instance /upload-analyze uses...\n")
-    try:
-        result = await analyzer.analyze(payload)   # identical call to every endpoint above
-    except Exception as exc:
-        print(f"ERROR: analysis failed: {exc}")
-        return
+#     print("\nRunning full analysis via the same QAAgent instance /upload-analyze uses...\n")
+#     try:
+#         result = await analyzer.analyze(payload)   # identical call to every endpoint above
+#     except Exception as exc:
+#         print(f"ERROR: analysis failed: {exc}")
+#         return
 
-    print(f"{'=' * 70}\nRESULT\n{'=' * 70}")
-    print(result.model_dump_json(indent=2))
+#     print(f"{'=' * 70}\nRESULT\n{'=' * 70}")
+#     print(result.model_dump_json(indent=2))
 
-    print(f"\noverall_assessment : {result.overall_assessment}")
-    # Bank and location are independent nodes/fields now — printed separately.
-    if result.bank_validation:
-        print("bank_validation (app.bank_node):")
-        print(json.dumps(result.bank_validation, indent=2, ensure_ascii=False))
-    else:
-        print("bank_validation : None (gate did not detect a bank request in this transcript)")
-    if result.location_validation:
-        print("location_validation (app.location_node):")
-        print(json.dumps(result.location_validation, indent=2, ensure_ascii=False))
-    else:
-        print("location_validation : None (gate did not detect a location request in this transcript)")
+#     print(f"\noverall_assessment : {result.overall_assessment}")
+#     # Bank and location are independent nodes/fields now — printed separately.
+#     if result.bank_validation:
+#         print("bank_validation (app.service_hub):")
+#         print(json.dumps(result.bank_validation, indent=2, ensure_ascii=False))
+#     else:
+#         print("bank_validation : None (gate did not detect a bank request in this transcript)")
+#     if result.location_validation:
+#         print("location_validation (app.service_hub):")
+#         print(json.dumps(result.location_validation, indent=2, ensure_ascii=False))
+#     else:
+#         print("location_validation : None (gate did not detect a location request in this transcript)")
 
 
-if __name__ == "__main__":
-    import sys as _sys
+# if __name__ == "__main__":
+#     import sys as _sys
 
-    if "--serve" in _sys.argv:
-        # Preserves the previous "start the real server" behaviour, now opt-in
-        # via `python main.py --serve`, since the default direct-execution
-        # behaviour is now the local JSON test above.
-        # `reload=True` is intentionally NOT set: uvicorn's auto-reload only
-        # works when the app is passed as an import string ("app.main:app"),
-        # not an already-instantiated object. Use
-        # `uvicorn app.main:app --reload` from the CLI for that.
-        import os
-        import uvicorn
+#     if "--serve" in _sys.argv:
+#         # Preserves the previous "start the real server" behaviour, now opt-in
+#         # via `python main.py --serve`, since the default direct-execution
+#         # behaviour is now the local JSON test above.
+#         # `reload=True` is intentionally NOT set: uvicorn's auto-reload only
+#         # works when the app is passed as an import string ("app.main:app"),
+#         # not an already-instantiated object. Use
+#         # `uvicorn app.main:app --reload` from the CLI for that.
+#         import os
+#         import uvicorn
 
-        port = int(os.getenv("PORT", "8000"))
-        uvicorn.run(app, host="127.0.0.1", port=port)
-    else:
-        import asyncio
+#         port = int(os.getenv("PORT", "8000"))
+#         uvicorn.run(app, host="127.0.0.1", port=port)
+#     else:
+#         import asyncio
 
-        asyncio.run(_run_local_test(_resolve_test_json_path(TEST_JSON_PATH)))
+#         asyncio.run(_run_local_test(_resolve_test_json_path(TEST_JSON_PATH)))
 

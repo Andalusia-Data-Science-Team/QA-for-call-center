@@ -44,8 +44,8 @@ class AgentState(TypedDict, total=False):
     appointment_details: Optional[dict[str, Any]]
     appointment_verification: Optional[dict[str, Any]]
     crm_offers_context: Optional[str]   # written by fetch_crm_offers_for_call
-    # Bank and location are separate graph nodes (app/bank_node/,
-    # app/location_node/) with separate state keys — each is independently
+    # Bank and location are separate graph nodes (both backed by
+    # app/service_hub/) with separate state keys — each is independently
     # NOT_APPLICABLE when its own request type isn't present in the call.
     bank_validation: Optional[dict[str, Any]]      # written by validate_bank_information_node
     location_validation: Optional[dict[str, Any]]  # written by validate_location_node
