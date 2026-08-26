@@ -498,7 +498,7 @@ async def batch_analyze(payload: BatchCallTranscripts) -> BatchQAAnalysisResult:
 # works the same regardless of which of the two run commands you use.
 # ─────────────────────────────────────────────────────────────────────────────
 
-TEST_JSON_PATH = "chats/fayrouz_ahmed.json"   # ← change this to test a different file
+TEST_JSON_PATH = "chats/fayrouz_ahmed_loc.json"   # ← change this to test a different file
 
 
 def _resolve_test_json_path(raw_path: str) -> Path:

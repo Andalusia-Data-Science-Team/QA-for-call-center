@@ -19,11 +19,22 @@ Graph topology (happy path):
                                    │                                        │
     └──→ detect_intent                                                        │
               │                                                               │
-              │  fan-out: 2 parallel, fully independent deterministic nodes   │
-              ├──→ validate_bank_information ──┐                              │
-              └──→ validate_location         ──┤ fan-in                       │
-                                               │                               │
-                                       loc_bank_ready  (barrier / no-op)       │
+              │  bank-intent router (conditional edge, reuses                │
+              │  bank_validation_needed — the SAME gate the node itself      │
+              │  uses, not a duplicate check):                               │
+              ├──(intent present)────→ validate_bank_information ──┐         │
+              ├──(no intent)──────────→ skip_bank_validation ───────┤        │
+              │                        (no CRM fetch, no BU          │       │
+              │                         resolution, no node_trace)   │       │
+              │                                                      │       │
+              │  location-intent router (independent conditional edge,       │
+              │  same pattern, reuses location_validation_needed):           │
+              ├──(intent present)────→ validate_location ────────────┤ fan-in│
+              └──(no intent)──────────→ skip_location_validation ────┤       │
+                                        (no CRM fetch, no             │       │
+                                         node_trace entry)            │       │
+                                                                       │       │
+                                                       loc_bank_ready (barrier)│
                                                │                               │
               ├──(booking)──→ extract_appointment_details                     │
               │                        │                                      │
@@ -36,13 +47,22 @@ Graph topology (happy path):
                                ▼                                              │
                         inference_gate  (barrier — single fan-out point)      │
                                │                                              │
-    fan-out: 2 parallel LLM calls                                             │
+                     fetch_crm_offers_for_call                                │
+              (shared 1-hop pass-through — see below)                        │
+                               │                                              │
+    fan-out: 4 parallel branches, ALL exactly one hop past the fetch —        │
+    this equal hop-count is required so inference_ready's fan-in merges      │
+    all four arrivals into ONE superstep (see Step 3 comment in code: a      │
+    mismatched hop-count here previously fired inference_ready — and every-  │
+    thing downstream of it — TWICE per call).                                │
     ├──→ infer_behavioral_evaluation ──(error)──────────────────────────┐    │
-    └──→ infer_compliance_evaluation ──(error)──────────────────────────┤    │
-                                                    │ fan-in (2 edges)  │    │
+    ├──→ infer_compliance_evaluation ──(error)──────────────────────────┤    │
+    ├──→ infer_script_matching       ──(error)──────────────────────────┤    │
+    └──→ infer_offer_evaluation      ──(error)──────────────────────────┤    │
+                                                    │ fan-in (4 edges)  │    │
                                                     ▼                   │    │
                                             inference_ready             │    │
-                                     (barrier — waits for exactly 2)    │    │
+                                     (barrier — waits for exactly 4)    │    │
                                                     │                   │    │
                                                     ▼                   │    │
                   infer_overall_scoring ──(error)───────────────────────┘    │
@@ -132,7 +152,11 @@ from app.agent.nodes import (
     verify_appointment_in_db,
     validate_bank_information_node,
     validate_location_node,
+    skip_location_validation,
+    skip_bank_validation,
 )
+from app.bank_node.bank_validation import detect_bank_signals, bank_validation_needed
+from app.location_node.location_validation import detect_location_signals, location_validation_needed
 from app.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -154,6 +178,41 @@ def _booking_router(state: AgentState) -> Literal["booking", "skip_booking"]:
     if state.get("is_booking_intent"):
         return "booking"
     return "skip_booking"
+
+
+def _bank_intent_router(state: AgentState) -> Literal["validate_bank_information", "skip_bank"]:
+    """Route to validate_bank_information only when there is actual bank
+    intent — reusing app.bank_node.bank_validation.bank_validation_needed /
+    detect_bank_signals, the SAME deterministic gate the node itself uses
+    internally, not a second copy of the logic (supported business unit AND
+    a bank request or agent-supplied financial identifier). When it doesn't
+    hold, validate_bank_information is skipped entirely at the graph level:
+    it never executes, never appears in node_trace, never triggers a CRM
+    bank-account fetch, and never resolves a business unit against CRM
+    bank data."""
+    call = state["call"]
+    signals = detect_bank_signals(call)
+    needed = bank_validation_needed(call, signals)
+    logger.info("bank intent routing | call_id=%s bank_validation_needed=%s", call.call_id, needed)
+    if needed:
+        return "validate_bank_information"
+    return "skip_bank"
+
+
+def _location_intent_router(state: AgentState) -> Literal["validate_location", "skip_location"]:
+    """Route to validate_location only when there is actual location
+    intent — patient_has_location_intent OR
+    agent_has_location_information (app.location_node.location_validation.
+    location_validation_needed / detect_location_intent) — reusing the
+    SAME deterministic gate the node itself uses internally, not a second
+    copy of the logic. When neither holds, validate_location is skipped
+    entirely at the graph level: it never executes, never appears in
+    node_trace, and never triggers a CRM location fetch."""
+    call = state["call"]
+    signals = detect_location_signals(call)
+    if location_validation_needed(call, signals):
+        return "validate_location"
+    return "skip_location"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,9 +310,17 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # parallel with the other (neither depends on the other's result).
     builder.add_node("validate_bank_information", validate_bank_information_node)
     builder.add_node("validate_location", validate_location_node)
-    # Barrier — fan-in for the two parallel nodes above, fan-out to the
-    # booking router. Neither is on the booking-detection critical path
-    # individually; the router just needs both to have finished.
+    # Graph-level skip paths for validate_bank_information / validate_location
+    # — see _bank_intent_router / _location_intent_router below. Deliberately
+    # do not add to node_trace: each is a routing decision, not a
+    # validation step.
+    builder.add_node("skip_bank_validation", skip_bank_validation)
+    builder.add_node("skip_location_validation", skip_location_validation)
+    # Barrier — fan-in for EITHER validate_bank_information or its skip path,
+    # AND EITHER validate_location or its skip path, fan-out to the booking
+    # router. Neither bank nor location is on the booking-detection critical
+    # path individually; the router just needs both branches to have
+    # finished, independently of each other.
     builder.add_node("loc_bank_ready", lambda state: {})
 
     # ── Edges ─────────────────────────────────────────────────────────────
@@ -309,10 +376,20 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Route through bank + location validation (parallel) before the booking
     # split. Both states survive both branches and are included in final
     # scoring and aggregation.
-    builder.add_edge("detect_intent", "validate_bank_information")
-    builder.add_edge("detect_intent", "validate_location")
+    builder.add_conditional_edges(
+        "detect_intent",
+        _bank_intent_router,
+        {"validate_bank_information": "validate_bank_information", "skip_bank": "skip_bank_validation"},
+    )
+    builder.add_conditional_edges(
+        "detect_intent",
+        _location_intent_router,
+        {"validate_location": "validate_location", "skip_location": "skip_location_validation"},
+    )
     builder.add_edge("validate_bank_information", "loc_bank_ready")
+    builder.add_edge("skip_bank_validation", "loc_bank_ready")
     builder.add_edge("validate_location", "loc_bank_ready")
+    builder.add_edge("skip_location_validation", "loc_bank_ready")
     builder.add_conditional_edges(
         "loc_bank_ready",
         _booking_router,
@@ -331,16 +408,28 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
 
     # ── Step 3: inference_gate fan-out ────────────────────────────────────
     #
-    # Three nodes run in PARALLEL directly from inference_gate:
-    #   behavioral, compliance, script_matching.
-    #
-    # The offer path has one extra sequential step:
-    #   inference_gate → fetch_crm_offers_for_call → infer_offer_evaluation
-    # This ensures live CRM data is fetched BEFORE the offer LLM prompt runs.
-    builder.add_edge("inference_gate", "infer_behavioral_evaluation")
-    builder.add_edge("inference_gate", "infer_compliance_evaluation")
-    builder.add_edge("inference_gate", "infer_script_matching")
+    # ALL FOUR of behavioral/compliance/script_matching/offer are exactly
+    # TWO hops from inference_gate, via fetch_crm_offers_for_call as a
+    # shared (fast, never-erroring) pass-through — not three direct edges
+    # plus one two-hop offer path. That asymmetry used to be the root
+    # cause of inference_ready (and everything downstream of it) firing
+    # TWICE per call: LangGraph's fan-in only merges arrivals that land in
+    # the SAME superstep, so when three branches reached inference_ready a
+    # superstep earlier than the offer branch (which took the extra
+    # fetch_crm_offers_for_call hop), the barrier fired once for the fast
+    # three and again when the offer branch caught up — replaying
+    # infer_overall_scoring → aggregate_results → integrity_check →
+    # save_to_database → finalize a second time. Routing all four through
+    # fetch_crm_offers_for_call equalises the hop count so every branch
+    # arrives in the same superstep and the barrier fires exactly once.
+    # fetch_crm_offers_for_call never sets state["error"], and behavioral/
+    # compliance/script_matching don't read its output (only
+    # infer_offer_evaluation does) — so this is a pure topology fix with no
+    # change to any evaluation's logic or inputs.
     builder.add_edge("inference_gate", "fetch_crm_offers_for_call")
+    builder.add_edge("fetch_crm_offers_for_call", "infer_behavioral_evaluation")
+    builder.add_edge("fetch_crm_offers_for_call", "infer_compliance_evaluation")
+    builder.add_edge("fetch_crm_offers_for_call", "infer_script_matching")
     builder.add_edge("fetch_crm_offers_for_call", "infer_offer_evaluation")
 
     # ── Step 4: all four evaluations fan-in → inference_ready ─────────────

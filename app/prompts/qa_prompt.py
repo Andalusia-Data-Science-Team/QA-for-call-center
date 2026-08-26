@@ -439,6 +439,55 @@ SUB-EVALUATION 6 — DETERMINISTIC KSA LOCATION VALIDATION
 ════════════════════════════════════════════════════════════
 {location_summary or "(not applicable)"}
 
+How to interpret the location result above — reason in this order, and
+never let this override a confident deterministic PASS/FAIL:
+  1. Is the location text actually about an Andalusia branch/facility at
+     all? Home-care / home-service conversations (قسم الرعاية المنزلية,
+     خدمة منزلية, زيارة منزلية, مرافق منزلي, تمريض منزلي, خدمة في المنزل)
+     routinely use the same location words to ask for the PATIENT's OWN
+     address so a coordinator can arrange delivery/visit there — e.g. an
+     agent saying "وبترسل لهم الموقع" / "ابعت موقعك" / "شارك اللوكيشن" /
+     "المنسق هيطلب موقع حضرتك" / "نحتاج موقعك لتقديم الخدمة المنزلية".
+     That is the customer's own service address, never an Andalusia
+     branch location. When the transcript is clearly this kind of
+     home-service context, branch-location validation is simply out of
+     scope: do not raise a location-related compliance violation or lower
+     accuracy for it, whatever the deterministic outcome field says.
+  2. Otherwise, check whether the patient asked about one branch but the
+     agent redirected them to a different one (e.g. the requested branch
+     doesn't offer the service, so the agent names another facility and
+     gives ITS address instead). When that happens, judge the
+     agent-provided branch and address — not the patient's
+     originally-named branch. A transcript that clearly shows this kind
+     of redirection, followed by the agent supplying the new branch's
+     location, reflects the agent doing its job correctly, not an error —
+     even if the deterministic resolver couldn't map that alternative
+     branch name.
+  3. With that context established, treat the deterministic outcome as
+     the primary signal:
+       - PASS: the provided location is correct. No violation.
+       - FAIL: a confirmed mismatch between the provided address and the
+         resolved branch's known location. Treat this as a real location
+         error — do not soften or dismiss a confirmed FAIL.
+       - BRANCH_UNRESOLVED: the matcher could not map a branch name to a
+         CRM record. This is NOT automatically an agent error — it
+         commonly happens in exactly the redirection case (an alternative
+         branch name the matcher doesn't recognize) or the home-service
+         case above. Do not create a compliance violation or lower the
+         accuracy score from a bare BRANCH_UNRESOLVED; only flag a
+         problem if the transcript itself shows the agent naming a
+         wrong/nonexistent facility, or giving an address that conflicts
+         with a branch you can otherwise identify from the conversation.
+       - NOT_APPLICABLE: no branch/location request or agent-provided
+         branch location was in scope. Do not infer any location
+         violation.
+  4. Only report a location-related violation when the transcript gives
+     real evidence of incorrect information — a confirmed FAIL, or the
+     agent clearly naming the wrong facility/address for what was asked.
+     Never penalize based on a home-service address, and never penalize a
+     plausible branch redirection just because it left the deterministic
+     resolver unable to confirm the alternative branch.
+
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 ════════════════════════════════════════════════════════════

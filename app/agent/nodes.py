@@ -54,7 +54,7 @@ from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
 from app.services.sql_helpers import insert_qa_result
 from app.bank_node.bank_validation import bank_validation_needed, validate_ksa_bank_information, detect_bank_signals
-from app.location_node.location_validation import detect_location_signals, validate_location_request
+from app.location_node.location_validation import detect_location_intent, detect_location_signals, is_home_service_location_text, location_validation_needed, validate_location_request
 from app.services.text_helpers import (
     _normalize_arabic,
     _arabic_like_pattern, 
@@ -1407,8 +1407,50 @@ async def verify_appointment_in_db(state: AgentState) -> dict:
 #   (bank_validation). The only thing the two share is the transcript-turn
 #   splitter in app.services.text_helpers.
 # ---------------------------------------------------------------------------
+def _not_applicable_bank_result(resolved_bu: str | None) -> dict:
+    """Shared NOT_APPLICABLE shape for when bank validation does not apply.
+    Used by BOTH the graph-level skip path (see skip_bank_validation below —
+    no bank intent at all, so validate_bank_information_node is never
+    reached) and validate_bank_information_node's own internal gate, kept
+    as a defensive fallback in case the node is ever reached without the
+    graph router having confirmed intent first."""
+    return {
+        "outcome": "NOT_APPLICABLE", "applicable": False,
+        "request_detected": False, "requested_business_unit": resolved_bu,
+        "provided_identifiers": [], "is_violation": False,
+        "reason": "No bank request within bank-validation scope (AFW/AHJ/AKW/ALW) was detected.",
+    }
+
+
+def skip_bank_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's bank-intent router
+    (_bank_intent_router) when there is no bank intent at all — reusing the
+    exact same gate validate_bank_information_node itself uses
+    (bank_validation_needed / detect_bank_signals), so the decision is never
+    duplicated. validate_bank_information is not on this path: no CRM
+    fetch, no business-unit bank resolution beyond the cheap keyword signal
+    already used for routing, and — deliberately — no node_trace entry for
+    'validate_bank_information', since the node never actually ran.
+    """
+    call = state["call"]
+    signals = detect_bank_signals(call)
+    logger.info("bank validation skipped | call_id=%s reason=no_bank_intent", call.call_id)
+    return {"bank_validation": _not_applicable_bank_result(signals[4])}
+
+
 async def validate_bank_information_node(state: AgentState) -> dict:
-    """Run deterministic KSA-only bank validation after cheap Arabic gating.
+    """Run deterministic KSA-only bank validation.
+
+    Under normal graph execution this node is only reached at all when
+    app.agent.graph's bank-intent router (_bank_intent_router) has already
+    confirmed bank_validation_needed — see
+    app.bank_node.bank_validation.bank_validation_needed /
+    detect_bank_signals, which the router reuses directly rather than
+    duplicating. The gate below is kept as a defensive fallback (not the
+    primary mechanism any more): it re-checks the same condition so that
+    even if this node were ever reached without going through the router,
+    it would still degrade to a safe, non-punitive NOT_APPLICABLE instead
+    of running CRM lookups it has no real signal to justify.
 
     Business-Unit resolution (app.bank_node.bank_validation.resolve_business_unit)
     is keyword-map-driven, not CRM-location-based — this node no longer
@@ -1420,12 +1462,7 @@ async def validate_bank_information_node(state: AgentState) -> dict:
     # request / no agent-provided financial identifier; keeps unrelated
     # flows (and out-of-scope BUs) untouched.
     if not bank_validation_needed(call, signals):
-        result = {
-            "outcome": "NOT_APPLICABLE", "applicable": False,
-            "request_detected": False, "requested_business_unit": signals[4],
-            "provided_identifiers": [], "is_violation": False,
-            "reason": "No bank request within bank-validation scope (AFW/AHJ/AKW/ALW) was detected.",
-        }
+        result = _not_applicable_bank_result(signals[4])
     else:
         try:
             from app.bank_node.crm_bank import fetch_bank_accounts
@@ -1453,31 +1490,79 @@ async def validate_bank_information_node(state: AgentState) -> dict:
     return {"bank_validation": result, "node_trace": _trace(state, "validate_bank_information")}
 
 
+def _not_applicable_location_result() -> dict:
+    """Shared NOT_APPLICABLE shape for when location validation does not
+    apply. Used by BOTH the graph-level skip path (see
+    skip_location_validation below — no location intent at all, so
+    validate_location_node is never reached) and validate_location_node's
+    own internal gate, kept as a defensive fallback in case the node is
+    ever reached without the graph router having confirmed intent first."""
+    return {
+        "outcome": "NOT_APPLICABLE", "applicable": False,
+        "request_detected": False, "requested_branch": None,
+        "crm_location": None, "provided_location": None,
+        "match_confidence": None, "is_violation": False,
+        "reason": "No location/address request or agent-provided address was detected.",
+    }
+
+
+def skip_location_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's location-intent
+    router (_location_intent_router) when there is no location intent at
+    all — reusing the exact same gate validate_location_node itself uses
+    (location_validation_needed / detect_location_intent), so the decision
+    is never duplicated. validate_location is not on this path: no CRM
+    fetch, no branch resolution, and — deliberately — no node_trace entry
+    for 'validate_location', since the node never actually ran.
+    """
+    call = state["call"]
+    _requested, patient_text, agent_text = detect_location_signals(call)
+    reason = "home_service_location" if is_home_service_location_text(patient_text, agent_text) else "no_location_intent"
+    logger.info("location validation skipped | call_id=%s reason=%s", call.call_id, reason)
+    print(f"[location] skipped | call_id={call.call_id} reason={reason}", flush=True)
+    return {"location_validation": _not_applicable_location_result()}
+
+
 # ---------------------------------------------------------------------------
 # Node – validate_location (app.location_node)
 #   Fully independent of validate_bank_information — see above.
 # ---------------------------------------------------------------------------
 async def validate_location_node(state: AgentState) -> dict:
-    """Run deterministic KSA-only branch/location validation after cheap
-    Arabic gating. Runs in parallel with validate_bank_information — neither
-    depends on the other's result."""
+    """Run deterministic KSA-only branch/location validation.
+
+    Under normal graph execution this node is only reached at all when
+    app.agent.graph's location-intent router (_location_intent_router) has
+    already confirmed patient_has_location_intent OR
+    agent_has_location_information — see
+    location_node.location_validation.detect_location_intent /
+    location_validation_needed, which the router reuses directly rather
+    than duplicating. The gate below is kept as a defensive fallback (not
+    the primary mechanism any more): it re-checks the same condition so
+    that even if this node were ever reached without going through the
+    router, it would still degrade to a safe, non-punitive NOT_APPLICABLE
+    instead of running CRM lookups it has no real signal to justify.
+    """
     call = state["call"]
-    requested, patient_text, agent_text = detect_location_signals(call)
-    if not requested:
-        result = {
-            "outcome": "NOT_APPLICABLE", "applicable": False,
-            "request_detected": False, "requested_branch": None,
-            "match_confidence": None, "is_violation": False,
-            "reason": "No location/address request was detected.",
-        }
+    signals = detect_location_signals(call)
+    requested, patient_text, agent_text = signals
+    patient_intent, agent_intent = detect_location_intent(patient_text, agent_text)
+    logger.info(
+        "location intent | call_id=%s patient_request=%s agent_provided=%s",
+        call.call_id, patient_intent, agent_intent,
+    )
+    if not location_validation_needed(call, signals):
+        logger.info("location validation skipped | call_id=%s reason=no_location_intent", call.call_id)
+        result = _not_applicable_location_result()
     else:
         try:
             from app.location_node.crm_location import fetch_ksa_locations
             locations = fetch_ksa_locations()
             if not locations:
+                logger.warning("[location_validation] CRM location lookup failed | call_id=%s reason=empty_result", call.call_id)
                 result = {
                     "outcome": "BRANCH_UNRESOLVED", "applicable": False,
-                    "request_detected": True, "requested_branch": None,
+                    "request_detected": requested, "requested_branch": None,
+                    "crm_location": None, "provided_location": None,
                     "match_confidence": None, "is_violation": False,
                     "reason": "Authoritative CRM location data is unavailable; no agent violation was inferred.",
                 }
@@ -1486,12 +1571,16 @@ async def validate_location_node(state: AgentState) -> dict:
                     call, locations, patient_text=patient_text, agent_text=agent_text,
                 )
         except Exception as exc:  # Reference-data failures are non-punitive.
-            logger.warning("location validation unavailable | call_id=%s | %s", call.call_id, exc)
+            logger.warning("[location_validation] CRM location lookup failed | call_id=%s | %s", call.call_id, exc)
             result = {
                 "outcome": "BRANCH_UNRESOLVED", "applicable": False,
-                "request_detected": True, "requested_branch": None,
+                "request_detected": requested, "requested_branch": None,
+                "crm_location": None, "provided_location": None,
                 "match_confidence": None, "is_violation": False,
                 "reason": "Authoritative CRM location data could not be read; no agent violation was inferred.",
             }
-    logger.info("location validation | call_id=%s outcome=%s", call.call_id, result["outcome"])
+        logger.info(
+            "location validation | call_id=%s outcome=%s branch=%s",
+            call.call_id, result["outcome"], result.get("requested_branch"),
+        )
     return {"location_validation": result, "node_trace": _trace(state, "validate_location")}

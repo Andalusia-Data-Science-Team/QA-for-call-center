@@ -73,12 +73,25 @@ project (booking, offers, ...), just outside this feature's scope.
 
 ## Entry point
 
-`app.agent.nodes.validate_bank_information_node` is the only caller. It
-gates on `bank_validation_needed()` — which now requires *both* a supported
-BU *and* bank-information context — before touching the CRM, so unrelated
-calls and out-of-scope BUs never trigger a Dynamics query. It then calls
+`app.agent.nodes.validate_bank_information_node` is only reachable through
+`app.agent.graph`'s conditional edge out of `detect_intent` —
+`_bank_intent_router`, which reuses `bank_validation_needed()` /
+`detect_bank_signals()` (which now requires *both* a supported BU *and*
+bank-information context) rather than duplicating the check. When there is
+no bank intent at all, the graph routes to `skip_bank_validation` instead:
+`validate_bank_information` never executes, never appears in `node_trace`,
+and never triggers a CRM fetch or business-unit bank resolution —
+`skip_bank_validation` just writes the `NOT_APPLICABLE` state directly.
+`validate_bank_information_node` keeps its own internal copy of the same
+gate as a defensive fallback only (in case it's ever reached some other
+way), not as the primary mechanism. When intent is present, the node calls
 `validate_ksa_bank_information()` and stores the result in
 `AgentState["bank_validation"]`.
+
+Bank and location routing are independent conditional edges off the same
+`detect_intent` node — all four combinations (neither/bank only/location
+only/both) are supported, and each node/skip-path pair fans into the same
+`loc_bank_ready` barrier before the booking split, exactly as before.
 
 ## Adding a new bank-related check
 
