@@ -1,81 +1,11 @@
 {
-  "DB_NAMES": {
-    "BI": {
-      "Database": "DWH_Claims",
-      "UID": "bi",
-      "PWD": "B!@SQL",
-      "Server": "172.31.8.178",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "Replica": {
-      "Database": "AHJ.Env.HCMS",
-      "UID": "BIuser",
-      "PWD": "BI@user123!",
-      "Server": "10.111.111.168",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "AI": {
-    "Database": "Ai",
-    "PWD": "2@23P@ssw0rd@!",
-    "Server": "10.24.105.160",
-    "UID": "Ai",
-    "driver": "{ODBC Driver 17 for SQL Server}"
-  },
-    "LIVE": {
-      "Database": "AHJ.Env.HCMS",
-      "PWD": "BI@user123!",
-      "Server": "10.111.111.169",
-      "UID": "BIuser",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "SNB": {
-      "Database": "SNB.Env.HCMS",
-      "UID": "BIuser",
-      "PWD": "BI@user123!",
-      "Server": "10.107.111.64",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "AKW": {
-      "Database": "SRI.Env.HCMS",
-      "UID": "BIuser",
-      "PWD": "BI@user123!",
-      "Server": "10.108.111.52",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "ALW": {
-      "Database": "ALW.Env.HCMS",
-      "UID": "BIuser",
-      "PWD": "BI@user123!",
-      "Server": "10.110.111.181",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "MKR": {
-      "Database": "JDC.Env.HCMS",
-      "UID": "BIuser",
-      "PWD": "BI@user123!",
-      "Server": "10.103.6.181",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "LCH": {
-      "Database": "CHT.Env.HCMS",
-      "UID": "BIuser",
-      "PWD": "BI@user123!",
-      "Server": "10.110.111.52",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "DWH": {
-      "Database": "DWH",
-      "UID": "bi",
-      "PWD": "B!@SQL",
-      "Server": "172.31.8.178",
-      "driver": "{ODBC Driver 17 for SQL Server}"
-    },
-    "CM": {
-      "Database": "master",
-      "UID": "Robin_ReadOnly_User",
-      "PWD": "CM@123",
-      "Server": "ksa-booking-01",
-      "driver": "{ODBC Driver 17 for SQL Server}"
+    "DB_NAMES": {
+        "CM": {
+          "Database": "master",
+          "UID": "Robin_ReadOnly_User",
+          "PWD": "CM@123",
+          "Server": "ksa-booking-01",
+          "driver": "{ODBC Driver 17 for SQL Server}"
+        }
     }
-  }
 }
