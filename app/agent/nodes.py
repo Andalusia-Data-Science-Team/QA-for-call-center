@@ -46,6 +46,8 @@ from app.prompts.qa_prompt import (
     build_compliance_prompt,
     build_reservation_prompt,
     build_offer_prompt,
+    build_service_prompt,
+    build_package_prompt,
     build_script_prompt,
     build_scoring_prompt,
     build_user_prompt,   # kept for legacy path
@@ -302,6 +304,7 @@ async def _focused_llm_call(
 async def infer_behavioral_evaluation(
     state: AgentState, llm_client: LLMClient
 ) -> dict:
+    
     """
     Call the LLM with a behavioral-only prompt.
     Produces: professionalism_score, behavioral_flags, strengths, improvements.
@@ -339,6 +342,7 @@ async def infer_behavioral_evaluation(
 async def infer_compliance_evaluation(
     state: AgentState, llm_client: LLMClient
 ) -> dict:
+    
     """
     Call the LLM with a compliance-pillars-only prompt.
     Produces: compliance_flags, escalation_required, escalation_reason.
@@ -397,6 +401,7 @@ async def load_offer_pillars(state: AgentState) -> dict:
 async def infer_reservation_evaluation(
     state: AgentState, llm_client: LLMClient
 ) -> dict:
+    
     """
     Call the LLM with a reservation-pillars-only prompt.
     Produces: reservation_flags, escalation_required, escalation_reason.
@@ -457,22 +462,32 @@ async def fetch_crm_offers_for_call(state: AgentState) -> dict:
     call_id = call.call_id if call else "UNKNOWN"
 
     # ── Resolve specialty ────────────────────────────────────────────────
+    # Only use the specialty extracted from the transcript by the LLM.
+    # call.department holds operational dept names ("Scheduling", "Helpdesk",
+    # etc.) which are NOT medical specialties and must never be used here.
     details: dict = state.get("appointment_details") or {}
-    specialty_en: str = (
-        details.get("specialty_name")
-        or (call.department if call else "")
-        or ""
-    ).strip()
-
-    if not specialty_en:
+    specialty_en: str = (details.get("specialty_name") or "").strip()
+    
+    # Check if offer name is directly mentioned in the transcript
+    offer_name_hint: str = (details.get("offer_name") or "").strip()
+    
+    # If no specialty but offer name is mentioned, we can still proceed
+    # The enhanced fast-path matching will handle the direct offer name lookup
+    if not specialty_en and not offer_name_hint:
         logger.info(
-            "fetch_crm_offers_for_call | call_id=%s — no specialty resolved, skipping CRM fetch",
+            "fetch_crm_offers_for_call | call_id=%s — no specialty or offer name extracted from transcript, skipping CRM fetch",
             call_id,
         )
         return {
             "crm_offers_context": "",
             "node_trace": _trace(state, "fetch_crm_offers_for_call"),
         }
+    
+    if not specialty_en and offer_name_hint:
+        logger.info(
+            "fetch_crm_offers_for_call | call_id=%s — no specialty extracted but offer name mentioned: %r, proceeding with direct name lookup",
+            call_id, offer_name_hint,
+        )
 
     # ── Infer patient gender from name (Arabic suffix heuristic) ────────
     patient_name: str = details.get("patient_name") or ""
@@ -492,14 +507,15 @@ async def fetch_crm_offers_for_call(state: AgentState) -> dict:
     try:
         # Import here (not at module top) so the QA pipeline doesn't hard-fail
         # when the CRM is not configured — the node just returns empty context.
-        from app.offers_node.crm_offers import get_offers_for_specialty, format_offer_card
+        from app.service_hub.crm_offers import get_offers_for_specialty, format_offer_card
 
-        # If the transcript explicitly named an offer, use it as the service hint
-        # so get_offers_for_specialty performs a direct-name lookup first.
-        offer_name_hint: str = (details.get("offer_name") or "").strip()
-
+        # When offer name is mentioned but specialty is missing, use a generic
+        # specialty value that won't filter results. The direct name lookup
+        # (fast-path) will find the offer regardless of specialty.
+        effective_specialty = specialty_en or "General"
+        
         offers = get_offers_for_specialty(
-            specialty_en=specialty_en,
+            specialty_en=effective_specialty,
             service_hint=offer_name_hint,  # direct offer name if mentioned, else ""
             specialty_only=not bool(offer_name_hint),  # skip specialty-only guard when name is known
             patient_gender=patient_gender,
@@ -515,20 +531,22 @@ async def fetch_crm_offers_for_call(state: AgentState) -> dict:
         }
 
     if not offers:
+        search_info = f"offer_name={offer_name_hint!r}" if offer_name_hint and not specialty_en else f"specialty={specialty_en!r}"
         logger.info(
-            "fetch_crm_offers_for_call | call_id=%s — no active offers found for specialty=%r",
-            call_id, specialty_en,
+            "fetch_crm_offers_for_call | call_id=%s — no active offers found for %s",
+            call_id, search_info,
         )
         return {
-            "crm_offers_context": f"No active CRM offers found for specialty: {specialty_en!r}",
+            "crm_offers_context": f"No active CRM offers found for {search_info}",
             "node_trace": _trace(state, "fetch_crm_offers_for_call"),
         }
 
     # ── Serialise offers as compact human-readable cards ─────────────────
     # Use the same format_offer_card formatter the chatbot uses so the LLM
     # sees the same representation the agent would have seen.
+    search_context = f"offer_name={offer_name_hint!r}" if offer_name_hint and not specialty_en else f"specialty: {specialty_en!r}"
     lines: list[str] = [
-        f"Active CRM offers for specialty: {specialty_en!r}  "
+        f"Active CRM offers for {search_context}  "
         f"(patient_gender={patient_gender or 'unknown'})",
         f"Total: {len(offers)} offer(s) returned",
         "",
@@ -550,6 +568,438 @@ async def fetch_crm_offers_for_call(state: AgentState) -> dict:
     return {
         "crm_offers_context": crm_context,
         "node_trace": _trace(state, "fetch_crm_offers_for_call"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ── Helper: Extract service name from transcript ──────────────────────────
+
+def _extract_service_name_from_transcript(transcript: str) -> str:
+    """
+    Extract ALL service names from transcript using medical/lab stopping words.
+    Returns a newline-separated string of all extracted service names, or empty string.
+    
+    Examples:
+        "عاوز أعمل فحص سونار" → "سونار"
+        "محتاج تحليل صورة دم كاملة" → "صورة دم كاملة"
+        "MRI BRAIN\nCT BRAIN" → "MRI BRAIN\nCT BRAIN"
+    """
+    if not transcript:
+        return ""
+    
+    import re
+    
+    # Strategy 1: Extract full English service names (multi-word, uppercase patterns)
+    # Pattern: 2-8 consecutive uppercase words, may include:
+    #   - Common medical abbreviations (MRI, CT, U/S, CBC, etc.)
+    #   - Anatomical terms (BRAIN, CHEST, ABDOMEN, etc.)
+    #   - Qualifiers (WITH/WITHOUT CONTRAST, COMPLETE, etc.)
+    # Examples: "MRI BRAIN WITH CONTRAST", "CT CHEST WITHOUT CONTRAST", "CBC"
+    english_service_names = re.findall(
+        r'\b[A-Z][A-Z\s/\.\-]{3,}[A-Z]\b',  # Uppercase sequence (min 5 chars total)
+        transcript,
+    )
+    
+    # Filter to keep only medical-looking service names (contain medical keywords)
+    _MEDICAL_KEYWORDS = {
+        'MRI', 'CT', 'SCAN', 'X-RAY', 'XRAY', 'U/S', 'ULTRASOUND', 'ECHO',
+        'CBC', 'ESR', 'CRP', 'TSH', 'ALT', 'AST', 'ECG', 'EKG',
+        'BRAIN', 'CHEST', 'ABDOMEN', 'PELVIS', 'SPINE', 'HEAD', 'NECK',
+        'CONTRAST', 'WITHOUT', 'WITH', 'COMPLETE', 'BLOOD', 'COUNT',
+        'BONE', 'WINDOW', 'SOFT', 'TISSUE', 'TEST', 'SCREENING'
+    }
+    
+    matched_services = []
+    for candidate in english_service_names:
+        candidate_clean = candidate.strip()
+        # Check if candidate contains at least one medical keyword
+        if any(keyword in candidate_clean.upper() for keyword in _MEDICAL_KEYWORDS):
+            # Deduplicate: only add if not already in the list
+            if candidate_clean not in matched_services:
+                matched_services.append(candidate_clean)
+    
+    if matched_services:
+        logger.info(f"_extract_service_name_from_transcript | extracted {len(matched_services)} English service name(s): {matched_services}")
+        # Return all services joined by newline for multi-service matching
+        return "\n".join(matched_services)
+    
+    # Strategy 1b: Extract lowercase/mixed-case English medical phrases
+    # Pattern: 2-4 English words that include medical terms (case-insensitive)
+    # Examples: "anomaly scan", "glucose test", "blood pressure"
+    _LOWERCASE_MEDICAL_KEYWORDS = [
+        'scan', 'test', 'screening', 'check', 'examination',
+        'ultrasound', 'echo', 'doppler', 'x-ray', 'xray',
+        'anomaly', 'anatomy', 'glucose', 'blood', 'pressure',
+        'thyroid', 'diabetes', 'cholesterol', 'liver', 'kidney',
+        'prenatal', 'pregnancy', 'fetal', 'obstetric', 'cardiac'
+    ]
+    
+    # Find phrases with 1-4 consecutive English words that contain a medical keyword
+    lowercase_phrases = re.findall(
+        r'\b([a-z]+(?:\s+[a-z]+){0,3})\b',
+        transcript.lower()
+    )
+    
+    for phrase in lowercase_phrases:
+        # Check if phrase contains any medical keyword
+        if any(keyword in phrase for keyword in _LOWERCASE_MEDICAL_KEYWORDS):
+            # Validate: must be 2+ words OR a known single-word service
+            words = phrase.strip().split()
+            if len(words) >= 2 or phrase in {'ultrasound', 'echo', 'doppler', 'xray'}:
+                logger.info(f"_extract_service_name_from_transcript | extracted lowercase English phrase: {phrase!r}")
+                return phrase
+    
+    # Strategy 1c: Extract English medical abbreviations only (fallback)
+    english_abbrev = re.findall(
+        r'\b(?:U/S|CT|MRI|CBC|ESR|CRP|HbA1c|TSH|T3|T4|ALT|AST|ECG|EKG|X-RAY|XRAY)\b'
+        r'(?:\s+[2-4]D)?',  # Optional dimension suffix (2D, 3D, 4D)
+        transcript, 
+        re.IGNORECASE
+    )
+    if english_abbrev:
+        extracted = english_abbrev[0].strip()
+        logger.info(f"_extract_service_name_from_transcript | extracted English abbrev: {extracted!r}")
+        return extracted
+    
+    # Strategy 2: Extract complete Arabic medical service phrases
+    # Match medical terms with their full descriptions (up to 10 words for complex services)
+    _MEDICAL_PHRASE_PATTERNS = [
+        # Ultrasound variations (موجات فوق الصوتية + dimensions)
+        r'(?:ال)?موجات\s+فوق\s+الصوتية(?:\s+(?:ثنائي|ثلاثي|رباعي|رباعية)\s+الأبعاد)?(?:\s+\w+){0,3}',
+        r'(?:ال)?سونار(?:\s+(?:ثنائي|ثلاثي|رباعي|رباعية)\s+الأبعاد)?(?:\s+\w+){0,3}',
+        r'(?:ال)?إيكو(?:\s+\w+){0,3}',
+        r'(?:ال)?ايكو(?:\s+\w+){0,3}',
+        r'(?:ال)?دوبلر(?:\s+\w+){0,3}',
+        
+        # Radiology (أشعة + type)
+        r'(?:ال)?أشعة(?:\s+مقطعية)?(?:\s+\w+){0,3}',
+        r'(?:ال)?اشعة(?:\s+مقطعية)?(?:\s+\w+){0,3}',
+        r'(?:ال)?رنين\s+(?:مغناطيسي)?(?:\s+\w+){0,3}',
+        r'(?:ال)?تصوير(?:\s+\w+){0,4}',
+        
+        # Lab tests
+        r'(?:صورة|تحليل)\s+دم(?:\s+(?:كاملة|شاملة))?',
+        r'(?:تحليل|فحص)\s+(?:السكر|سكر)(?:\s+تراكمي)?',
+        r'(?:تحليل|فحص)\s+(?:الكوليسترول|كوليسترول)',
+        r'(?:تحليل|فحص)\s+(?:الغدة\s+الدرقية|غدة\s+درقية)',
+        r'(?:تحليل|فحص)\s+(?:وظائف\s+(?:كلى|كبد))',
+        r'(?:تحليل|فحص)\s+(?:فيتامين\s+\w+)',
+    ]
+    
+    for pattern in _MEDICAL_PHRASE_PATTERNS:
+        match = re.search(pattern, transcript, re.IGNORECASE)
+        if match:
+            extracted = match.group(0).strip()
+            logger.info(f"_extract_service_name_from_transcript | extracted medical phrase: {extracted!r}")
+            return extracted
+    
+    # Strategy 3: Generic extraction using trigger keywords (fallback)
+    _SERVICE_TRIGGERS = [
+        r'(?:أريد|اريد|عايز|عاوز|محتاج|ممكن)\s+(?:عمل|اعمل|أعمل)?\s*',
+        r'(?:فحص|فحوص|فحوصات)\s+',
+        r'(?:تحليل|تحاليل)\s+',
+        r'(?:أشعة|اشعة|الأشعة|الاشعة)\s+',
+        r'(?:تصوير)\s+',
+        r'(?:صورة|صور)\s+',
+    ]
+    
+    trigger_pattern = '|'.join(_SERVICE_TRIGGERS)
+    # Capture up to 10 words after trigger for complex service names
+    # Stop at: punctuation, questions, branch mentions, or price indicators
+    full_pattern = rf"(?:{trigger_pattern})((?:(?![؟،\n\.!]|هل |في |عندكم|فرع|بكام|كام|سعر|ريال)[^\s]{{2,}}\s*){{1,10}})"
+    
+    match = re.search(full_pattern, transcript, re.IGNORECASE)
+    if match:
+        service_name = match.group(1).strip()
+        # Clean up the extracted name
+        service_name = re.sub(r'\s+', ' ', service_name)  # normalize whitespace
+        logger.info(f"_extract_service_name_from_transcript | extracted generic: {service_name!r}")
+        return service_name
+    
+    return ""
+
+
+# Node G2 – fetch_crm_services_for_call
+#   Looks up active services for the call's specialty from the hospital SQL
+#   Server DB (cr301_ksaservicedataset, active rows only).
+#   Runs in parallel with fetch_crm_offers_for_call.
+#   Stores a compact human-readable context string in crm_services_context.
+# ---------------------------------------------------------------------------
+
+async def fetch_crm_services_for_call(state: AgentState) -> dict:
+    """
+    Fetch live service records for the call's specialty and serialise them
+    as a compact string for injection into evaluation prompts.
+
+    Falls back gracefully to "" on any error so downstream nodes are unaffected.
+    """
+    call = state.get("call")
+    call_id = call.call_id if call else "UNKNOWN"
+
+    # Only use the specialty extracted from the transcript by the LLM.
+    # call.department is an operational label ("Scheduling", "Helpdesk", etc.),
+    # not a medical specialty — never use it as a specialty fallback.
+    details: dict = state.get("appointment_details") or {}
+    specialty_en: str = (details.get("specialty_name") or "").strip()
+
+    # Extract service hint: prioritize direct transcript extraction over LLM-extracted offer_name
+    # This catches English service names (e.g., "anomaly scan") that the LLM might miss or misclassify
+    transcript: str = getattr(call, "transcript", "") or ""
+    service_hint = _extract_service_name_from_transcript(transcript)
+    
+    # Fallback: use LLM-extracted offer_name if transcript extraction found nothing
+    if not service_hint:
+        service_hint = (details.get("offer_name") or "").strip()
+    
+    # Skip fetching only if BOTH specialty AND service_hint are missing
+    if not specialty_en and not service_hint:
+        logger.info(
+            "fetch_crm_services_for_call | call_id=%s — no specialty or service hint extracted, skipping",
+            call_id
+        )
+        return {"crm_services_context": "", "node_trace": _trace(state, "fetch_crm_services_for_call")}
+    
+    # Use a generic specialty when missing but service_hint exists
+    # The direct name matching in get_services_for_specialty will handle it
+    if not specialty_en and service_hint:
+        specialty_en = "General"
+        logger.info(
+            "fetch_crm_services_for_call | call_id=%s — using generic specialty with service_hint=%r",
+            call_id, service_hint
+        )
+    
+    business_unit: str = (getattr(call, "business_unit", None) or "LIVE")
+
+    # Split service_hint by newlines to handle multiple service names
+    # (e.g., when agent mentions multiple services in one conversation)
+    service_hints = [h.strip() for h in service_hint.split('\n') if h.strip()] if service_hint else []
+    
+    logger.info(
+        "fetch_crm_services_for_call | call_id=%s specialty=%r bu=%s hints=%d: %s",
+        call_id, specialty_en, business_unit, len(service_hints), service_hints or "(none)",
+    )
+
+    try:
+        from app.service_hub.crm_services import get_services_for_specialty, format_service_card
+
+        # Fetch services for each hint and aggregate results
+        all_services = []
+        seen_service_keys = set()  # Track by servicekey to deduplicate
+        
+        if service_hints:
+            # Multiple hints: fetch services for each one
+            for idx, hint in enumerate(service_hints, 1):
+                services = get_services_for_specialty(
+                    specialty_en=specialty_en,
+                    service_hint=hint,
+                    bu=business_unit,
+                    top_n=3,  # Limit to top 3 per hint to avoid explosion
+                )
+                logger.info(
+                    "fetch_crm_services_for_call | call_id=%s hint#%d (%r) → %d service(s)",
+                    call_id, idx, hint, len(services)
+                )
+                # Deduplicate by servicekey
+                for svc in services:
+                    svc_key = svc.get("cr301_servicekey")
+                    if svc_key and svc_key not in seen_service_keys:
+                        seen_service_keys.add(svc_key)
+                        all_services.append(svc)
+        else:
+            # No hints: fallback to specialty-only search
+            all_services = get_services_for_specialty(
+                specialty_en=specialty_en,
+                service_hint="",
+                bu=business_unit,
+            )
+        
+        services = all_services
+    except Exception as exc:
+        logger.warning(
+            "fetch_crm_services_for_call | call_id=%s — fetch failed (non-fatal): %s", call_id, exc
+        )
+        return {"crm_services_context": "", "node_trace": _trace(state, "fetch_crm_services_for_call")}
+
+    if not services:
+        logger.info(
+            "fetch_crm_services_for_call | call_id=%s — no services for specialty=%r", call_id, specialty_en
+        )
+        return {
+            "crm_services_context": f"No services found for specialty: {specialty_en!r}",
+            "node_trace": _trace(state, "fetch_crm_services_for_call"),
+        }
+
+    # ── Log detailed service information (same format as offers) ──────────────
+    for i, svc in enumerate(services, 1):
+        is_primary = not svc.get("_is_alternative", False)
+        flag = "[PRIMARY]" if is_primary else "[ALTERNATIVE]"
+        
+        # Collect all available fields for comprehensive logging
+        log_fields = [
+            ("cr301_title", svc.get("cr301_title")),
+            ("cr301_service", svc.get("cr301_service")),
+            ("cr301_servicear", svc.get("cr301_servicear")),
+            ("cr301_specialtyname", svc.get("cr301_specialtyname")),
+            ("cr301_price", svc.get("servhub_priced")),
+            ("cr301_code", svc.get("cr301_code")),
+            ("cr301_servicekey", svc.get("cr301_servicekey")),
+            ("cr301_nphiescode", svc.get("cr301_nphiescode")),
+            ("cr18c_buname", svc.get("cr18c_buname")),
+            ("_service_matched", svc.get("_service_matched", False)),
+        ]
+        
+        # Build log message with NULL warnings
+        log_lines = [f"fetch_crm_services_for_call | call_id={call_id} — retrieved service #{i} {flag}:"]
+        null_fields = []
+        for field_name, field_value in log_fields:
+            if field_value is None or (isinstance(field_value, str) and not field_value.strip()):
+                null_fields.append(field_name)
+                log_lines.append(f"  {field_name:<20}: NULL ⚠️")
+            else:
+                log_lines.append(f"  {field_name:<20}: {field_value}")
+        
+        if null_fields:
+            log_lines.append(f"  ⚠️  WARNING: {len(null_fields)} NULL field(s): {', '.join(null_fields)}")
+        
+        logger.info("\n".join(log_lines))
+
+    hint_summary = f" | hints: {', '.join(repr(h) for h in service_hints)}" if service_hints else ""
+    lines: list[str] = [
+        f"Active services for specialty: {specialty_en!r}  (bu={business_unit}){hint_summary}",
+        f"Total: {len(services)} service(s) returned",
+        "",
+    ]
+    for i, svc in enumerate(services, 1):
+        flag = " [PRIMARY]" if not svc.get("_is_alternative") else " [ALTERNATIVE]"
+        card = format_service_card(svc, lang="ar")
+        lines.append(f"--- Service {i}{flag} ---")
+        lines.append(card)
+        lines.append("")
+
+    context = "\n".join(lines)
+    logger.info(
+        "fetch_crm_services_for_call | call_id=%s — serialised %d service(s) from %d hint(s) (%d chars)",
+        call_id, len(services), len(service_hints), len(context),
+    )
+    return {
+        "crm_services_context": context,
+        "node_trace": _trace(state, "fetch_crm_services_for_call"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node G3 – fetch_crm_packages_for_call
+#   Looks up packages for the call's specialty from the hospital SQL Server DB
+#   (cr301_ksaservicedataset where servicecategoryname = 'Package').
+#   Runs in parallel with fetch_crm_offers_for_call.
+#   Stores a compact human-readable context string in crm_packages_context.
+# ---------------------------------------------------------------------------
+
+async def fetch_crm_packages_for_call(state: AgentState) -> dict:
+    """
+    Fetch live package records for the call's specialty and serialise them
+    as a compact string for injection into evaluation prompts.
+
+    Falls back gracefully to "" on any error so downstream nodes are unaffected.
+    """
+    call = state.get("call")
+    call_id = call.call_id if call else "UNKNOWN"
+
+    # Only use the specialty extracted from the transcript by the LLM.
+    # call.department is an operational label ("Scheduling", "Helpdesk", etc.),
+    # not a medical specialty — never use it as a specialty fallback.
+    details: dict = state.get("appointment_details") or {}
+    specialty_en: str = (details.get("specialty_name") or "").strip()
+
+    if not specialty_en:
+        logger.info("fetch_crm_packages_for_call | call_id=%s — no specialty extracted from transcript, skipping", call_id)
+        return {"crm_packages_context": "", "node_trace": _trace(state, "fetch_crm_packages_for_call")}
+
+    service_hint: str = (details.get("offer_name") or "").strip()
+    business_unit: str = (getattr(call, "business_unit", None) or "LIVE")
+
+    logger.info(
+        "fetch_crm_packages_for_call | call_id=%s specialty=%r bu=%s hint=%r",
+        call_id, specialty_en, business_unit, service_hint or "(none)",
+    )
+
+    try:
+        from app.service_hub.crm_packages import get_packages_for_specialty, format_package_card
+
+        packages = get_packages_for_specialty(
+            specialty_en=specialty_en,
+            service_hint=service_hint,
+            bu=business_unit,
+        )
+    except Exception as exc:
+        logger.warning(
+            "fetch_crm_packages_for_call | call_id=%s — fetch failed (non-fatal): %s", call_id, exc
+        )
+        return {"crm_packages_context": "", "node_trace": _trace(state, "fetch_crm_packages_for_call")}
+
+    if not packages:
+        logger.info(
+            "fetch_crm_packages_for_call | call_id=%s — no packages for specialty=%r", call_id, specialty_en
+        )
+        return {
+            "crm_packages_context": f"No packages found for specialty: {specialty_en!r}",
+            "node_trace": _trace(state, "fetch_crm_packages_for_call"),
+        }
+
+    # ── Log detailed package information (same format as offers) ──────────────
+    for i, pkg in enumerate(packages, 1):
+        is_primary = not pkg.get("_is_alternative", False)
+        flag = "[PRIMARY]" if is_primary else "[ALTERNATIVE]"
+        
+        # Collect all available fields for comprehensive logging
+        log_fields = [
+            ("cr301_title", pkg.get("cr301_title")),
+            ("cr301_service", pkg.get("cr301_service")),
+            ("cr301_servicear", pkg.get("cr301_servicear")),
+            ("cr301_specialtyname", pkg.get("cr301_specialtyname")),
+            ("cr301_price", pkg.get("cr301_price")),
+            ("cr301_code", pkg.get("cr301_code")),
+            ("cr301_servicekey", pkg.get("cr301_servicekey")),
+            ("cr301_nphiescode", pkg.get("cr301_nphiescode")),
+            ("cr18c_buname", pkg.get("cr18c_buname")),
+            ("_service_matched", pkg.get("_service_matched", False)),
+        ]
+        
+        # Build log message with NULL warnings
+        log_lines = [f"fetch_crm_packages_for_call | call_id={call_id} — retrieved package #{i} {flag}:"]
+        null_fields = []
+        for field_name, field_value in log_fields:
+            if field_value is None or (isinstance(field_value, str) and not field_value.strip()):
+                null_fields.append(field_name)
+                log_lines.append(f"  {field_name:<20}: NULL ⚠️")
+            else:
+                log_lines.append(f"  {field_name:<20}: {field_value}")
+        
+        if null_fields:
+            log_lines.append(f"  ⚠️  WARNING: {len(null_fields)} NULL field(s): {', '.join(null_fields)}")
+        
+        logger.info("\n".join(log_lines))
+
+    lines: list[str] = [
+        f"Active packages for specialty: {specialty_en!r}  (bu={business_unit})",
+        f"Total: {len(packages)} package(s) returned",
+        "",
+    ]
+    for i, pkg in enumerate(packages, 1):
+        flag = " [PRIMARY]" if not pkg.get("_is_alternative") else " [ALTERNATIVE]"
+        card = format_package_card(pkg, lang="ar")
+        lines.append(f"--- Package {i}{flag} ---")
+        lines.append(card)
+        lines.append("")
+
+    context = "\n".join(lines)
+    logger.info(
+        "fetch_crm_packages_for_call | call_id=%s — serialised %d package(s) (%d chars)",
+        call_id, len(packages), len(context),
+    )
+    return {
+        "crm_packages_context": context,
+        "node_trace": _trace(state, "fetch_crm_packages_for_call"),
     }
 
 
@@ -614,6 +1064,120 @@ async def infer_offer_evaluation(
 
 
 # ---------------------------------------------------------------------------
+# Node H – infer_service_evaluation
+#   Focused LLM call: did the agent correctly recommend services available
+#   for the patient's specialty?
+#   Runs AFTER fetch_crm_services_for_call (sequential dependency).
+# ---------------------------------------------------------------------------
+
+async def infer_service_evaluation(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    Call the LLM with a service-evaluation-only prompt.
+
+    Evaluates the agent's service recommendation behaviour against possible
+    outcomes:
+      • SUITABLE_SERVICE_RECOMMENDED    — positive flag
+      • SERVICE_SKIPPED                 — C2B moderate flag
+      • UNRELATED_SERVICE_RECOMMENDED   — C2B moderate flag
+      • SERVICE_MISREPRESENTED          — C2B moderate flag
+      • INCOMPLETE_SERVICE_PRESENTATION — NC minor flag
+      • NO_SERVICE_AVAILABLE            — no flag
+      • SERVICE_NOT_APPLICABLE          — no flag
+
+    Result stored in state["service_eval"].
+    """
+    call = state["call"]
+
+    user_prompt = build_service_prompt(
+        call,
+        crm_services_context=state.get("crm_services_context") or "",
+    )
+    logger.debug(
+        "infer_service_evaluation | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_service_evaluation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
+    outcome = data.get("service_outcome", "SERVICE_NOT_APPLICABLE")
+    logger.info(
+        "infer_service_evaluation | call_id=%s outcome=%s flags=%d",
+        call.call_id,
+        outcome,
+        len(data.get("service_flags", [])),
+    )
+
+    return {
+        "service_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_service_evaluation"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node I – infer_package_evaluation
+#   Focused LLM call: did the agent correctly recommend packages available
+#   for the patient's specialty?
+#   Runs AFTER fetch_crm_packages_for_call (sequential dependency).
+# ---------------------------------------------------------------------------
+
+async def infer_package_evaluation(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """
+    Call the LLM with a package-evaluation-only prompt.
+
+    Evaluates the agent's package recommendation behaviour against possible
+    outcomes:
+      • SUITABLE_PACKAGE_RECOMMENDED    — positive flag
+      • PACKAGE_SKIPPED                 — C2B moderate flag
+      • UNRELATED_PACKAGE_RECOMMENDED   — C2B moderate flag
+      • PACKAGE_MISREPRESENTED          — C2B moderate flag
+      • INCOMPLETE_PACKAGE_PRESENTATION — NC minor flag
+      • NO_PACKAGE_AVAILABLE            — no flag
+      • PACKAGE_NOT_APPLICABLE          — no flag
+
+    Result stored in state["package_eval"].
+    """
+    call = state["call"]
+
+    user_prompt = build_package_prompt(
+        call,
+        crm_packages_context=state.get("crm_packages_context") or "",
+    )
+    logger.debug(
+        "infer_package_evaluation | call_id=%s prompt_len=%d",
+        call.call_id, len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_package_evaluation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return err
+
+    outcome = data.get("package_outcome", "PACKAGE_NOT_APPLICABLE")
+    logger.info(
+        "infer_package_evaluation | call_id=%s outcome=%s flags=%d",
+        call.call_id,
+        outcome,
+        len(data.get("package_flags", [])),
+    )
+
+    return {
+        "package_eval": data,
+        "usage_list": [data.get("_usage", {})],
+        "node_trace": _trace(state, "infer_package_evaluation"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Node C – infer_script_matching
 #   Focused LLM call: greeting / closing script adherence.
 #   Runs in PARALLEL with infer_behavioral_evaluation & infer_compliance_evaluation.
@@ -627,7 +1191,6 @@ async def infer_script_matching(
     Produces: accuracy_score, script_flags.
     Result stored in state["script_eval"].
     """
-    pass
     """ call = state["call"]
     user_prompt = build_script_prompt(
         call,
@@ -733,6 +1296,8 @@ async def aggregate_results(state: AgentState) -> dict:
     compliance  = state.get("compliance_eval")  or {}
     reservation = state.get("reservation_eval") or {}
     offer       = state.get("offer_eval")       or {}
+    service     = state.get("service_eval")     or {}
+    package     = state.get("package_eval")     or {}
     script      = state.get("script_eval")      or {}
     scoring     = state.get("scoring_eval")     or {}
 
@@ -748,12 +1313,34 @@ async def aggregate_results(state: AgentState) -> dict:
             flag["severity"] = "positive"
         _offer_flags.append(flag)
 
+    # Normalise service_flags
+    _raw_service_flags: list[dict] = service.get("service_flags", [])
+    _service_flags: list[dict] = []
+    for f in _raw_service_flags:
+        flag = dict(f)
+        if flag.get("type") == "positive":
+            flag["type"] = "NC"
+            flag["severity"] = "positive"
+        _service_flags.append(flag)
+
+    # Normalise package_flags
+    _raw_package_flags: list[dict] = package.get("package_flags", [])
+    _package_flags: list[dict] = []
+    for f in _raw_package_flags:
+        flag = dict(f)
+        if flag.get("type") == "positive":
+            flag["type"] = "NC"
+            flag["severity"] = "positive"
+        _package_flags.append(flag)
+
     # Merge all compliance flag lists from all focused evaluations
     all_flags: list[dict] = (
         behavioral.get("behavioral_flags", [])
         + compliance.get("compliance_flags", [])
         + reservation.get("reservation_flags", [])
         + _offer_flags
+        + _service_flags
+        + _package_flags
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
@@ -804,13 +1391,15 @@ async def aggregate_results(state: AgentState) -> dict:
     }
 
     logger.debug(
-        "aggregate_results | call_id=%s flags=%d assessment=%s classification=%s profiling=%s offer_outcome=%s",
+        "aggregate_results | call_id=%s flags=%d assessment=%s classification=%s profiling=%s offer_outcome=%s service_outcome=%s package_outcome=%s",
         call_id,
         len(deduped_flags),
         merged["overall_assessment"],
         merged["agent_performance"].get("Agent Classification"),
         merged["agent_performance"].get("Profiling Comment"),
         offer.get("offer_outcome", "N/A"),
+        service.get("service_outcome", "N/A"),
+        package.get("package_outcome", "N/A"),
     )
 
     try:
@@ -878,6 +1467,7 @@ async def integrity_check(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 
 async def save_to_database(state: AgentState) -> dict:
+    
     """
     Persist the validated QAAnalysisResult to the SQL Server database.
 
@@ -983,24 +1573,43 @@ async def handle_error(state: AgentState) -> dict:
 #     • intent_label       (str)   – human-readable label for the intent
 # ---------------------------------------------------------------------------
 
-# Keywords that signal a booking or appointment-checking intent
+# Keywords that signal a booking / appointment intent.
+# Triggers the full sub-flow: extract → verify DB → infer_reservation_evaluation.
 _BOOKING_KEYWORDS: list[str] = [
-    "احجز",    # "book" (imperative)
-    "احجزلي",  # "book for me"
-    "حجز",     # "booking / reservation"
-    "حجزي",    # "my booking"
-    "حجزك",    # "your booking"
-    "حجزه",    # "his/her booking"
-    "الحجز",   # "the booking"
-    "معاد",    # "appointment"
-    "المعاد",  # "the appointment"
-    "معادي",   # "my appointment"
-    "موعد",    # "appointment / time-slot"
-    "المواعيد", # "the appointments"
-    "مواعيد",  # "appointments"
+    "احجز",           # "book" (imperative)
+    "احجزلي",         # "book for me"
+    "حجز",            # "booking / reservation"
+    "حجزي",           # "my booking"
+    "حجزك",           # "your booking"
+    "حجزه",           # "his/her booking"
+    "الحجز",          # "the booking"
+    "معاد",           # "appointment"
+    "المعاد",         # "the appointment"
+    "معادي",          # "my appointment"
+    "موعد",           # "appointment / time-slot"
+    "المواعيد",       # "the appointments"
+    "مواعيد",         # "appointments"
     "تأكيد الحجز",
     "الموعد",
-    "تم تأكيد الحجز"
+    "تم تأكيد الحجز",
+]
+
+# Keywords that signal an offer / package / discount inquiry.
+# Triggers extract_appointment_details (to get specialty + offer name) but
+# SKIPS the DB appointment verification step — there is no reservation to check.
+_OFFER_KEYWORDS: list[str] = [
+    "عرض",            # "offer"
+    "العرض",          # "the offer"
+    "عروض",           # "offers" (plural)
+    "العروض",         # "the offers"
+    "باقة",           # "package"
+    "الباقة",         # "the package"
+    "باقات",          # "packages"
+    "خصم",            # "discount"
+    "الخصم",          # "the discount"
+    "تخفيض",          # "reduction / sale"
+    "بروموشن",        # "promotion" (colloquial)
+    "كود الخصم",      # "discount code"
 ]
 
 
@@ -1049,20 +1658,34 @@ async def detect_intent(state: AgentState) -> dict:
             "node_trace": _trace(state, "detect_intent"),
         }
 
-    matched_keywords = [kw for kw in _BOOKING_KEYWORDS if kw in transcript_text]
-    is_booking = bool(matched_keywords)
-    intent_label = "booking_or_appointment" if is_booking else "other"
+    matched_booking = [kw for kw in _BOOKING_KEYWORDS if kw in transcript_text]
+    matched_offer   = [kw for kw in _OFFER_KEYWORDS   if kw in transcript_text]
+
+    is_booking = bool(matched_booking)
+    # offer_only: offer keywords found but NO booking keywords
+    # (if both appear, the booking flow already handles everything)
+    is_offer = bool(matched_offer) and not is_booking
+
+    if is_booking:
+        intent_label = "booking_or_appointment"
+    elif is_offer:
+        intent_label = "offer_inquiry"
+    else:
+        intent_label = "other"
 
     logger.info(
-        "detect_intent | call_id=%s is_booking=%s matched=%s",
+        "detect_intent | call_id=%s is_booking=%s is_offer=%s matched_booking=%s matched_offer=%s",
         call.call_id,
         is_booking,
-        matched_keywords or "none",
+        is_offer,
+        matched_booking or "none",
+        matched_offer or "none",
     )
 
     return {
         "is_booking_intent": is_booking,
-        "intent_label": intent_label,
+        "is_offer_intent":   is_offer,
+        "intent_label":      intent_label,
         "node_trace": _trace(state, "detect_intent"),
     }
 
@@ -1094,18 +1717,80 @@ async def extract_appointment_details(
       - ``specialty_name``    (str | None)
 
     These are stored together in ``state["appointment_details"]``.
-    When ``is_booking_intent`` is False the node skips the LLM call and
-    stores ``None`` for every field.
+    When both ``is_booking_intent`` and ``is_offer_intent`` are False the node
+    skips any work and stores ``None`` for every field.
+
+    When ``is_offer_intent`` is True (and ``is_booking_intent`` is False), a
+    fast regex scan extracts the offer name directly from the transcript
+    (text immediately after عرض / باقة / خصم / ...) without calling the LLM.
     """
-    if not state.get("is_booking_intent", False):
+    is_booking = state.get("is_booking_intent", False)
+    is_offer   = state.get("is_offer_intent",   False)
+
+    # ── Fast path: offer-only – extract offer name via regex, skip LLM ────────
+    if is_offer and not is_booking:
+        call = state.get("call")
+        call_id = call.call_id if call else "UNKNOWN"
+        transcript: str = getattr(call, "transcript", "") or ""
+
+        # Regex: capture 1–6 words after an offer trigger keyword.
+        # Handles: "عرض X", "باقة X Y", etc.
+        # Stops at sentence-ending punctuation, common filler words, OR discount indicators
+        _OFFER_NAME_RE = re.compile(
+            r"(?:عرض|باقة|باقات|العرض|الباقة|بروموشن)\s+"
+            r"((?:(?![؟،\n]|هل |هلل|هليه|فيه|عندكم|\d+%|على|علي)[^\s]{2,}\s*){1,6})",
+            re.IGNORECASE,
+        )
+        offer_name: str | None = None
+        m = _OFFER_NAME_RE.search(transcript)
+        if m:
+            extracted = m.group(1).strip()
+            # Validate: skip if extracted text is price/discount info
+            # (contains %, SAR, ريال, price numbers, "على"/"علي", etc.)
+            _DISCOUNT_INDICATORS = re.compile(
+                r'(?:\d+%|%\d+|SAR|ريال|SR|على|علي|سعر|السعر|\d{3,})',
+                re.IGNORECASE
+            )
+            if not _DISCOUNT_INDICATORS.search(extracted):
+                offer_name = extracted
+                logger.info(
+                    "extract_appointment_details | call_id=%s — offer fast-path: extracted offer_name=%r",
+                    call_id, offer_name,
+                )
+            else:
+                logger.info(
+                    "extract_appointment_details | call_id=%s — offer fast-path: rejected discount text %r (not an offer name)",
+                    call_id, extracted,
+                )
+        else:
+            logger.info(
+                "extract_appointment_details | call_id=%s — offer fast-path: no offer name found after keyword",
+                call_id,
+            )
+
+        return {
+            "appointment_details": {
+                "appointment_date": None,
+                "doctor_name":      None,
+                "specialty_name":   None,
+                "patient_name":     None,
+                "offer_name":       offer_name,
+            },
+            "node_trace": _trace(state, "extract_appointment_details"),
+        }
+
+    # ── Skip entirely when neither booking nor offer ───────────────────────
+    if not is_booking:
         logger.info(
-            "extract_appointment_details | is_booking_intent=False — skipping"
+            "extract_appointment_details | is_booking_intent=False, is_offer_intent=False — skipping"
         )
         return {
             "appointment_details": {
                 "appointment_date": None,
                 "doctor_name": None,
                 "specialty_name": None,
+                "patient_name": None,
+                "offer_name": None,
             },
             "node_trace": _trace(state, "extract_appointment_details"),
         }

@@ -33,7 +33,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
         ON p.Account_UniqueID = a.UniqueID
     OUTER APPLY
     (
-        SELECT TOP (10)
+        SELECT TOP (1)
             DATEADD(HOUR, 3, m2.CreationDateTime) AS FirstResponse
         FROM [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[Messages] m2
         WHERE m2.Conversation_UniqueId = c.UniqueId
@@ -63,7 +63,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
 ),
 TopConversations AS
 (
-    SELECT TOP (1) *
+    SELECT TOP (10) *
     FROM ConvSummary
     ORDER BY Start_DateTime DESC
 )
@@ -98,6 +98,7 @@ SELECT
 FROM TopConversations tc
 INNER JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[MessagesTotal] m
     ON m.ConversationId = tc.UniqueId
+--where m.ConversationId = '32497DAA-9299-F111-9B33-000D3AA9D409'
 ORDER BY
     tc.Start_DateTime DESC,
     tc.UniqueId,

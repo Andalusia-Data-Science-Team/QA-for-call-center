@@ -368,7 +368,7 @@ def fetch_offers(force_refresh: bool = False) -> list[dict]:
     Never raises — returns [] on failure so booking flow is unaffected.
     Thread-safe.
     """
-    from app.offers_node.crm_database import _run_query_with_retry, _is_configured
+    from app.service_hub.crm_database import _run_query_with_retry, _is_configured
 
     if not _is_configured():
         return []
@@ -456,27 +456,97 @@ def get_offers_for_specialty(
     # minor word-order / diacritic differences still match.
     if service_hint and len(service_hint.strip()) >= 4:
         _hint_norm = service_hint.strip().lower()
+        
+        # ── Enhanced normalization for extracted offer names ──────────────────
+        # Strip common prefixes (branch names, offer labels) and suffixes (prices)
+        # Examples:
+        #   "فرع السنابل عرض التركيبه الزيركون 750" → "عرض التركيبه الزيركون"
+        #   "عرض الليزر الكامل 500 ريال" → "عرض الليزر الكامل"
+        def _normalize_offer_hint(hint: str) -> str:
+            """Normalize extracted offer names for better matching."""
+            # First, remove newlines and normalize whitespace
+            text = _re.sub(r'[\r\n]+', ' ', hint)
+            text = _re.sub(r'\s+', ' ', text).strip()
+            
+            # Remove trailing prices: numbers with SAR/ريال/SR or standalone numbers at end
+            text = _re.sub(r'\s+\d+[\s\.]*(ريال|SAR|SR|جنيه|دينار|درهم)\s*$', '', text, flags=_re.IGNORECASE)
+            text = _re.sub(r'\s+\d{2,}[\s\.]*$', '', text)  # "... 750" → "..."
+            
+            # Remove branch name patterns at the beginning
+            # Pattern: "فرع السنابل" or "فرع X" at start
+            text = _re.sub(r'^فرع\s+\S+\s+', '', text)  # "فرع السنابل عرض..." → "عرض..."
+            
+            # Alternative patterns for branches
+            text = _re.sub(r'^(في|فى)\s+فرع\s+\S+\s+', '', text)  # "في فرع X عرض..." → "عرض..."
+            
+            return text.strip().lower()
+        
+        _hint_clean = _normalize_offer_hint(_hint_norm)
+        
+        # Apply Arabic normalization (hamza, tashkeel, etc.)
+        def _norm_ar_fast(text: str) -> str:
+            """Quick Arabic normalization for matching."""
+            t = text.lower()
+            # Remove tashkeel
+            t = _re.sub(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]', '', t)
+            # Normalize hamza
+            t = t.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ٱ", "ا")
+            t = t.replace("ؤ", "و").replace("ئ", "ي")
+            t = t.replace("ة", "ه").replace("ى", "ي")
+            return t
+        
+        _hint_normalized = _norm_ar_fast(_hint_clean)
+        
         _name_candidates: list[tuple[float, dict]] = []
         for _o in all_offers:
             if (_o.get("Offer_Status") or "") == STATUS_DRAFT:
                 continue
             _on_ar = (_o.get("Offer_Name_AR") or "").strip().lower()
             _on_en = (_o.get("Offer_Name_EN") or "").strip().lower()
-            _score = max(
-                _rfuzz.partial_ratio(_hint_norm, _on_ar),
-                _rfuzz.partial_ratio(_hint_norm, _on_en),
-            )
-            if _score >= 85:  # high-confidence name match
+            
+            # Normalize database offer names too
+            _on_ar_norm = _norm_ar_fast(_on_ar)
+            _on_en_norm = _on_en  # English doesn't need Arabic normalization
+            
+            # Try multiple matching strategies
+            # 1. Partial ratio with cleaned hint
+            _score1 = _rfuzz.partial_ratio(_hint_clean, _on_ar)
+            _score2 = _rfuzz.partial_ratio(_hint_clean, _on_en)
+            
+            # 2. Partial ratio with fully normalized Arabic
+            _score3 = _rfuzz.partial_ratio(_hint_normalized, _on_ar_norm)
+            
+            # 3. Token set ratio (word order independent) for key terms
+            _score4 = _rfuzz.token_set_ratio(_hint_normalized, _on_ar_norm)
+            _score5 = _rfuzz.token_set_ratio(_hint_clean, _on_en)
+            
+            # Take the best score from all strategies
+            _score = max(_score1, _score2, _score3, _score4, _score5)
+            
+            # Lower threshold for normalized matching (75 instead of 85)
+            if _score >= 75:  # more lenient threshold for normalized matching
                 _name_candidates.append((_score, _o))
         if _name_candidates:
             _name_candidates.sort(key=lambda x: -x[0])
             _best_score, _best_offer = _name_candidates[0]
             print(
-                f"[offers] direct name match: hint={service_hint!r} → "
+                f"[offers] direct name match: hint={service_hint!r} → cleaned={_hint_clean!r} → "
                 f"{(_best_offer.get('Offer_Name_AR') or _best_offer.get('Offer_Name_EN'))!r} "
                 f"(score={_best_score})",
                 flush=True,
             )
+            
+            # Log all high-scoring candidates (score >= 75) to show related offers
+            if len(_name_candidates) > 1:
+                print(f"[offers] Found {len(_name_candidates)} related offers:", flush=True)
+                for idx, (_sc, _o) in enumerate(_name_candidates[:5], 1):
+                    print(
+                        f"[offers]   #{idx}: score={_sc} | "
+                        f"{(_o.get('Offer_Name_AR') or _o.get('Offer_Name_EN'))!r} | "
+                        f"Status={_o.get('Offer_Status')} | "
+                        f"Price={_o.get('Price_After_Discount')}",
+                        flush=True,
+                    )
             _best = dict(_best_offer)
             _best["_service_matched"] = True
             _best["_is_alternative"] = False
@@ -814,7 +884,7 @@ def get_offers_for_specialty(
         #          it is de-facto generic regardless of specialty-name mapping.
         #          This catches cases like Pedodontic (no AR mapping) where
         #          "اسنان" still appears in every dental offer.
-        from config.constants import SPECIALTY_EN_TO_AR
+        from app.constants import SPECIALTY_EN_TO_AR
         _spec_ar = SPECIALTY_EN_TO_AR.get(specialty_en, "")
         _spec_ar_words = set()
         if _spec_ar:

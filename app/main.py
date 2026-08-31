@@ -291,7 +291,19 @@ async def retrieve_and_analyze(
             logger.error("analyze failed | call_id=%s | %s", call.call_id, exc)
             return QAAnalysisResult.error_result(call.call_id, str(exc), conversation_link=call.conversation_link)
 
-    results = await asyncio.gather(*[safe_analyze(c) for c in batch.calls])
+    # ── MULTITHREADING APPROACH (commented out — sequential processing below) ──
+    # Process all calls in parallel using asyncio.gather for maximum throughput.
+    # Uncomment this block and comment the sequential loop below to re-enable.
+    # results = await asyncio.gather(*[safe_analyze(c) for c in batch.calls])
+
+    # ── SEQUENTIAL APPROACH (active) ──────────────────────────────────────────
+    # Process calls one by one to avoid overwhelming the LLM provider or database.
+    # This approach is slower but more stable for large batches.
+    results = []
+    for idx, call in enumerate(batch.calls, 1):
+        logger.info("Processing call %d/%d | call_id=%s", idx, len(batch.calls), call.call_id)
+        result = await safe_analyze(call)
+        results.append(result)
 
     summary = {
         "total":        len(results),
@@ -360,7 +372,20 @@ async def batch_analyze(payload: BatchCallTranscripts) -> BatchQAAnalysisResult:
             logger.error("batch item failed | call_id=%s | %s", call.call_id, exc)
             return QAAnalysisResult.error_result(call.call_id, str(exc))
 
-    results = await asyncio.gather(*[safe_analyze(c) for c in payload.calls])
+    # ── MULTITHREADING APPROACH (commented out — sequential processing below) ──
+    # Process all calls in parallel using asyncio.gather for maximum throughput.
+    # Uncomment this block and comment the sequential loop below to re-enable.
+    # results = await asyncio.gather(*[safe_analyze(c) for c in payload.calls])
+
+    # ── SEQUENTIAL APPROACH (active) ──────────────────────────────────────────
+    # Process calls one by one to avoid overwhelming the LLM provider or database.
+    # This approach is slower but more stable for large batches.
+    results = []
+    for idx, call in enumerate(payload.calls, 1):
+        logger.info("Processing call %d/%d | call_id=%s", idx, len(payload.calls), call.call_id)
+        result = await safe_analyze(call)
+        results.append(result)
+
     summary = {
         "total":        len(results),
         "pass":         sum(1 for r in results if r.overall_assessment == "pass"),

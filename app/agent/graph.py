@@ -66,11 +66,14 @@ Stage 2 (focused LLM calls, parallel):
   infer_behavioral_evaluation  — tone, empathy, professionalism, red flags
   infer_compliance_evaluation  — 15 compliance pillars (C2Com/C2C/C2B/NC)
   infer_script_matching        — greeting / closing script adherence
+  infer_offer_evaluation       — offer recommendation (via fetch_crm_offers_for_call)
+  infer_service_evaluation     — service recommendation (via fetch_crm_services_for_call)
+  infer_package_evaluation     — package recommendation (via fetch_crm_packages_for_call)
   Each node calls the LLM with a narrow prompt and stores a partial result.
 
 Stage 3 (sequential synthesis):
-  infer_overall_scoring   — synthesises the three sub-results + scoring weights
-  aggregate_results       — merges all four dicts → QAAnalysisResult (Pydantic)
+  infer_overall_scoring   — synthesises all sub-results + scoring weights
+  aggregate_results       — merges all dicts → QAAnalysisResult (Pydantic)
   integrity_check         — fixes escalation_required ↔ overall_assessment
   finalize                — logs summary, closes trace
 
@@ -113,7 +116,11 @@ from app.agent.nodes import (
     infer_compliance_evaluation,
     infer_reservation_evaluation,
     infer_offer_evaluation,
+    infer_service_evaluation,
+    infer_package_evaluation,
     fetch_crm_offers_for_call,
+    fetch_crm_services_for_call,
+    fetch_crm_packages_for_call,
     infer_script_matching,
     infer_overall_scoring,
     aggregate_results,
@@ -141,10 +148,20 @@ def _error_router(state: AgentState) -> Literal["continue", "handle_error"]:
     return "continue"
 
 
-def _booking_router(state: AgentState) -> Literal["booking", "skip_booking"]:
-    """Route to the booking sub-flow when a booking intent was detected."""
+def _booking_router(state: AgentState) -> Literal["booking", "offer_only", "skip_booking"]:
+    """Three-way route after detect_intent:
+
+    booking     — booking/appointment keywords matched:
+                  extract → verify DB → infer_reservation → inference_gate
+    offer_only  — offer/package keywords matched (no booking keywords):
+                  extract (for specialty + offer_name) → inference_gate
+                  (DB verification is SKIPPED — there is no reservation to check)
+    skip_booking — neither matched: go straight to inference_gate
+    """
     if state.get("is_booking_intent"):
         return "booking"
+    if state.get("is_offer_intent"):
+        return "offer_only"
     return "skip_booking"
 
 
@@ -191,10 +208,20 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         "infer_reservation_evaluation",
         functools.partial(infer_reservation_evaluation, llm_client=llm_client),
     )
-    builder.add_node("fetch_crm_offers_for_call", fetch_crm_offers_for_call)
+    builder.add_node("fetch_crm_offers_for_call",   fetch_crm_offers_for_call)
+    builder.add_node("fetch_crm_services_for_call",  fetch_crm_services_for_call)
+    builder.add_node("fetch_crm_packages_for_call",  fetch_crm_packages_for_call)
     builder.add_node(
         "infer_offer_evaluation",
         functools.partial(infer_offer_evaluation, llm_client=llm_client),
+    )
+    builder.add_node(
+        "infer_service_evaluation",
+        functools.partial(infer_service_evaluation, llm_client=llm_client),
+    )
+    builder.add_node(
+        "infer_package_evaluation",
+        functools.partial(infer_package_evaluation, llm_client=llm_client),
     )
 
     # Stage 4: scoring synthesis (fan-in barrier — waits for all 3 focused nodes)
@@ -216,8 +243,10 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     #   • infer_behavioral_evaluation     (direct from inference_gate)
     #   • infer_compliance_evaluation     (direct from inference_gate)
     #   • infer_offer_evaluation          (via fetch_crm_offers_for_call)
+    #   • infer_service_evaluation        (via fetch_crm_services_for_call)
+    #   • infer_package_evaluation        (via fetch_crm_packages_for_call)
     #   • infer_script_matching           (direct from inference_gate)
-    # Exactly 4 unconditional predecessors.
+    # Exactly 6 unconditional predecessors.
     builder.add_node("inference_ready", lambda state: {})
 
     # Stage 5: aggregate + validate merged result
@@ -294,10 +323,22 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         _booking_router,
         {
             "booking":      "extract_appointment_details",
+            "offer_only":   "extract_appointment_details",  # extract specialty+offer_name, skip DB
             "skip_booking": "inference_gate",
         },
     )
-    builder.add_edge("extract_appointment_details", "verify_appointment_in_db")
+    # Booking path: extract → verify DB → infer_reservation → inference_gate
+    # Offer-only path: extract → inference_gate (skips DB + reservation eval)
+    builder.add_node("offer_extraction_done", lambda state: {})  # no-op barrier
+    builder.add_conditional_edges(
+        "extract_appointment_details",
+        lambda s: "booking" if s.get("is_booking_intent") else "offer_only",
+        {
+            "booking":    "verify_appointment_in_db",
+            "offer_only": "offer_extraction_done",
+        },
+    )
+    builder.add_edge("offer_extraction_done",       "inference_gate")
     builder.add_edge("verify_appointment_in_db",    "infer_reservation_evaluation")
     builder.add_conditional_edges(
         "infer_reservation_evaluation",
@@ -310,14 +351,21 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Three nodes run in PARALLEL directly from inference_gate:
     #   behavioral, compliance, script_matching.
     #
-    # The offer path has one extra sequential step:
+    # The offer/service/package paths each have one extra sequential step:
     #   inference_gate → fetch_crm_offers_for_call → infer_offer_evaluation
-    # This ensures live CRM data is fetched BEFORE the offer LLM prompt runs.
+    #   inference_gate → fetch_crm_services_for_call → infer_service_evaluation
+    #   inference_gate → fetch_crm_packages_for_call → infer_package_evaluation
+    # This ensures live CRM data is fetched BEFORE the LLM prompt runs.
     builder.add_edge("inference_gate", "infer_behavioral_evaluation")
     builder.add_edge("inference_gate", "infer_compliance_evaluation")
     builder.add_edge("inference_gate", "infer_script_matching")
     builder.add_edge("inference_gate", "fetch_crm_offers_for_call")
     builder.add_edge("fetch_crm_offers_for_call", "infer_offer_evaluation")
+    # Services and packages run with their fetch → infer chain in parallel
+    builder.add_edge("inference_gate", "fetch_crm_services_for_call")
+    builder.add_edge("fetch_crm_services_for_call", "infer_service_evaluation")
+    builder.add_edge("inference_gate", "fetch_crm_packages_for_call")
+    builder.add_edge("fetch_crm_packages_for_call", "infer_package_evaluation")
 
     # ── Step 4: all four evaluations fan-in → inference_ready ─────────────
     #
@@ -342,6 +390,8 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         _error_router,
         {"continue": "inference_ready", "handle_error": "handle_error"},
     )
+    builder.add_edge("fetch_crm_services_for_call",  "inference_ready")
+    builder.add_edge("fetch_crm_packages_for_call",  "inference_ready")
 
     # ── Step 5: inference_ready → infer_overall_scoring ───────────────────
     builder.add_edge("inference_ready", "infer_overall_scoring")

@@ -28,5 +28,5 @@ SELECT
       ,[cr18c_buname]
   FROM [dbo].[cr301_ksaservicedataset]
 WHERE [cr301_servicecategoryname] = 'Package'
-and cr18c_buname in ('HJH','AHJ','LCH','MKR','AKW','ALW','SNB','AFW','ADC')
+and cr18c_buname = :bu_name
 order by createdon desc

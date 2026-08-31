@@ -27,6 +27,8 @@ class AgentState(TypedDict, total=False):
     compliance_eval: dict[str, Any]   # from infer_compliance_evaluation
     reservation_eval: dict[str, Any]  # from infer_reservation_evaluation
     offer_eval: dict[str, Any]        # from infer_offer_evaluation
+    service_eval: dict[str, Any]      # from infer_service_evaluation
+    package_eval: dict[str, Any]      # from infer_package_evaluation
     script_eval: dict[str, Any]       # from infer_script_matching
     scoring_eval: dict[str, Any]      # from infer_overall_scoring
 
@@ -39,11 +41,14 @@ class AgentState(TypedDict, total=False):
     # all fan into handle_error in the same step, the concurrent writes to
     # `result` do not raise InvalidUpdateError.
     result: Annotated[Optional[QAAnalysisResult], lambda _old, new: new]
-    is_booking_intent: Optional[bool]
+    is_booking_intent: Optional[bool]  # booking/appointment keywords matched
+    is_offer_intent: Optional[bool]    # offer/package keywords matched (no DB verify needed)
     intent_label: Optional[str]
     appointment_details: Optional[dict[str, Any]]
     appointment_verification: Optional[dict[str, Any]]
-    crm_offers_context: Optional[str]   # written by fetch_crm_offers_for_call
+    crm_offers_context: Optional[str]    # written by fetch_crm_offers_for_call
+    crm_services_context: Optional[str]  # written by fetch_crm_services_for_call
+    crm_packages_context: Optional[str]  # written by fetch_crm_packages_for_call
 
     # ── Error handling ────────────────────────────────────────────────────
     error: Optional[str]

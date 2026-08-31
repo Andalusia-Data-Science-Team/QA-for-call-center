@@ -519,6 +519,8 @@ offer to the patient during the call below.
 3. Compare what the agent said (if anything) against the available CRM offers
    provided below.
 4. Choose exactly ONE outcome from the list and produce the appropriate flags.
+5. If there is a offer fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched offer
+
 
 ## OUTCOME DEFINITIONS
 - SUITABLE_OFFER_RECOMMENDED   : Agent identified and correctly presented a matching offer → positive flag.
@@ -581,6 +583,254 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 
 IMPORTANT: offer_flags must be an EMPTY LIST [] when the outcome is
 NO_OFFER_AVAILABLE or OFFER_NOT_APPLICABLE.
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE F — Service Recommendation Evaluation Prompt
+#   Focus: did the agent correctly recommend services available for the
+#          patient's specialty from the CRM/hospital database?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_service_prompt(
+    call: "CallTranscript",
+    crm_services_context: str = "",
+) -> str:
+    """
+    Evaluate whether the agent correctly handled service recommendations during
+    the call.
+
+    Parameters
+    ----------
+    call : CallTranscript
+        The call being evaluated.
+    crm_services_context : str
+        Optional: a JSON-serialised list of active services available for
+        the patient's specialty at call time. Pass "" when services cannot
+        be fetched.
+    """
+    crm_section = (
+        f"""
+════════════════════════════════════════════════════════════
+AVAILABLE CRM SERVICES  (active services for this specialty at call time)
+════════════════════════════════════════════════════════════
+{crm_services_context}
+"""
+        if crm_services_context
+        else """
+════════════════════════════════════════════════════════════
+AVAILABLE CRM SERVICES
+════════════════════════════════════════════════════════════
+(CRM service data not available for this evaluation — infer from transcript only)
+"""
+    )
+
+    return f"""
+Evaluate whether the agent correctly identified and recommended appropriate
+services to the patient during the call below.
+
+## YOUR TASK
+1. Determine if the call type warrants a service recommendation check.
+2. Identify whether the agent mentioned any services.
+3. Compare what the agent said against the available CRM services provided below.
+4. Choose exactly ONE outcome and produce appropriate flags.
+5. If there is a service fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched service
+
+## OUTCOME DEFINITIONS
+- SUITABLE_SERVICE_RECOMMENDED    : Agent correctly identified and presented a matching service → positive flag.
+                                    ONLY use this when the service name mentioned by the agent matches a service 
+                                    in the AVAILABLE CRM SERVICES list (check both cr301_service and cr301_servicear fields).
+                                    The match must be exact or semantically equivalent (e.g., "Dental Cleaning" ≈ "تنظيف الأسنان").
+                                    Price and details must also be accurate.
+- SERVICE_SKIPPED                 : Relevant service existed in the CRM list but agent never mentioned it → C2B flag.
+- UNRELATED_SERVICE_RECOMMENDED   : Agent presented a service that does NOT appear in the AVAILABLE CRM SERVICES list → C2B flag.
+- SERVICE_MISREPRESENTED          : Agent mentioned a service that exists in the CRM list but stated incorrect 
+                                    price, name spelling, or details → C2B flag.
+- INCOMPLETE_SERVICE_PRESENTATION : Service mentioned correctly but key details (price, code) omitted → NC flag.
+- NO_SERVICE_AVAILABLE            : No active service exists for this specialty in the CRM list → no flag.
+- SERVICE_NOT_APPLICABLE          : Call type doesn't warrant service check (complaint, admin, etc.) → no flag.
+
+## IMPORTANT RULES — READ CAREFULLY
+- **STRICT MATCHING REQUIRED**: You can ONLY select SUITABLE_SERVICE_RECOMMENDED if:
+  1. The agent mentioned a service by name (in Arabic or English)
+  2. That exact service name appears in the AVAILABLE CRM SERVICES section below
+  3. The agent provided accurate price and details matching the CRM record
+  4. If the service name does NOT appear in the CRM list → choose UNRELATED_SERVICE_RECOMMENDED or SERVICE_SKIPPED
+  
+- Do NOT penalise when CRM services context is absent (shows "CRM service data not available").
+- Do NOT penalise when patient explicitly declined a correctly presented service.
+- Short calls (< 90 seconds) with no specialty signal → SERVICE_NOT_APPLICABLE.
+- **KEYWORD DETECTION**: If the agent mentioned any of these patterns in the transcript:
+  • English words in Arabic context (e.g., "CBC", "CT Scan", "MRI", "X-Ray", "ECG", "Ultrasound") → extract the English word as the service name
+  • Arabic service trigger words: فحص، فحوصات، تحليل، تحاليل، أشعة، تصوير، صورة، سونار، رنين، مقطعية، إيكو، دوبلر
+    → extract the 2-4 words AFTER the trigger as the actual service name (e.g., "فحص السكر" → extract "السكر")
+  • Then check if that extracted name matches any service in the AVAILABLE CRM SERVICES list below
+  • The trigger words themselves (فحص، تحليل، etc.) are NOT the service name — they indicate intent only
+- **CRITICAL**: If the agent mentioned a service but you cannot find it in the AVAILABLE CRM SERVICES list below, 
+  you MUST choose UNRELATED_SERVICE_RECOMMENDED or NO_SERVICE_AVAILABLE — never SUITABLE_SERVICE_RECOMMENDED.
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Department: {call.department}
+
+{crm_section}
+════════════════════════════════════════════════════════════
+TRANSCRIPT
+════════════════════════════════════════════════════════════
+{call.transcript}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "service_outcome": "<SUITABLE_SERVICE_RECOMMENDED | SERVICE_SKIPPED | UNRELATED_SERVICE_RECOMMENDED | SERVICE_MISREPRESENTED | INCOMPLETE_SERVICE_PRESENTATION | NO_SERVICE_AVAILABLE | SERVICE_NOT_APPLICABLE>",
+  "service_reasoning": "<2-3 sentences citing specific transcript evidence. 
+                        If you chose SUITABLE_SERVICE_RECOMMENDED, you MUST state which service from the 
+                        AVAILABLE CRM SERVICES list matched what the agent said (include the service name 
+                        and code from the CRM list). If you chose UNRELATED_SERVICE_RECOMMENDED, explain 
+                        that the service mentioned by the agent does not appear in the CRM list.>",
+  "service_flags": [
+    {{
+      "type": "<C2B | NC | positive>",
+      "severity": "<critical | positive>",
+      "description": "<1-2 sentences. If positive flag, state the CRM service name and code that matched.>",
+      "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
+    }}
+  ]
+}}
+
+IMPORTANT: service_flags must be an EMPTY LIST [] when the outcome is
+NO_SERVICE_AVAILABLE or SERVICE_NOT_APPLICABLE.
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE G — Package Recommendation Evaluation Prompt
+#   Focus: did the agent correctly recommend packages available for the
+#          patient's specialty from the CRM/hospital database?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_package_prompt(
+    call: "CallTranscript",
+    crm_packages_context: str = "",
+) -> str:
+    """
+    Evaluate whether the agent correctly handled package recommendations during
+    the call.
+
+    Parameters
+    ----------
+    call : CallTranscript
+        The call being evaluated.
+    crm_packages_context : str
+        Optional: a JSON-serialised list of active packages available for
+        the patient's specialty at call time. Pass "" when packages cannot
+        be fetched.
+    """
+    crm_section = (
+        f"""
+════════════════════════════════════════════════════════════
+AVAILABLE CRM PACKAGES  (active packages for this specialty at call time)
+════════════════════════════════════════════════════════════
+{crm_packages_context}
+"""
+        if crm_packages_context
+        else """
+════════════════════════════════════════════════════════════
+AVAILABLE CRM PACKAGES
+════════════════════════════════════════════════════════════
+(CRM package data not available for this evaluation — infer from transcript only)
+"""
+    )
+
+    return f"""
+Evaluate whether the agent correctly identified and recommended appropriate
+packages to the patient during the call below.
+
+## YOUR TASK
+1. Determine if the call type warrants a package recommendation check.
+2. Identify whether the agent mentioned any packages.
+3. Compare what the agent said against the available CRM packages provided below.
+4. Choose exactly ONE outcome and produce appropriate flags.
+5. If there is a package fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched package
+
+
+## OUTCOME DEFINITIONS
+- SUITABLE_PACKAGE_RECOMMENDED    : Agent correctly identified and presented a matching package → positive flag.
+                                    ONLY use this when the package name mentioned by the agent matches a package 
+                                    in the AVAILABLE CRM PACKAGES list (check both cr301_service and cr301_servicear fields).
+                                    The match must be exact or semantically equivalent (e.g., "Dental Package" ≈ "باقة الأسنان").
+                                    Price and details must also be accurate.
+- PACKAGE_SKIPPED                 : Relevant package existed in the CRM list but agent never mentioned it → C2B flag.
+- UNRELATED_PACKAGE_RECOMMENDED   : Agent presented a package that does NOT appear in the AVAILABLE CRM PACKAGES list → C2B flag.
+- PACKAGE_MISREPRESENTED          : Agent mentioned a package that exists in the CRM list but stated incorrect 
+                                    price, name spelling, or details → C2B flag.
+- INCOMPLETE_PACKAGE_PRESENTATION : Package mentioned correctly but key details (price, code) omitted → NC flag.
+- NO_PACKAGE_AVAILABLE            : No active package exists for this specialty in the CRM list → no flag.
+- PACKAGE_NOT_APPLICABLE          : Call type doesn't warrant package check (complaint, admin, etc.) → no flag.
+
+## IMPORTANT RULES — READ CAREFULLY
+- **STRICT MATCHING REQUIRED**: You can ONLY select SUITABLE_PACKAGE_RECOMMENDED if:
+  1. The agent mentioned a package by name (in Arabic or English)
+  2. That exact package name appears in the AVAILABLE CRM PACKAGES section below
+  3. The agent provided accurate price and details matching the CRM record
+  4. If the package name does NOT appear in the CRM list → choose UNRELATED_PACKAGE_RECOMMENDED or PACKAGE_SKIPPED
+  
+- Do NOT penalise when CRM packages context is absent (shows "CRM package data not available").
+- Do NOT penalise when patient explicitly declined a correctly presented package.
+- Short calls (< 90 seconds) with no specialty signal → PACKAGE_NOT_APPLICABLE.
+- **KEYWORD DETECTION**: If the agent mentioned any of these patterns in the transcript:
+  • English words in Arabic context (e.g., "VIP Package", "Prenatal Care", "Diabetes Package") → extract the English phrase as the package name
+  • Arabic package trigger words: باقة، باقات، برنامج، برامج، عرض، عروض، شامل، شاملة، كامل، كاملة، متكامل، متكاملة
+    → extract the 2-4 words AFTER the trigger as the actual package name (e.g., "باقة السكري المتكاملة" → extract "السكري المتكاملة")
+  • Then check if that extracted name matches any package in the AVAILABLE CRM PACKAGES list below
+  • The trigger words themselves (باقة، عرض، etc.) are NOT the package name — they indicate intent only
+- **CRITICAL**: If the agent mentioned a package but you cannot find it in the AVAILABLE CRM PACKAGES list below, 
+  you MUST choose UNRELATED_PACKAGE_RECOMMENDED or NO_PACKAGE_AVAILABLE — never SUITABLE_PACKAGE_RECOMMENDED.
+- Report at most 1 package flag per call.
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Department: {call.department}
+
+{crm_section}
+════════════════════════════════════════════════════════════
+TRANSCRIPT
+════════════════════════════════════════════════════════════
+{call.transcript}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "package_outcome": "<SUITABLE_PACKAGE_RECOMMENDED | PACKAGE_SKIPPED | UNRELATED_PACKAGE_RECOMMENDED | PACKAGE_MISREPRESENTED | INCOMPLETE_PACKAGE_PRESENTATION | NO_PACKAGE_AVAILABLE | PACKAGE_NOT_APPLICABLE>",
+  "package_reasoning": "<2-3 sentences citing specific transcript evidence. 
+                        If you chose SUITABLE_PACKAGE_RECOMMENDED, you MUST state which package from the 
+                        AVAILABLE CRM PACKAGES list matched what the agent said (include the package name 
+                        and code from the CRM list). If you chose UNRELATED_PACKAGE_RECOMMENDED, explain 
+                        that the package mentioned by the agent does not appear in the CRM list.>",
+  "package_flags": [
+    {{
+      "type": "<C2B | NC | positive>",
+      "severity": "<critical | positive>",
+      "description": "<1-2 sentences. If positive flag, state the CRM package name and code that matched.>",
+      "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
+    }}
+  ]
+}}
+
+IMPORTANT: package_flags must be an EMPTY LIST [] when the outcome is
+NO_PACKAGE_AVAILABLE or PACKAGE_NOT_APPLICABLE.
 """
 
 
@@ -685,7 +935,10 @@ You are a medical-call data extractor. Given the following call transcript, extr
 2. The doctor's full name (exactly as mentioned, or null if not mentioned).
 3. The medical specialty name (e.g. "cardiology", "dermatology", or null if not mentioned).
 4. Patient Name for the reservation (exactly as mentioned, or null if not mentioned).
-5. The name of any promotional offer explicitly mentioned by name (e.g. "باقة الصحة المتكاملة", "عرض الليزر"), or null if no specific offer name was mentioned.
+5. The name of any promotional offer explicitly mentioned. Follow these rules:
+   - If the word "عرض" appears, extract the words that immediately follow it as the offer name (e.g. "عرض الليزر" → "عرض الليزر", "عرض تنظيف الأسنان" → "عرض تنظيف الأسنان").
+   - Also capture named packages introduced by "باقة" (e.g. "باقة الصحة المتكاملة").
+   - If neither pattern is found, return null.
 
 Do not guess or infer information that is not explicitly stated in the transcript.
 Do not refine any information

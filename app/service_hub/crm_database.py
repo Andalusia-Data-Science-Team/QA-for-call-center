@@ -254,14 +254,34 @@ _QUERY_VARIANTS = [
 ]
  
  
-def _run_query_with_retry(query: str, max_attempts: int = 3) -> list[dict]:
-    """Open a fresh connection and execute the query, retrying on transient errors."""
+def _run_query_with_retry(query: str, max_attempts: int = 3, params: dict | None = None) -> list[dict]:
+    """Open a fresh connection and execute the query, retrying on transient errors.
+
+    Args:
+        query:       SQL string, may contain pyodbc named placeholders (:name).
+        max_attempts: Number of retry attempts on transient errors.
+        params:      Optional dict of bind parameters, e.g. {"bu_name": "AHJ"}.
+                     Placeholders in the query use :name syntax; they are
+                     converted to ? positional markers before execution so
+                     pyodbc (which does not support named params) is happy.
+    """
+    # Convert :name placeholders → ? and build a positional values tuple
+    import re as _re_db
+    _param_values: tuple = ()
+    if params:
+        _keys_in_order: list[str] = _re_db.findall(r":([A-Za-z_][A-Za-z0-9_]*)", query)
+        _param_values = tuple(params[k] for k in _keys_in_order)
+        query = _re_db.sub(r":[A-Za-z_][A-Za-z0-9_]*", "?", query)
+
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
             with _get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(query)
+                if _param_values:
+                    cursor.execute(query, _param_values)
+                else:
+                    cursor.execute(query)
                 cols = [c[0] for c in cursor.description]
                 return [dict(zip(cols, r)) for r in cursor.fetchall()]
         except pyodbc.Error as e:
