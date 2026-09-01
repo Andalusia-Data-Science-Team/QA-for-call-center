@@ -1,0 +1,12 @@
+2026-09-01 15:02:35,862 [INFO] Connecting to SharePoint: https://andalusiagroupegypt.sharepoint.com/sites/AHJ/Medical/Lists/FAQ/AllItems.aspx
+2026-09-01 15:02:35,862 [ERROR] Failed to connect to SharePoint: 'ClientContext' object has no attribute 'with_ntlm'
+2026-09-01 15:05:29,697 [INFO] Connecting to SharePoint: https://andalusiagroupegypt.sharepoint.com/sites/AHJ/Medical/Lists/FAQ/AllItems.aspx
+2026-09-01 15:05:29,697 [ERROR] Failed to connect to SharePoint: with_user_credentials uses the legacy SAML/ACS auth flow which Microsoft has retired for SharePoint Online. Use with_username_and_password(tenant, client_id, username, password) instead. For on-premises SharePoint, use allow_ntlm=True.
+2026-09-01 15:07:55,825 [INFO] Connecting to SharePoint: https://andalusiagroupegypt.sharepoint.com/sites/AHJ/Medical
+2026-09-01 15:07:55,826 [ERROR] Failed to connect to SharePoint: Missing SharePoint Online configuration: SP_TENANT, SP_CLIENT_ID, SP_USERNAME, SP_PASSWORD
+2026-09-01 15:34:57,770 [INFO] Connecting to SharePoint: https://andalusiagroupegypt.sharepoint.com/sites/AHJ/Medical
+2026-09-01 15:34:57,770 [ERROR] Failed to connect to SharePoint: Missing SharePoint Online configuration: SP_TENANT, SP_CLIENT_ID, SP_USERNAME, SP_PASSWORD
+2026-09-01 15:42:40,381 [INFO] Connecting to SharePoint: https://andalusiagroupegypt.sharepoint.com/sites/AHJ/Medical
+2026-09-01 15:42:40,381 [ERROR] Failed to connect to SharePoint: Missing SharePoint Online configuration: SP_TENANT, SP_CLIENT_ID
+2026-09-01 15:45:29,874 [INFO] Connecting to SharePoint: https://andalusiagroupegypt.sharepoint.com/sites/AHJ/Medical
+2026-09-01 15:45:29,874 [ERROR] Failed to connect to SharePoint: Missing SharePoint Online configuration: SP_TENANT

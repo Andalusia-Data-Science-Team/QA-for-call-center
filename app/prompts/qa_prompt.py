@@ -401,6 +401,7 @@ evaluated in three separate passes. Your job is to:
   7. Aggregate strengths and improvements from behavioral sub-evaluation.
   8. Assign Agent Classification based on the violation counts below.
   9. Assign Profiling Comment ONLY if there is a clear performance issue — otherwise omit it (null).
+  10. if there is a misrepresented or said any incorrect information about offer, service, package flag the conversations as needs review and mention the misrepresented offer, service, package in the assessment_reasoning.
 
 Agent Classification criteria:
 A  -> No C2C, C2B, C2Com or NC violations
