@@ -77,6 +77,18 @@ def _trace(_state: AgentState, node: str) -> list[str]:
     return [node]
 
 
+def _eligibility_evaluation_context(eligibility_result: Optional[dict]) -> str:
+    """Return an authoritative eligibility fact only when the API result is conclusive."""
+    if not eligibility_result or eligibility_result.get("api_status") != "Success":
+        return "No conclusive eligibility result is available."
+
+    outcome = "ELIGIBLE" if eligibility_result.get("is_eligible") else "NOT ELIGIBLE"
+    return (
+        "Authoritative eligibility API result: the patient is "
+        f"{outcome}. This is the reference outcome for this call."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Node 1 – load_call
 #   Validates the CallTranscript exists in state and initialises the trace.
@@ -248,6 +260,37 @@ async def load_scoring_weights(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _escape_json_string_controls(payload: str) -> str:
+    """Escape raw control characters inside JSON strings emitted by an LLM."""
+    repaired: list[str] = []
+    in_string = False
+    escaped = False
+    for char in payload:
+        if in_string:
+            if escaped:
+                repaired.append(char)
+                escaped = False
+            elif char == "\\":
+                repaired.append(char)
+                escaped = True
+            elif char == '"':
+                repaired.append(char)
+                in_string = False
+            elif char == "\n":
+                repaired.append("\\n")
+            elif char == "\r":
+                repaired.append("\\r")
+            elif char == "\t":
+                repaired.append("\\t")
+            else:
+                repaired.append(char)
+        else:
+            repaired.append(char)
+            if char == '"':
+                in_string = True
+    return "".join(repaired)
+
+
 async def _focused_llm_call(
     node_name: str,
     call_id: str,
@@ -282,15 +325,26 @@ async def _focused_llm_call(
     try:
         data: dict = json.loads(clean)
     except json.JSONDecodeError as exc:
-        logger.error(
-            "%s JSON parse error | call_id=%s snippet=%s | %s",
-            node_name, call_id, raw_text[:300], exc,
-        )
-        return None, {
-            "error": f"{node_name}: LLM returned invalid JSON: {exc}",
-            "error_node": node_name,
-            "node_trace": _trace(state, node_name),
-        }
+        # Models occasionally emit a raw newline inside a JSON string. Escape
+        # only those invalid control characters before failing the QA run.
+        try:
+            data = json.loads(_escape_json_string_controls(clean))
+            if not isinstance(data, dict):
+                raise ValueError("repaired response is not a JSON object")
+            logger.warning(
+                "%s JSON repaired | call_id=%s original_error=%s",
+                node_name, call_id, exc,
+            )
+        except (json.JSONDecodeError, ValueError) as repair_exc:
+            logger.error(
+                "%s JSON parse error | call_id=%s snippet=%s | %s",
+                node_name, call_id, raw_text[:300], exc,
+            )
+            return None, {
+                "error": f"{node_name}: LLM returned invalid JSON: {exc}; repair failed: {repair_exc}",
+                "error_node": node_name,
+                "node_trace": _trace(state, node_name),
+            }
 
     return data, None
 
@@ -352,6 +406,9 @@ async def infer_compliance_evaluation(
     user_prompt = build_compliance_prompt(
         call,
         compliance_pillars=state.get("compliance_pillars", ""),
+        eligibility_context=_eligibility_evaluation_context(
+            state.get("eligibility_result")
+        ),
     )
     logger.debug(
         "infer_compliance_evaluation | call_id=%s prompt_len=%d",
@@ -412,6 +469,7 @@ async def infer_reservation_evaluation(
         call,
         appointment_verification=state.get("appointment_verification", ""),
         reservation_pillars=state.get("reservation_pillars", ""),
+        eligibility_result=state.get("eligibility_result"),
     )
     logger.debug(
         "infer_reservation_evaluation | call_id=%s prompt_len=%d",
@@ -428,6 +486,57 @@ async def infer_reservation_evaluation(
         "reservation_eval": data,
         "usage_list": [data.get("_usage", {})],
         "node_trace": _trace(state, "infer_reservation_evaluation"),
+    }
+
+
+def _reservation_transcript_excerpt(state: AgentState) -> str:
+    """Return a short verbatim agent turn to accompany a reservation finding."""
+    call = state.get("call")
+    transcript = getattr(call, "transcript", None)
+    turns = [transcript] if isinstance(transcript, str) else (transcript or [])
+    for turn in turns:
+        text = turn if isinstance(turn, str) else getattr(turn, "text", "")
+        for line in str(text).splitlines():
+            if "agent:" in line.lower() and any(keyword in line for keyword in _BOOKING_KEYWORDS):
+                return line.strip()
+    return ""
+
+
+async def enforce_ineligible_reservation_violation(state: AgentState) -> dict:
+    """Ensure an ineligible patient with a persisted reservation gets C2C_005."""
+    eligibility = state.get("eligibility_result") or {}
+    verification = state.get("appointment_verification") or {}
+    is_conclusively_ineligible = (
+        eligibility.get("http_status") == 200
+        and eligibility.get("is_eligible") is False
+        and eligibility.get("api_status") in {"Fail", "Success"}
+    )
+    if not (is_conclusively_ineligible and verification.get("found") is True):
+        return {"node_trace": _trace(state, "enforce_ineligible_reservation_violation")}
+
+    reservation_eval = dict(state.get("reservation_eval") or {})
+    flags = list(reservation_eval.get("reservation_flags", []))
+    if not any("C2C_005" in flag.get("description", "") for flag in flags):
+        flags.append(
+            {
+                "type": "C2C",
+                "severity": "critical",
+                "description": (
+                    "Submitting the right action on the system / C2C_005: "
+                    "Made wrong reservation for a patient whose eligibility check failed."
+                ),
+                "transcript_excerpt": _reservation_transcript_excerpt(state),
+            }
+        )
+        reservation_eval["reservation_flags"] = flags
+        logger.warning(
+            "enforce_ineligible_reservation_violation | call_id=%s persisted reservation found for ineligible patient",
+            state["call"].call_id,
+        )
+
+    return {
+        "reservation_eval": reservation_eval,
+        "node_trace": _trace(state, "enforce_ineligible_reservation_violation"),
     }
 
 # ---------------------------------------------------------------------------
@@ -589,40 +698,60 @@ def _extract_service_name_from_transcript(transcript: str) -> str:
     
     import re
     
-    # Strategy 1: Extract full English service names (multi-word, uppercase patterns)
-    # Pattern: 2-8 consecutive uppercase words, may include:
-    #   - Common medical abbreviations (MRI, CT, U/S, CBC, etc.)
-    #   - Anatomical terms (BRAIN, CHEST, ABDOMEN, etc.)
-    #   - Qualifiers (WITH/WITHOUT CONTRAST, COMPLETE, etc.)
-    # Examples: "MRI BRAIN WITH CONTRAST", "CT CHEST WITHOUT CONTRAST", "CBC"
-    english_service_names = re.findall(
-        r'\b[A-Z][A-Z\s/\.\-]{3,}[A-Z]\b',  # Uppercase sequence (min 5 chars total)
-        transcript,
-    )
-    
-    # Filter to keep only medical-looking service names (contain medical keywords)
+    # Strategy 1: Extract every uppercase English service line independently.
+    # Service lists are commonly one item per line followed by a price. Do not
+    # use ``\s`` across the entire transcript because it consumes newlines and
+    # merges multiple services into one candidate.
     _MEDICAL_KEYWORDS = {
-        'MRI', 'CT', 'SCAN', 'X-RAY', 'XRAY', 'U/S', 'ULTRASOUND', 'ECHO',
+        'MRI', 'CT', 'SCAN', 'X-RAY', 'X RAY', 'XRAY', 'U/S', 'ULTRASOUND', 'ECHO',
         'CBC', 'ESR', 'CRP', 'TSH', 'ALT', 'AST', 'ECG', 'EKG',
         'BRAIN', 'CHEST', 'ABDOMEN', 'PELVIS', 'SPINE', 'HEAD', 'NECK',
         'CONTRAST', 'WITHOUT', 'WITH', 'COMPLETE', 'BLOOD', 'COUNT',
-        'BONE', 'WINDOW', 'SOFT', 'TISSUE', 'TEST', 'SCREENING'
+        'BONE', 'WINDOW', 'SOFT', 'TISSUE', 'TEST', 'SCREENING',
+        'CREATININE', 'UREA', 'NITROGEN', 'ANTIGEN', 'TUMOR', 'MARKER',
+        'SERUM', 'SGPT', 'SGOT', 'DENSITOMETRY', 'SCOLIOSIS', 'KYPHOSIS',
     }
-    
-    matched_services = []
-    for candidate in english_service_names:
-        candidate_clean = candidate.strip()
-        # Check if candidate contains at least one medical keyword
-        if any(keyword in candidate_clean.upper() for keyword in _MEDICAL_KEYWORDS):
-            # Deduplicate: only add if not already in the list
-            if candidate_clean not in matched_services:
-                matched_services.append(candidate_clean)
-    
+    _PRICE_SUFFIX = re.compile(
+        r'\s+\d+(?:\.\d+)?\s*(?:sar|sr|ريال(?:\s+سعودي)?)\b.*$',
+        re.IGNORECASE,
+    )
+    _SPEAKER_PREFIX = re.compile(r'^(?:agent|patient)\s*:\s*', re.IGNORECASE)
+
+    # Prefer the agent's explicitly quoted service names. Patient phrasing can
+    # be descriptive and may otherwise produce an unrelated fuzzy CRM match.
+    agent_services: list[str] = []
+    other_services: list[str] = []
+    current_speaker = ''
+    for raw_line in transcript.splitlines():
+        # Transcript exports prefix only the first line of a multi-line turn.
+        # Keep that speaker until a later explicit Agent:/Patient: prefix.
+        speaker_match = _SPEAKER_PREFIX.match(raw_line)
+        if speaker_match:
+            current_speaker = raw_line.split(':', 1)[0].strip().lower()
+        is_agent_line = current_speaker == 'agent'
+        candidate = _SPEAKER_PREFIX.sub('', raw_line).strip()
+        candidate = _PRICE_SUFFIX.sub('', candidate).strip(' -:')
+        candidate_upper = candidate.upper()
+        # Do not turn lowercase explanatory text into a service by uppercasing
+        # it first. The dedicated lowercase fallback below handles true
+        # mixed-case service requests when no technical service line is found.
+        if not candidate or not re.search(r'[A-Z]', candidate):
+            continue
+        if not any(keyword in candidate_upper for keyword in _MEDICAL_KEYWORDS):
+            continue
+        services = agent_services if is_agent_line else other_services
+        if candidate not in services:
+            services.append(candidate)
+
+    matched_services = agent_services or other_services
     if matched_services:
-        logger.info(f"_extract_service_name_from_transcript | extracted {len(matched_services)} English service name(s): {matched_services}")
-        # Return all services joined by newline for multi-service matching
+        logger.info(
+            "_extract_service_name_from_transcript | extracted %d English service name(s): %s",
+            len(matched_services),
+            matched_services,
+        )
         return "\n".join(matched_services)
-    
+
     # Strategy 1b: Extract lowercase/mixed-case English medical phrases
     # Pattern: 2-4 English words that include medical terms (case-insensitive)
     # Examples: "anomaly scan", "glucose test", "blood pressure"
@@ -877,12 +1006,23 @@ async def fetch_crm_services_for_call(state: AgentState) -> dict:
         lines.append("")
 
     context = "\n".join(lines)
+    matched_services = [
+        {
+            "arabic_name": str(svc.get("cr301_servicear") or svc.get("cr301_service") or "N/A"),
+            "english_name": str(svc.get("cr301_title") or "N/A"),
+            "code": str(svc.get("cr301_code") or "N/A"),
+            "price": str(svc.get("servhub_priced") or svc.get("cr301_price") or "N/A"),
+        }
+        for svc in services
+        if svc.get("_service_matched") is True
+    ]
     logger.info(
         "fetch_crm_services_for_call | call_id=%s — serialised %d service(s) from %d hint(s) (%d chars)",
         call_id, len(services), len(service_hints), len(context),
     )
     return {
         "crm_services_context": context,
+        "crm_matched_services": matched_services,
         "node_trace": _trace(state, "fetch_crm_services_for_call"),
     }
 
@@ -1063,6 +1203,15 @@ async def infer_offer_evaluation(
     }
 
 
+def _format_matched_services_summary(matched_services: list[dict[str, str]]) -> str:
+    """Build a complete audit summary from CRM records, outside the LLM JSON."""
+    details = [
+        "{arabic_name} / {english_name} (Code: {code}, Price: {price} SAR)".format(**service)
+        for service in matched_services
+    ]
+    return "Agent accurately provided the details and price for the following CRM-matched services: " + "; ".join(details)
+
+
 # ---------------------------------------------------------------------------
 # Node H – infer_service_evaluation
 #   Focused LLM call: did the agent correctly recommend services available
@@ -1106,6 +1255,25 @@ async def infer_service_evaluation(
         return err
 
     outcome = data.get("service_outcome", "SERVICE_NOT_APPLICABLE")
+    matched_services = state.get("crm_matched_services") or []
+    if outcome == "SUITABLE_SERVICE_RECOMMENDED" and matched_services:
+        summary = _format_matched_services_summary(matched_services)
+        data["service_reasoning"] = summary
+        flags = list(data.get("service_flags") or [])
+        positive_flag = next((flag for flag in flags if flag.get("type") == "positive"), None)
+        if positive_flag is None:
+            flags.append(
+                {
+                    "type": "positive",
+                    "severity": "positive",
+                    "description": summary,
+                    "transcript_excerpt": "N/A",
+                }
+            )
+        else:
+            positive_flag["description"] = summary
+        data["service_flags"] = flags
+
     logger.info(
         "infer_service_evaluation | call_id=%s outcome=%s flags=%d",
         call.call_id,
@@ -1264,6 +1432,49 @@ async def infer_overall_scoring(
     }
 
 
+def _filter_unsubstantiated_reservation_flags(
+    flags: list[dict], state: AgentState
+) -> list[dict]:
+    """Keep verified bookings from being misreported as doctor/specialty errors."""
+    verification = state.get("appointment_verification") or {}
+    eligibility = state.get("eligibility_result") or {}
+    is_conclusively_ineligible = (
+        eligibility.get("http_status") == 200
+        and eligibility.get("is_eligible") is False
+        and eligibility.get("api_status") in {"Fail", "Success"}
+    )
+    if verification.get("found") is not True:
+        return flags
+
+    # A verified ineligible reservation may retain only the appropriate C2C_005
+    # finding; doctor/specialty mismatch claims remain unsupported either way.
+    unsupported_markers = (
+        "wrong doctor",
+        "wrong specialty",
+        "wrong appointment",
+        "doctor and specialty",
+        "incorrect doctor",
+        "incorrect specialty",
+    )
+    if not is_conclusively_ineligible:
+        unsupported_markers += (
+            "c2c_005",
+            "wrong reservation",
+            "booking error",
+        )
+    filtered = [
+        flag for flag in flags
+        if not any(marker in flag.get("description", "").lower() for marker in unsupported_markers)
+    ]
+    if len(filtered) != len(flags):
+        logger.warning(
+            "aggregate_results: removed %d unsupported reservation mismatch flag(s) for verified booking | call_id=%s",
+            len(flags) - len(filtered),
+            state["call"].call_id,
+        )
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Node E – aggregate_results
 #   Fan-in barrier: merges the four sub-evaluation dicts into one
@@ -1344,6 +1555,8 @@ async def aggregate_results(state: AgentState) -> dict:
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
+
+    all_flags = _filter_unsubstantiated_reservation_flags(all_flags, state)
 
     # Deduplicate flags by (type + transcript_excerpt[:80])
     seen: set[tuple] = set()
@@ -1451,6 +1664,26 @@ async def integrity_check(state: AgentState) -> dict:
             call_id,
         )
         result = result.model_copy(update={"escalation_required": True})
+
+    has_critical_eligibility_error = any(
+        flag.severity == "critical" and "C2C_030" in flag.description
+        for flag in result.compliance_flags
+    )
+    if has_critical_eligibility_error:
+        logger.warning(
+            "integrity_check: critical eligibility misinformation detected | call_id=%s",
+            call_id,
+        )
+        result = result.model_copy(
+            update={
+                "overall_assessment": "escalate",
+                "escalation_required": True,
+                "escalation_reason": (
+                    "Critical eligibility misinformation: the agent stated an outcome "
+                    "that conflicts with the eligibility API result."
+                ),
+            }
+        )
 
     return {
         "result": result,
@@ -1612,6 +1845,107 @@ _OFFER_KEYWORDS: list[str] = [
     "كود الخصم",      # "discount code"
 ]
 
+_INSURANCE_QUESTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"كاش\s*(?:او|أو|ام)\s*ت(?:ا|أ)مين", re.IGNORECASE),
+    re.compile(r"الحجز\s+كاش\s*(?:او|أو|ام)\s*ت(?:ا|أ)مين", re.IGNORECASE),
+    re.compile(r"cash\s*(?:or|/)\s*insurance", re.IGNORECASE),
+    re.compile(r"insured\s+or\s+cash", re.IGNORECASE),
+]
+
+_INSURED_REPLY_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\binsured\b", re.IGNORECASE),
+    re.compile(r"\binsurance\b", re.IGNORECASE),
+    re.compile(r"\bمؤمن\b", re.IGNORECASE),
+    re.compile(r"\bت(?:ا|أ)مين\b", re.IGNORECASE),
+]
+
+_CASH_OR_UNINSURED_REPLY_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bcash\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+insured\b", re.IGNORECASE),
+    re.compile(r"\bno\s+insurance\b", re.IGNORECASE),
+    re.compile(r"\bكاش\b", re.IGNORECASE),
+    re.compile(r"\bنقد(?:ي|ا)?\b", re.IGNORECASE),
+    re.compile(r"(?:غير|مو)\s*مؤمن", re.IGNORECASE),
+    re.compile(r"(?:ما|لا)\s*(?:عندي|لدي|يوجد)?\s*ت(?:ا|أ)مين", re.IGNORECASE),
+    re.compile(r"بدون\s*ت(?:ا|أ)مين", re.IGNORECASE),
+]
+
+_IQAMA_NUMBER_PATTERN = re.compile(
+    r"(?:iqama|i?qama|رقم\s*(?:ال)?(?:اقامة|إقامة)|(?:ال)?(?:اقامة|إقامة))?\D*([12]\d{9})",
+    re.IGNORECASE,
+)
+
+_IDENTITY_OR_IQAMA_REQUEST_PATTERN = re.compile(
+    r"(?:رقم\s*(?:ال)?(?:هوية|هويتك|اقامة|إقامة|اقامتك|إقامتك)|(?:iqama|i?qama)(?:\s*(?:number|no\.?))?)",
+    re.IGNORECASE,
+)
+
+
+def _extract_iqama_number(text: str) -> str | None:
+    """Return the first 10-digit iqama-like number found in the transcript."""
+    if not text:
+        return None
+
+    match = _IQAMA_NUMBER_PATTERN.search(text)
+    if match:
+        return match.group(1)
+
+    fallback = re.search(r"\b([12]\d{9})\b", text)
+    if fallback:
+        return fallback.group(1)
+
+    return None
+
+
+def _agent_requested_identity_or_iqama(transcript_text: str) -> bool:
+    """Return True when the agent requests an identity or IQAMA number."""
+    if not transcript_text:
+        return False
+
+    return any(
+        "agent:" in line.lower() and _IDENTITY_OR_IQAMA_REQUEST_PATTERN.search(line)
+        for line in transcript_text.splitlines()
+    )
+
+
+def _patient_declined_insurance(transcript_text: str) -> bool:
+    """Return True when the patient explicitly selects cash or no insurance."""
+    if not transcript_text:
+        return False
+
+    return any(
+        "patient:" in line.lower()
+        and any(pattern.search(line) for pattern in _CASH_OR_UNINSURED_REPLY_PATTERNS)
+        for line in transcript_text.splitlines()
+    )
+
+
+def _patient_selected_insured(transcript_text: str) -> bool:
+    """
+    Detect the flow where the agent asks for payment type and the patient
+    responds that the booking is insured.
+    """
+    if not transcript_text:
+        return False
+
+    lines = [line.strip() for line in transcript_text.splitlines() if line.strip()]
+
+    for index, line in enumerate(lines):
+        if "agent:" not in line.lower():
+            continue
+        if not any(pattern.search(line) for pattern in _INSURANCE_QUESTION_PATTERNS):
+            continue
+
+        for reply in lines[index + 1:index + 4]:
+            if "agent:" in reply.lower():
+                break
+            if "patient:" in reply.lower() and any(
+                pattern.search(reply) for pattern in _INSURED_REPLY_PATTERNS
+            ):
+                return True
+
+    return False
+
 
 async def detect_intent(state: AgentState) -> dict:
     """
@@ -1660,7 +1994,6 @@ async def detect_intent(state: AgentState) -> dict:
 
     matched_booking = [kw for kw in _BOOKING_KEYWORDS if kw in transcript_text]
     matched_offer   = [kw for kw in _OFFER_KEYWORDS   if kw in transcript_text]
-
     is_booking = bool(matched_booking)
     # offer_only: offer keywords found but NO booking keywords
     # (if both appear, the booking flow already handles everything)
@@ -1687,6 +2020,53 @@ async def detect_intent(state: AgentState) -> dict:
         "is_offer_intent":   is_offer,
         "intent_label":      intent_label,
         "node_trace": _trace(state, "detect_intent"),
+    }
+
+
+async def detect_insurance_intent(state: AgentState) -> dict:
+    """Detect insurance flow from coverage selection or an identity/IQAMA request."""
+    call = state.get("call")
+    if call is None:
+        return {
+            "patient_is_insured": False,
+            "patient_declined_insurance": False,
+            "is_insurance_intent": False,
+            "node_trace": _trace(state, "detect_insurance_intent"),
+        }
+
+    try:
+        raw_turns = call.transcript or []
+        transcript_text = "".join(
+            turn if isinstance(turn, str) else turn.text
+            for turn in raw_turns
+            if (turn if isinstance(turn, str) else getattr(turn, "text", None))
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("detect_insurance_intent | failed to read transcript | %s", exc)
+        transcript_text = ""
+
+    patient_is_insured = _patient_selected_insured(transcript_text)
+    patient_declined_insurance = _patient_declined_insurance(transcript_text)
+    identity_or_iqama_requested = _agent_requested_identity_or_iqama(transcript_text)
+    is_insurance_intent = (
+        (patient_is_insured or identity_or_iqama_requested)
+        and not patient_declined_insurance
+    )
+    iqama_number = state.get("iqama_number") or _extract_iqama_number(transcript_text)
+    logger.info(
+        "detect_insurance_intent | call_id=%s insured=%s declined=%s identity_or_iqama_requested=%s iqama=%s",
+        call.call_id,
+        patient_is_insured,
+        patient_declined_insurance,
+        identity_or_iqama_requested,
+        iqama_number or "none",
+    )
+    return {
+        "patient_is_insured": patient_is_insured,
+        "patient_declined_insurance": patient_declined_insurance,
+        "is_insurance_intent": is_insurance_intent,
+        "iqama_number": iqama_number,
+        "node_trace": _trace(state, "detect_insurance_intent"),
     }
 
 
@@ -2040,4 +2420,263 @@ async def verify_appointment_in_db(state: AgentState) -> dict:
             },
             "node_trace": _trace(state, "verify_appointment_in_db"),
         }
+
+"""
+eligibility_node.py
+───────────────────
+LangGraph node: check_patient_eligibility
+
+Position in the booking graph
+──────────────────────────────
+  detect_intent
+       │
+       ▼ (booking intent confirmed)
+  check_patient_eligibility          ← NEW
+       │
+       ├──(eligible)──────────────→  extract_appointment_details
+       ├──(not_eligible)──────────→  handle_ineligible_patient
+       └──(error / timeout)────────→ handle_error
+
+What this node does
+───────────────────
+1. Reads `iqama_number` from state (set by detect_intent or injected by the API layer).
+2. Calls Beneficiary_api() → /check-insurance → insurance coverage snapshot.
+3. Parses the response:
+     • ApiStatus == "Success" + at least one Insurance entry  → eligible
+     • ApiStatus != "Success" or empty Insurance list         → not_eligible
+     • Network / timeout / unexpected exception               → error
+4. Writes the parsed result back into state so downstream nodes
+   (infer_reservation_evaluation, scoring, etc.) can reference it.
+
+NOTE: EligibilityService.process_visit() requires a visit_id (post-booking).
+      Do NOT call it here. Wire it after the appointment is created in the DB.
+"""
+
+#from __future__ import annotations
+
+import logging
+import time
+import random
+from datetime import datetime
+from typing import Any
+
+from app.agent.state import AgentState          # adjust import to your project layout
+from app.eligibilty.eligibility import Beneficiary_api
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_beneficiary_response(iqama: int, raw_response: Any) -> dict:
+    """Parse the `/check-insurance` response into one authoritative outcome."""
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    default = {
+        "iqama_number": iqama,
+        "http_status": None,
+        "api_status": "Unknown",
+        "is_eligible": False,
+        "insurance": None,
+        "error_code": None,
+        "reason": "Invalid eligibility API response",
+        "transaction_name": None,
+        "checked_at": checked_at,
+    }
+    if not isinstance(raw_response, dict):
+        return default
+
+    http_status = raw_response.get("status_code")
+    response = raw_response.get("response")
+    if not isinstance(response, dict):
+        return {**default, "http_status": http_status, "reason": "Missing response payload"}
+
+    api_status = response.get("ApiStatus", "Unknown")
+    insurance_list = response.get("Insurance")
+    error_code = response.get("ErrorCode")
+    error_description = response.get("ErrorDescription")
+    transaction_name = response.get("TransactionName")
+    insurance_entry = (
+        insurance_list[0]
+        if isinstance(insurance_list, list) and insurance_list and isinstance(insurance_list[0], dict)
+        else None
+    )
+
+    is_eligible = (
+        http_status == 200
+        and api_status == "Success"
+        and insurance_entry is not None
+    )
+    if is_eligible:
+        reason = None
+    elif http_status != 200:
+        reason = f"Eligibility API returned HTTP status {http_status!r}"
+    elif api_status == "Fail":
+        reason = error_description or error_code or "Eligibility API reported no coverage"
+    elif api_status == "Success":
+        reason = "Eligibility API returned Success without a valid Insurance entry"
+    else:
+        reason = error_description or "Unknown eligibility API status"
+
+    return {
+        "iqama_number": iqama,
+        "http_status": http_status,
+        "api_status": api_status,
+        "is_eligible": is_eligible,
+        "insurance": insurance_entry,
+        "error_code": error_code,
+        "reason": reason,
+        "transaction_name": transaction_name,
+        "checked_at": checked_at,
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Node
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_patient_eligibility(state: AgentState) -> dict:
+    """
+    LangGraph node — runs BEFORE appointment extraction.
+
+    Reads
+    -----
+    state["iqama_number"]  : str | int   (required)
+
+    Writes
+    ------
+    state["eligibility_result"]  : dict   (always set, even on error)
+    state["error"]               : str    (only on hard failure)
+    """
+    raw_iqama = state.get("iqama_number")
+
+    # ── Guard: iqama_number must be present ─────────────────────────────────
+    if not raw_iqama:
+        logger.warning("check_patient_eligibility: iqama_number missing from state")
+        return {
+            "eligibility_result": {
+                "iqama_number": None,
+                "api_status":   "Fail",
+                "is_eligible":  False,
+                "insurance":    None,
+                "checked_at":   datetime.now().isoformat(timespec="seconds"),
+                "reason":       "iqama_number not provided",
+            }
+        }
+
+    # ── Normalise: convert to int (Beneficiary_api expects int) ─────────────
+    try:
+        iqama = int(str(raw_iqama).strip())
+    except (ValueError, TypeError) as exc:
+        logger.error("check_patient_eligibility: cannot coerce iqama to int — %s", exc)
+        return {
+            "error": f"Invalid Iqama number format: {raw_iqama!r}",
+            "eligibility_result": {
+                "iqama_number": raw_iqama,
+                "api_status":   "Fail",
+                "is_eligible":  False,
+                "insurance":    None,
+                "checked_at":   datetime.now().isoformat(timespec="seconds"),
+                "reason":       f"Non-numeric Iqama: {raw_iqama}",
+            },
+        }
+
+    # ── Call Beneficiary API ─────────────────────────────────────────────────
+    logger.info("check_patient_eligibility: calling Beneficiary_api for iqama=%d", iqama)
+
+    try:
+        # Small random jitter — matches the pattern in Iqama_table()
+        jitter_ms = random.uniform(10, 30)
+        time.sleep(jitter_ms / 1000)
+
+        raw_response = Beneficiary_api(iqama)
+
+    except Exception as exc:
+        logger.exception(
+            "check_patient_eligibility: Beneficiary_api raised an exception: %s", exc
+        )
+        return {
+            "error": f"Eligibility API call failed: {exc}",
+            "eligibility_result": {
+                "iqama_number": iqama,
+                "api_status":   "Fail",
+                "is_eligible":  False,
+                "insurance":    None,
+                "checked_at":   datetime.now().isoformat(timespec="seconds"),
+                "reason":       str(exc),
+            },
+        }
+
+    # ── Parse & classify ─────────────────────────────────────────────────────
+    result = _parse_beneficiary_response(iqama, raw_response)
+
+    if result["is_eligible"]:
+        logger.info(
+            "check_patient_eligibility: iqama=%d → ELIGIBLE (insurer: %s)",
+            iqama,
+            result["insurance"].get("InsuranceCompanyEN", "unknown"),
+        )
+    else:
+        logger.warning(
+            "check_patient_eligibility: iqama=%d → NOT ELIGIBLE (api_status=%s)",
+            iqama,
+            result["api_status"],
+        )
+
+    return {"eligibility_result": result}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Router (add this to graph.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _eligibility_router(state: AgentState):
+    """
+    Conditional edge after check_patient_eligibility.
+
+    Returns
+    -------
+    "eligible"      → proceed to extract_appointment_details
+    "not_eligible"  → route to handle_ineligible_patient (graceful rejection)
+    "error"         → route to handle_error
+    """
+    if state.get("error"):
+        return "error"
+
+    result = state.get("eligibility_result", {})
+
+    if result.get("is_eligible"):
+        return "eligible"
+
+    return "not_eligible"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ineligible handler (simple, no LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def handle_ineligible_patient(state: AgentState) -> dict:
+    """
+    Pure-Python node — no LLM call needed.
+    Records the rejection reason and surfaces a human-readable message
+    that the downstream response builder can include in the agent's reply.
+    """
+    result = state.get("eligibility_result", {})
+    iqama  = result.get("iqama_number", "unknown")
+
+    api_status = result.get("api_status", "Unknown")
+    reason     = result.get("reason", "Insurance coverage not found")
+
+    logger.info(
+        "handle_ineligible_patient: iqama=%s api_status=%s reason=%s",
+        iqama, api_status, reason,
+    )
+
+    return {
+        "ineligible_reason": reason,
+        "final_response": (
+            "عذراً، لم نتمكن من التحقق من تغطيتك التأمينية. "
+            "يرجى التواصل مع شركة التأمين أو زيارة أقرب فرع. "
+            f"(رقم الإقامة: {iqama})"
+        ),
+    }
 

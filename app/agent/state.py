@@ -43,12 +43,29 @@ class AgentState(TypedDict, total=False):
     result: Annotated[Optional[QAAnalysisResult], lambda _old, new: new]
     is_booking_intent: Optional[bool]  # booking/appointment keywords matched
     is_offer_intent: Optional[bool]    # offer/package keywords matched (no DB verify needed)
+    patient_is_insured: Optional[bool] # patient chose insurance after cash/insured prompt
+    patient_declined_insurance: Optional[bool] # patient explicitly selected cash or stated no insurance
+    is_insurance_intent: Optional[bool] # insurance flow detected unless the patient declined insurance
     intent_label: Optional[str]
     appointment_details: Optional[dict[str, Any]]
     appointment_verification: Optional[dict[str, Any]]
     crm_offers_context: Optional[str]    # written by fetch_crm_offers_for_call
     crm_services_context: Optional[str]  # written by fetch_crm_services_for_call
+    crm_matched_services: list[dict[str, str]]  # CRM records that matched services mentioned by the agent
     crm_packages_context: Optional[str]  # written by fetch_crm_packages_for_call
+
+    # ── Eligibility check sub-flow ────────────────────────────────────────
+    # iqama_number        — injected by the API layer from the booking request
+    # eligibility_result  — written by check_patient_eligibility
+    #   keys: iqama_number (int), http_status (int|None), api_status (str),
+    #         is_eligible (bool), insurance (dict|None), error_code (str|None),
+    #         transaction_name (str|None), checked_at (str), reason (str|None)
+    # ineligible_reason   — written by handle_ineligible_patient
+    # final_response      — written by handle_ineligible_patient (bilingual rejection message)
+    iqama_number: Optional[str]
+    eligibility_result: Optional[dict[str, Any]]
+    ineligible_reason: Optional[str]
+    final_response: Optional[str]
 
     # ── Error handling ────────────────────────────────────────────────────
     error: Optional[str]

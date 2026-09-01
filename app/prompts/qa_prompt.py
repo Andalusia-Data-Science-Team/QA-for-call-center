@@ -143,6 +143,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 def build_compliance_prompt(
     call: CallTranscript,
     compliance_pillars: str = "",
+    eligibility_context: str = "",
 ) -> str:
     return f"""\
 Evaluate the call below against the official COMPLIANCE PILLARS only.
@@ -156,6 +157,14 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
 - minor      → small deviation, negligible impact.
 - NOT a violation: a callback promise within a stated window, a patient citing a prior unresolved inquiry,
   the agent deferring a medication availability check to a specialist or pharmacy team.
+
+## ELIGIBILITY ACCURACY - critical rule
+{eligibility_context or "No conclusive eligibility result is available; do not infer or flag eligibility accuracy."}
+When a conclusive eligibility result is provided above, compare it with explicit eligibility statements by the agent.
+If the agent told the patient the opposite eligibility outcome, flag exactly one critical C2C violation under
+"Provide complete accurate and relevant information" / `C2C_030`.
+Do not flag uncertainty, a pending-check statement, or an eligibility conclusion made without a conclusive
+reference result.
 
 ## WHAT DOES NOT CONSTITUTE "INACCURATE INFORMATION"
   Saying "we will contact you within 30 minutes" is a service commitment — not inaccurate information.
@@ -202,7 +211,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
     {{
       "type": "<C2Com | C2C | C2B | NC>",
       "severity": "<critical | positive>",
-      "description": "<1-2 sentences referencing the exact pillar name>",
+      "description": "<1-2 sentences referencing the exact pillar name and id>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
   ]
@@ -219,12 +228,18 @@ def build_reservation_prompt(
     call: CallTranscript,
     appointment_verification: str,
     reservation_pillars: str = "",
+    eligibility_result: dict | None = None,
 ) -> str:
     return f"""\
 Evaluate the call below against the official RESERVATION PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Check the appointment details extracted from the transcript against the hospital's reservation database.
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
+
+## APPOINTMENT VERIFICATION IS AUTHORITATIVE
+When APPOINTMENT VERIFICATION says `found: true`, the booking has been verified against the database.
+Do NOT flag a wrong doctor, wrong specialty, wrong appointment assignment, or `C2C_005` from the
+transcript in that case. The only exception is the explicit ineligible-patient rule below.
 
 ## SEVERITY REMINDER — apply before flagging anything as critical
 - critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
@@ -249,6 +264,14 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
   - The agent attempted to re-engage or used proper farewell before system timeout
   Do NOT flag automated closings or system messages as violations when the agent followed proper protocol.
   This includes: "Close the call on time", "Didn't Commit to call script", "Professional Closing" violations.
+
+## INELIGIBLE PATIENT WITH PERSISTED RESERVATION
+Eligibility result: {eligibility_result or "(not checked)"}
+If the eligibility result is conclusively not eligible and APPOINTMENT VERIFICATION says `found: true`,
+flag exactly one critical C2C violation using the existing reservation item:
+"Submitting the right action on the system" / `C2C_005` / "Made wrong reservation".
+Do not apply this rule when eligibility was not checked, the API response was inconclusive, or no persisted
+reservation was found.
 
 DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT over-evaluate.
 
@@ -280,7 +303,7 @@ APPOINTMENT VERIFICATION
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 ════════════════════════════════════════════════════════════
 {{
-  "compliance_flags": [
+  "reservation_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
       "severity": "<critical | positive>",
@@ -668,6 +691,9 @@ services to the patient during the call below.
   • The trigger words themselves (فحص، تحليل، etc.) are NOT the service name — they indicate intent only
 - **CRITICAL**: If the agent mentioned a service but you cannot find it in the AVAILABLE CRM SERVICES list below, 
   you MUST choose UNRELATED_SERVICE_RECOMMENDED or NO_SERVICE_AVAILABLE — never SUITABLE_SERVICE_RECOMMENDED.
+- **MULTIPLE MATCHED SERVICES**: Return a concise suitability decision only. Do not enumerate a long list
+  of CRM services in the JSON response; the system appends the complete CRM-verified name, code, and price
+  summary after parsing. Never use raw line breaks inside JSON strings.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -689,16 +715,12 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 ════════════════════════════════════════════════════════════
 {{
   "service_outcome": "<SUITABLE_SERVICE_RECOMMENDED | SERVICE_SKIPPED | UNRELATED_SERVICE_RECOMMENDED | SERVICE_MISREPRESENTED | INCOMPLETE_SERVICE_PRESENTATION | NO_SERVICE_AVAILABLE | SERVICE_NOT_APPLICABLE>",
-  "service_reasoning": "<2-3 sentences citing specific transcript evidence. 
-                        If you chose SUITABLE_SERVICE_RECOMMENDED, you MUST state which service from the 
-                        AVAILABLE CRM SERVICES list matched what the agent said (include the service name 
-                        and code from the CRM list). If you chose UNRELATED_SERVICE_RECOMMENDED, explain 
-                        that the service mentioned by the agent does not appear in the CRM list.>",
+  "service_reasoning": "<1-2 concise sentences citing transcript evidence.>",
   "service_flags": [
     {{
       "type": "<C2B | NC | positive>",
       "severity": "<critical | positive>",
-      "description": "<1-2 sentences. If positive flag, state the CRM service name and code that matched.>",
+      "description": "<1-2 concise sentences; do not use raw line breaks.>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
     }}
   ]

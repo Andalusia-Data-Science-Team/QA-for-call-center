@@ -115,6 +115,7 @@ from app.agent.nodes import (
     infer_behavioral_evaluation,
     infer_compliance_evaluation,
     infer_reservation_evaluation,
+    enforce_ineligible_reservation_violation,
     infer_offer_evaluation,
     infer_service_evaluation,
     infer_package_evaluation,
@@ -129,8 +130,12 @@ from app.agent.nodes import (
     finalize,
     handle_error,
     detect_intent,
+    detect_insurance_intent,
     extract_appointment_details,
     verify_appointment_in_db,
+    check_patient_eligibility,
+    handle_ineligible_patient,
+    _eligibility_router,
 )
 from app.services.llm_client import LLMClient
 
@@ -149,20 +154,19 @@ def _error_router(state: AgentState) -> Literal["continue", "handle_error"]:
 
 
 def _booking_router(state: AgentState) -> Literal["booking", "offer_only", "skip_booking"]:
-    """Three-way route after detect_intent:
-
-    booking     — booking/appointment keywords matched:
-                  extract → verify DB → infer_reservation → inference_gate
-    offer_only  — offer/package keywords matched (no booking keywords):
-                  extract (for specialty + offer_name) → inference_gate
-                  (DB verification is SKIPPED — there is no reservation to check)
-    skip_booking — neither matched: go straight to inference_gate
-    """
+    """Route the general booking intent without inspecting insurance status."""
     if state.get("is_booking_intent"):
         return "booking"
     if state.get("is_offer_intent"):
         return "offer_only"
     return "skip_booking"
+
+
+def _insurance_router(state: AgentState) -> Literal["insurance", "continue"]:
+    """Prioritize a separately detected insurance intent before booking routing."""
+    if state.get("is_insurance_intent"):
+        return "insurance"
+    return "continue"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,11 +266,16 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
 
     # ── Booking intent sub-flow (inserted after infer_behavioral_evaluation) ──
     builder.add_node("detect_intent", detect_intent)
+    builder.add_node("detect_insurance_intent", detect_insurance_intent)
+    builder.add_node("route_booking_intent", lambda state: {})
     builder.add_node(
         "extract_appointment_details",
         functools.partial(extract_appointment_details, llm_client=llm_client),
     )
     builder.add_node("verify_appointment_in_db", verify_appointment_in_db)
+    builder.add_node("enforce_ineligible_reservation_violation", enforce_ineligible_reservation_violation)
+    builder.add_node("check_patient_eligibility", check_patient_eligibility)
+    builder.add_node("handle_ineligible_patient", handle_ineligible_patient)
 
     # ── Edges ─────────────────────────────────────────────────────────────
 
@@ -303,30 +312,41 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Its result (is_booking_intent) determines which branch runs next.
     builder.add_edge("criteria_ready", "detect_intent")
 
-    # ── Step 2: booking sub-flow OR skip — both end at infer_behavioral ───
+    # ── Step 2: independent insurance intent, then booking routing ────────
     #
-    # BOOKING:    detect_intent → extract → verify → infer_reservation_evaluation
-    #             → infer_behavioral_evaluation (fan-in start)
-    # SKIP:       detect_intent → infer_behavioral_evaluation directly
-    #
-    # This ensures infer_reservation_evaluation ALWAYS completes (or is
-    # skipped) BEFORE the parallel behavioral+compliance LLM calls begin.
-    # BOOKING:  detect_intent → extract → verify → infer_reservation → inference_gate
-    # SKIP:     detect_intent → inference_gate
-    #
-    # inference_gate is the SINGLE fan-out point for both parallel LLM calls.
-    # Nothing else feeds into infer_behavioral_evaluation or
-    # infer_compliance_evaluation — this guarantees inference_ready receives
-    # exactly 2 triggers per run, preventing duplicate tail execution.
+    # Identity/IQAMA requests are insurance intent unless the patient explicitly
+    # selected cash or stated they are uninsured. The detector always runs; a
+    # successful check returns to the unchanged booking router.
+    builder.add_edge("detect_intent", "detect_insurance_intent")
     builder.add_conditional_edges(
-        "detect_intent",
+        "detect_insurance_intent",
+        _insurance_router,
+        {
+            "insurance": "check_patient_eligibility",
+            "continue":  "route_booking_intent",
+        },
+    )
+    builder.add_conditional_edges(
+        "check_patient_eligibility",
+        _eligibility_router,
+        {
+            "eligible":     "route_booking_intent",
+            "not_eligible": "handle_ineligible_patient",
+            "error":        "handle_error",
+        },
+    )
+    builder.add_conditional_edges(
+        "route_booking_intent",
         _booking_router,
         {
             "booking":      "extract_appointment_details",
-            "offer_only":   "extract_appointment_details",  # extract specialty+offer_name, skip DB
+            "offer_only":   "extract_appointment_details",
             "skip_booking": "inference_gate",
         },
     )
+
+    # Ineligible bookings are still extracted and verified to catch an improper reservation.
+    builder.add_edge("handle_ineligible_patient", "extract_appointment_details")
     # Booking path: extract → verify DB → infer_reservation → inference_gate
     # Offer-only path: extract → inference_gate (skips DB + reservation eval)
     builder.add_node("offer_extraction_done", lambda state: {})  # no-op barrier
@@ -343,8 +363,9 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_conditional_edges(
         "infer_reservation_evaluation",
         _error_router,
-        {"continue": "inference_gate", "handle_error": "handle_error"},
+        {"continue": "enforce_ineligible_reservation_violation", "handle_error": "handle_error"},
     )
+    builder.add_edge("enforce_ineligible_reservation_violation", "inference_gate")
 
     # ── Step 3: inference_gate fan-out ────────────────────────────────────
     #
