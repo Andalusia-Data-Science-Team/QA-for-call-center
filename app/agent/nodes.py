@@ -23,6 +23,7 @@ To add a NEW node (e.g. criteria_lookup, human_review, re_rank):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -42,12 +43,14 @@ from app.models.output import QAAnalysisResult
 from app.prompts.qa_prompt import (
     SYSTEM_PROMPT,
     APPOINTMENT_EXTRACTION_PROMPT,
+    DOCTOR_NAME_EXTRACTION_PROMPT,
     build_behavioral_prompt,
     build_compliance_prompt,
     build_reservation_prompt,
     build_offer_prompt,
     build_script_prompt,
     build_scoring_prompt,
+    build_doctor_scope_prompt,
     build_user_prompt,   # kept for legacy path
 )
 from app.services.criteria_loader import CriteriaLoader
@@ -55,11 +58,27 @@ from app.services.llm_client import LLMClient
 from app.services.sql_helpers import insert_qa_result
 from app.service_hub.bank_validation import bank_validation_needed, validate_ksa_bank_information, detect_bank_signals
 from app.service_hub.location_validation import detect_location_intent, detect_location_signals, is_home_service_location_text, location_validation_needed, validate_location_request
+from app.service_hub.doctor_validation import (
+    canonical_doctor_bu,
+    check_age_eligibility,
+    classify_doctor_context,
+    detect_doctor_signals,
+    doctor_validation_needed,
+    doctor_scope_skip_reason,
+    doctor_scope_validation_needed,
+    extract_doctor_context_specialty,
+    extract_patient_clinical_need,
+    extract_patient_stated_age,
+    has_detailed_scope_evidence,
+    patient_describes_medical_complaint,
+    validate_doctor_information,
+)
 from app.services.text_helpers import (
     _normalize_arabic,
-    _arabic_like_pattern, 
+    _arabic_like_pattern,
     _strip_markdown_fences,
     _norm_score,
+    normalize_arabic_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -681,6 +700,8 @@ async def infer_overall_scoring(
     # assessment. Bank and location are independent nodes/state keys now.
     bank_summary       = json.dumps(state.get("bank_validation") or {}, ensure_ascii=False)
     location_summary   = json.dumps(state.get("location_validation") or {}, ensure_ascii=False)
+    doctor_summary       = json.dumps(state.get("doctor_validation") or {}, ensure_ascii=False)
+    doctor_scope_summary = json.dumps(state.get("doctor_scope_validation") or {}, ensure_ascii=False)
 
     user_prompt = build_scoring_prompt(
         call,
@@ -691,6 +712,8 @@ async def infer_overall_scoring(
         script_summary=script_summary,
         bank_summary=bank_summary,
         location_summary=location_summary,
+        doctor_summary=doctor_summary,
+        doctor_scope_summary=doctor_scope_summary,
     )
     logger.debug(
         "infer_overall_scoring | call_id=%s prompt_len=%d",
@@ -746,6 +769,8 @@ async def aggregate_results(state: AgentState) -> dict:
     scoring     = state.get("scoring_eval")     or {}
     bank        = state.get("bank_validation") or {}
     location    = state.get("location_validation") or {}
+    doctor        = state.get("doctor_validation") or {}
+    doctor_scope  = state.get("doctor_scope_validation") or {}
 
     # Normalise offer_flags: the offer node uses "C2B"/"NC"/"positive" as type
     # but the ComplianceFlag schema expects type in {C2Com,C2C,C2B,NC}.
@@ -777,6 +802,22 @@ async def aggregate_results(state: AgentState) -> dict:
             "description": location.get("reason", "KSA branch/location validation failed."),
             "transcript_excerpt": "Location information supplied by agent.",
         })
+    # Doctor is two independent checks (deterministic + semantic) — each
+    # gets its own flag when it independently flags a violation, same
+    # pattern as bank/location.
+    doctor_flags = []
+    if doctor.get("is_violation"):
+        doctor_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": doctor.get("reason", "Doctor information validation failed."),
+            "transcript_excerpt": "Doctor information supplied by agent.",
+        })
+    if doctor_scope.get("is_violation"):
+        doctor_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": doctor_scope.get("reasoning", "The recommended doctor's documented scope does not match the patient's stated need."),
+            "transcript_excerpt": "Doctor recommendation given by agent.",
+        })
 
     # Merge all compliance flag lists from all focused evaluations
     all_flags: list[dict] = (
@@ -786,6 +827,7 @@ async def aggregate_results(state: AgentState) -> dict:
         + _offer_flags
         + bank_flags
         + location_flags
+        + doctor_flags
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
@@ -835,6 +877,8 @@ async def aggregate_results(state: AgentState) -> dict:
         "conversation_link":   state["call"].conversation_link,
         "bank_validation":  bank,
         "location_validation": location,
+        "doctor_validation": doctor,
+        "doctor_scope_validation": doctor_scope,
     }
 
     logger.debug(
@@ -890,13 +934,15 @@ async def integrity_check(state: AgentState) -> dict:
         )
         result = result.model_copy(update={"overall_assessment": "escalate"})
 
-    # A bank or location violation cannot remain a pass even if the LLM
-    # overlooks the deterministic scoring context; severity/escalation stay
-    # policy-driven. Bank and location are independent checks — either one
-    # alone is enough to trigger this.
+    # A bank, location, or doctor violation cannot remain a pass even if the
+    # LLM overlooks the deterministic scoring context; severity/escalation
+    # stay policy-driven. All are independent checks — any ONE alone is
+    # enough to trigger this.
     bank_violation = (state.get("bank_validation") or {}).get("is_violation")
     location_violation = (state.get("location_validation") or {}).get("is_violation")
-    if (bank_violation or location_violation) and result.overall_assessment == "pass":
+    doctor_violation = (state.get("doctor_validation") or {}).get("is_violation")
+    doctor_scope_violation = (state.get("doctor_scope_validation") or {}).get("is_violation")
+    if (bank_violation or location_violation or doctor_violation or doctor_scope_violation) and result.overall_assessment == "pass":
         result = result.model_copy(update={"overall_assessment": "needs_review"})
 
     if result.overall_assessment == "escalate" and not result.escalation_required:
@@ -1128,6 +1174,7 @@ async def detect_intent(state: AgentState) -> dict:
 async def extract_appointment_details(
     state: AgentState, llm_client: LLMClient
 ) -> dict:
+    pass
     """
     LLM-based extraction node for appointment attributes.
 
@@ -1239,6 +1286,8 @@ async def extract_appointment_details(
 
 
 async def verify_appointment_in_db(state: AgentState) -> dict:
+    pass
+
     """
     Database-lookup node for appointment verification.
 
@@ -1439,6 +1488,7 @@ def skip_bank_validation(state: AgentState) -> dict:
 
 
 async def validate_bank_information_node(state: AgentState) -> dict:
+    pass
     """Run deterministic KSA-only bank validation.
 
     Under normal graph execution this node is only reached at all when
@@ -1528,6 +1578,7 @@ def skip_location_validation(state: AgentState) -> dict:
 #   Fully independent of validate_bank_information — see above.
 # ---------------------------------------------------------------------------
 async def validate_location_node(state: AgentState) -> dict:
+    pass
     """Run deterministic KSA-only branch/location validation.
 
     Under normal graph execution this node is only reached at all when
@@ -1584,3 +1635,590 @@ async def validate_location_node(state: AgentState) -> dict:
             call.call_id, result["outcome"], result.get("requested_branch"),
         )
     return {"location_validation": result, "node_trace": _trace(state, "validate_location")}
+
+
+def _not_applicable_doctor_result(context_specialty: str | None = None) -> dict:
+    """Shared NOT_APPLICABLE shape for when doctor validation does not
+    apply. Used by BOTH the graph-level skip path (see
+    skip_doctor_validation below — no named-doctor mention at all, so
+    validate_doctor_node is never reached) and validate_doctor_node's own
+    internal gate, kept as a defensive fallback.
+
+    context_specialty carries the deterministic doctor_context_specialty
+    (see app.service_hub.doctor_validation.extract_doctor_context_specialty)
+    even when no doctor name qualified — e.g. "دكتور اورام" alone must
+    still surface doctor_context_specialty='اورام' even though
+    doctor_name/doctor_validation_needed are correctly None/False."""
+    return {
+        "applicable": False, "outcome": "NOT_APPLICABLE", "doctor_resolved": False,
+        "doctor_key": None, "doctor_name_ar": None, "doctor_name_en": None,
+        "business_unit": None, "status": None, "opd_flag": None,
+        "candidate_count": 0, "validated_fields": {}, "scope_reference": None,
+        "doctor_context_specialty": context_specialty,
+        "is_violation": False,
+        "reason": "No named-doctor mention or recommendation was detected.",
+    }
+
+
+def skip_doctor_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's doctor-intent
+    router (_doctor_intent_router) when there is no named-doctor mention at
+    all — reusing the exact same gate validate_doctor_node itself uses
+    (doctor_validation_needed / detect_doctor_signals), so the decision is
+    never duplicated. validate_doctor is not on this path: no CRM fetch, no
+    doctor resolution, and — deliberately — no node_trace entry for
+    'validate_doctor', since the node never actually ran.
+    """
+    call = state["call"]
+    context_specialty = extract_doctor_context_specialty(call)
+    logger.info("doctor validation skipped | call_id=%s reason=no_doctor_mention", call.call_id)
+    print(
+        f"[doctor] extraction:\n"
+        f"[doctor]     doctors=[]\n"
+        f"[doctor]     specialty_context={context_specialty!r}\n"
+        f"[doctor] outcome:\n"
+        f"[doctor]     N/A",
+        flush=True,
+    )
+    return {"doctor_validation": _not_applicable_doctor_result(context_specialty)}
+
+
+# ---------------------------------------------------------------------------
+# Helper – extract_doctor_semantic_context
+#   Additive, LLM-based doctor-name/specialty extraction for Doctor
+#   Validation, using the SAME _focused_llm_call helper and prompt-response
+#   pattern extract_appointment_details already uses, but as its OWN
+#   dedicated prompt (DOCTOR_NAME_EXTRACTION_PROMPT) and its OWN call — it
+#   never reuses or changes the appointment-extraction flow itself, and it
+#   runs regardless of is_booking_intent (a doctor can be discussed without
+#   ever booking). On any failure (LLM error / malformed JSON) this
+#   degrades to (None, None) rather than raising — validate_doctor_
+#   information's semantic_doctor_name docstring covers exactly how that
+#   safely falls back to the existing deterministic extraction.
+# ---------------------------------------------------------------------------
+async def extract_doctor_semantic_context(
+    call, llm_client: LLMClient, state: AgentState,
+) -> tuple[str | None, str | None, str | None]:
+    """Returns (doctor_name, doctor_context_specialty, doctor_role).
+
+    doctor_role is read straight from DOCTOR_NAME_EXTRACTION_PROMPT's own
+    "doctor_role" field — an ADDITIVE signal, exactly like doctor_name/
+    doctor_context_specialty: on any failure (LLM error, malformed JSON,
+    or simply a missing/unrecognised key — including under the plain
+    "{}" a stub/degenerate LLM response produces) it degrades to None,
+    never to "agent_self_introduction". Only validate_doctor_node's guard
+    treats "agent_self_introduction" specially, and only because that
+    string can ONLY come from a real, positive LLM classification — never
+    a default — so it is safe to trust as an authoritative skip signal.
+    """
+    try:
+        user_prompt = DOCTOR_NAME_EXTRACTION_PROMPT.format(transcript=call.transcript)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("extract_doctor_semantic_context | call_id=%s prompt build failed | %s", call.call_id, exc)
+        return None, None, None
+
+    data, err = await _focused_llm_call(
+        "extract_doctor_semantic_context", call.call_id, user_prompt, llm_client, state,
+    )
+    if err or not isinstance(data, dict):
+        return None, None, None
+
+    data_lower = {k.lower(): v for k, v in data.items()}
+    doctor_name = data_lower.get("doctor_name")
+    specialty = data_lower.get("doctor_context_specialty")
+    doctor_role = data_lower.get("doctor_role")
+    doctor_name = doctor_name.strip() if isinstance(doctor_name, str) and doctor_name.strip() else None
+    specialty = specialty.strip() if isinstance(specialty, str) and specialty.strip() else None
+    doctor_role = doctor_role.strip() if isinstance(doctor_role, str) and doctor_role.strip() else None
+    return doctor_name, specialty, doctor_role
+
+
+# ---------------------------------------------------------------------------
+# Node – validate_doctor (app.service_hub.doctor_validation)
+#   Deterministic factual-information check. Fully independent of
+#   validate_bank_information / validate_location — separate graph node,
+#   separate CRM fetch/cache (app.service_hub.crm_doctors), separate state
+#   key (doctor_validation).
+# ---------------------------------------------------------------------------
+async def validate_doctor_node(state: AgentState, llm_client: LLMClient) -> dict:
+    """Run deterministic doctor-information validation.
+
+    Under normal graph execution this node is only reached at all when
+    app.agent.graph's doctor-intent router (_doctor_intent_router) has
+    already confirmed doctor_validation_needed — see
+    app.service_hub.doctor_validation.doctor_validation_needed /
+    detect_doctor_signals, which the router reuses directly rather than
+    duplicating. The gate below is kept as a defensive fallback only.
+
+    This is the ONE place a call's clean doctor-name/specialty extraction,
+    routing, CRM resolution, and outcome are all printed at INFO level —
+    see extract_doctor_semantic_context and validate_doctor_information's
+    semantic_doctor_name parameter for how the LLM-vetted name (when
+    available) both drives this logging AND becomes the query CRM
+    resolution actually uses.
+
+    Self-introduction guard: when extract_doctor_semantic_context
+    positively classifies doctor_role as "agent_self_introduction", this
+    node exits immediately with the same NOT_APPLICABLE/N/A result the
+    graph-level skip path (skip_doctor_validation) uses — no CRM doctor
+    fetch, no resolution, no degree/specialty/notes/scope checks. This is
+    a defense-in-depth safety net alongside the deterministic gate above
+    (doctor_validation_needed/is_agent_self_introduction already correctly
+    excludes the common self-introduction phrasings before this node is
+    even reached — see app.agent.graph._doctor_intent_router): it only
+    fires on an EXPLICIT, positive string the LLM actively asserted, never
+    on an empty/default response (a stub or failed LLM call returns
+    doctor_role=None here, which never matches — see extract_doctor_
+    semantic_context's own docstring), so it can never turn a real,
+    resolvable doctor call into a false skip.
+    """
+    call = state["call"]
+    signals = detect_doctor_signals(call)
+    if not doctor_validation_needed(call, signals):
+        result = _not_applicable_doctor_result(extract_doctor_context_specialty(call))
+        return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
+    semantic_name, semantic_specialty, semantic_role = await extract_doctor_semantic_context(call, llm_client, state)
+    if semantic_role == "agent_self_introduction":
+        result = _not_applicable_doctor_result(semantic_specialty)
+        logger.info("doctor validation skipped | call_id=%s reason=agent_self_introduction (semantic)", call.call_id)
+        print(
+            f"[doctor] extraction:\n"
+            f"[doctor]     doctors=[]\n"
+            f"[doctor]     specialty_context={semantic_specialty!r}\n"
+            f"[doctor] outcome:\n"
+            f"[doctor]     N/A",
+            flush=True,
+        )
+        return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
+    intent_ctx = classify_doctor_context(call)
+    call_bu = getattr(call, "business_unit", None)
+    canonical_bu = canonical_doctor_bu(call_bu)
+
+    try:
+        from app.service_hub.crm_doctors import fetch_doctors
+        doctors = fetch_doctors()
+        if not doctors:
+            logger.warning("[doctor_validation] CRM doctor lookup failed | call_id=%s reason=empty_result", call.call_id)
+            result = {
+                **_not_applicable_doctor_result(),
+                "outcome": "INSUFFICIENT_REFERENCE_DATA",
+                "reason": "Authoritative CRM doctor data is unavailable; no agent violation was inferred.",
+            }
+        else:
+            result = validate_doctor_information(
+                call, doctors, signals,
+                semantic_doctor_name=semantic_name,
+                semantic_specialty_context=semantic_specialty,
+            )
+    except Exception as exc:  # Reference-data failures are non-punitive.
+        logger.warning("[doctor_validation] CRM doctor lookup failed | call_id=%s | %s", call.call_id, exc)
+        result = {
+            **_not_applicable_doctor_result(),
+            "outcome": "INSUFFICIENT_REFERENCE_DATA",
+            "reason": "Authoritative CRM doctor data could not be read; no agent violation was inferred.",
+        }
+
+    logger.info(
+        "doctor validation | call_id=%s outcome=%s doctor_key=%s",
+        call.call_id, result["outcome"], result.get("doctor_key"),
+    )
+    _resolved_name = result.get("doctor_name_ar") or result.get("doctor_name_en")
+    _requested_name = semantic_name or result.get("input_name")
+    _source = result.get("resolution_source") or ""
+    # bu_scoped: True/False once a resolution attempt actually ran (see
+    # _resolve_and_validate_one_doctor's resolution_source values), None
+    # when resolution never got that far at all (e.g. INSUFFICIENT_
+    # REFERENCE_DATA before any CRM pool existed).
+    _bu_scoped = ("bu_scoped" in _source) if _source else None
+    _match_method = (
+        None if not result.get("doctor_resolved")
+        else "partial" if (_requested_name and _resolved_name and normalize_arabic_text(_requested_name) != normalize_arabic_text(_resolved_name))
+        else "exact"
+    )
+    # Field-level breakdown for WHY a PASS/FAIL outcome was reached — the
+    # doctor was already correctly resolved by this point (see the
+    # resolution block above); PASS/FAIL is a SEPARATE, later check of
+    # which factual claims the Agent actually made about that doctor
+    # against their CRM record (degree/specialty/subspecialty/business
+    # unit/notes/scope/qualifications/examination age/fee — see
+    # _resolve_and_validate_one_doctor's field-by-field validation). Shown
+    # here so a FAIL is never a bare, unexplained verdict.
+    _validated_fields = result.get("validated_fields") or {}
+    _fields_summary = {k: v.get("outcome") for k, v in _validated_fields.items()}
+    print(
+        f"[doctor] extraction:\n"
+        f"[doctor]     doctors={[semantic_name] if semantic_name else []}\n"
+        f"[doctor]     specialty_context={semantic_specialty or result.get('doctor_context_specialty')!r}\n"
+        f"[doctor] routing:\n"
+        f"[doctor]     business_unit={call_bu}\n"
+        + (f"[doctor]     canonical_business_unit={canonical_bu}\n" if canonical_bu != call_bu else "")
+        + f"[doctor]     doctor_role={intent_ctx.get('doctor_role')}\n"
+        f"[doctor]     doctor_validation_needed=True\n"
+        f"[doctor] resolution:\n"
+        f"[doctor]     requested_name={_requested_name!r}\n"
+        f"[doctor]     requested_business_unit={call_bu!r}\n"
+        + (f"[doctor]     canonical_business_unit={canonical_bu!r}\n" if canonical_bu != call_bu else "")
+        + f"[doctor]     match_method={_match_method}\n"
+        f"[doctor]     bu_scoped={_bu_scoped}\n"
+        f"[doctor]     resolved_name={_resolved_name!r}\n"
+        f"[doctor]     resolved_business_unit={result.get('business_unit')!r}\n"
+        f"[doctor]     doctor_key={result.get('doctor_key')}\n"
+        f"[doctor] outcome:\n"
+        f"[doctor]     {result['outcome']}\n"
+        + (f"[doctor]     reason={result.get('reason')}\n" if result.get("reason") else "")
+        + (f"[doctor]     fields_checked={_fields_summary}" if _fields_summary else ""),
+        flush=True,
+    )
+    return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
+
+# ---------------------------------------------------------------------------
+# Node – infer_doctor_scope_validation (semantic, LLM-based)
+#   Separate from validate_doctor_node: judges whether the ALREADY-RESOLVED
+#   doctor's documented CRM scope is a reasonable fit for the patient's
+#   stated complaint. Runs one hop past inference_gate (via
+#   fetch_crm_offers_for_call), alongside behavioral/compliance/script/
+#   offer, so every inference branch stays at an EQUAL hop count from
+#   inference_gate — see graph.py's Step 3 comment: a mismatched hop count
+#   there previously caused the whole downstream chain to fire twice.
+#   Applicability is checked INLINE (not via a graph-level skip): when the
+#   gate fails, this still returns NOT_APPLICABLE without calling the LLM,
+#   the same pattern infer_offer_evaluation already uses for
+#   NO_OFFER_AVAILABLE/OFFER_NOT_APPLICABLE.
+# ---------------------------------------------------------------------------
+def _not_applicable_doctor_scope_result(reason: str) -> dict:
+    return {
+        "applicable": False, "outcome": "NOT_APPLICABLE",
+        "patient_need_summary": None, "doctor_scope_summary": None,
+        "matched_scope_evidence": [], "reasoning": reason,
+        "is_violation": False,
+    }
+
+
+def _normalize_doctor_scope_result(data: dict, fallback_outcome: str) -> dict:
+    """Guarantee the outgoing doctor_scope_validation state is always a
+    complete, safe structure — even when the LLM response was malformed or
+    incomplete (e.g. an empty {} from a weak/degenerate completion). This
+    node is only ever reached after the gate confirmed scope validation
+    IS applicable, so applicable=True always holds here; a genuinely
+    undeterminable semantic result degrades to the safe, non-punitive
+    UNCLEAR outcome rather than leaking outcome=None/applicable=None into
+    the final state. is_violation is never left non-boolean, and is never
+    True without an outcome that actually says so."""
+    if not isinstance(data.get("outcome"), str) or not data.get("outcome"):
+        data["outcome"] = fallback_outcome if isinstance(fallback_outcome, str) and fallback_outcome else "UNCLEAR"
+        data.setdefault(
+            "reasoning",
+            "Doctor scope validation could not be determined from the model response.",
+        )
+    data.setdefault("applicable", True)
+    if not isinstance(data.get("is_violation"), bool):
+        data["is_violation"] = data.get("outcome") == "UNSUITABLE"
+    data.setdefault("patient_need_summary", None)
+    data.setdefault("doctor_scope_summary", None)
+    data.setdefault("matched_scope_evidence", [])
+    data.setdefault("reasoning", "")
+    return data
+
+
+def skip_doctor_scope_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's doctor-scope
+    conditional edge off fetch_crm_offers_for_call (_doctor_scope_intent_router)
+    when doctor_scope_validation_needed() is False — reusing the exact same
+    gate (doctor_scope_skip_reason / doctor_scope_validation_needed)
+    infer_doctor_scope_validation itself uses defensively, so the routing
+    decision and the node's own fallback can never drift apart. This mirrors
+    skip_doctor_validation/skip_bank_validation/skip_location_validation:
+    infer_doctor_scope_validation is NOT on this path — no clinical-need
+    extraction, no scope-reference JSON, no LLM prompt is built, no LLM call
+    is made — and, deliberately, no node_trace entry for
+    'infer_doctor_scope_validation', since the node never actually ran. This
+    is what keeps a no-doctor (or doctor-but-no-clinical-need) call's trace
+    from ever showing a semantic scope evaluation that didn't happen.
+    """
+    call = state["call"]
+    doctor_result = state.get("doctor_validation")
+    _p_mentions, _a_mentions, patient_text, _agent_text = detect_doctor_signals(call)
+    reason = doctor_scope_skip_reason(doctor_result, patient_text, call) or "no_resolved_doctor"
+    logger.info("doctor_scope routing | call_id=%s needed=False reason=%s", call.call_id, reason)
+    print(f"[doctor_scope] skipped | call_id={call.call_id} reason={reason}", flush=True)
+    return {
+        "doctor_scope_validation": _not_applicable_doctor_scope_result(
+            "No medical complaint, unresolved doctor, or no scope evidence available.",
+        ),
+    }
+
+
+def _doctor_has_scope_evidence(scope_ref: dict) -> bool:
+    """Same broad evidence check as doctor_scope_skip_reason's condition
+    #2 (specialty/subspecialty/scope_of_service/scope_of_service_ar — at
+    least one), reused per-doctor in the multi-doctor recommendation-set
+    path below."""
+    return any(scope_ref.get(k) for k in ("scope_of_service", "scope_of_service_ar", "subspecialty", "specialty"))
+
+
+async def _infer_scope_for_one_doctor(
+    call, scope_ref: dict, clinical_need: str, patient_text: str, llm_client: LLMClient, state: AgentState,
+) -> tuple[dict, dict | None]:
+    """Judge ONE resolved doctor's fit for *clinical_need* — the exact LLM-
+    call + two deterministic safety-net body infer_doctor_scope_validation
+    has always used, now a reusable unit so a multi-doctor recommendation
+    set (see validate_doctor_information's docstring) can call it once per
+    INDEPENDENTLY-resolved doctor, each with its own CRM scope evidence,
+    all within this ONE graph node (never as separate graph nodes/hops —
+    see infer_doctor_scope_validation's docstring). Returns (data, err);
+    err is non-None only on an LLM/parse failure, letting the caller decide
+    whether to hard-fail (single-doctor path, unchanged behaviour) or soft-
+    degrade just this one doctor to UNCLEAR while the rest of the
+    recommendation set still gets evaluated (multi-doctor path).
+
+    The LLM never independently selects a doctor — it only judges fit for
+    a doctor validate_doctor_node already resolved; that resolution
+    (doctor_key/doctor_name_ar/doctor_name_en/business_unit) is the sole
+    authority here.
+
+    scope_of_service/scope_of_service_ar are the primary evidence handed to
+    the LLM — a bare specialty/subspecialty label is supporting context
+    only (see qa_prompt.build_doctor_scope_prompt's evidence hierarchy and
+    has_detailed_scope_evidence()). When that detailed scope text is
+    missing, a deterministic safety net below downgrades an LLM SUITABLE
+    verdict built on specialty alone back to UNCLEAR, rather than trusting
+    the LLM to always follow that instruction unprompted.
+    """
+    scope_ref = dict(scope_ref)
+
+    # Deterministic, precomputed evidence handed to the LLM alongside the raw
+    # CRM fields — see qa_prompt.build_doctor_scope_prompt's "SPECIALTY-ALONE
+    # SAFEGUARD" and "AGE-ELIGIBILITY RULE" sections. Never invents a patient
+    # age; a missing/ambiguous mention correctly yields a null hint.
+    detailed_scope = has_detailed_scope_evidence(scope_ref)
+    patient_age = extract_patient_stated_age(patient_text)
+    age_hint = check_age_eligibility(patient_age, scope_ref.get("examination_age"))
+    scope_ref["has_detailed_scope"] = detailed_scope
+    scope_ref["patient_age"] = patient_age
+    scope_ref["age_eligibility_hint"] = age_hint
+
+    doctor_reference_json = json.dumps(scope_ref, ensure_ascii=False)
+    doctor_label = scope_ref.get("doctor_name_ar") or scope_ref.get("doctor_name_en")
+    print(
+        f"[doctor_scope] recommendation candidate:\n"
+        f"[doctor_scope]   doctor_key={scope_ref.get('doctor_key')}\n"
+        f"[doctor_scope]   doctor={doctor_label}\n"
+        f"[doctor_scope]   patient_need={clinical_need.strip()[:200]}\n"
+        f"[doctor_scope]   scope_source={'scope_of_service' if detailed_scope else 'specialty_only'} "
+        f"age_eligibility_hint={age_hint}",
+        flush=True,
+    )
+
+    user_prompt = build_doctor_scope_prompt(call, patient_complaint=clinical_need, doctor_reference=doctor_reference_json)
+    logger.debug(
+        "infer_doctor_scope_validation | call_id=%s doctor_key=%s prompt_len=%d",
+        call.call_id, scope_ref.get("doctor_key"), len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_doctor_scope_validation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return {}, err
+
+    outcome = data.get("outcome", "UNCLEAR")
+
+    # Deterministic safety net #1 — never let a confident SUITABLE stand on
+    # specialty/subspecialty alone when no detailed scope text or relevant
+    # doctor note backs it up (belt-and-suspenders alongside the prompt's
+    # own "SPECIALTY-ALONE SAFEGUARD" instruction).
+    if outcome == "SUITABLE" and not detailed_scope and not (scope_ref.get("doctor_notes") or "").strip():
+        outcome = "UNCLEAR"
+        data["outcome"] = "UNCLEAR"
+        data["is_violation"] = False
+        data["reasoning"] = (
+            "Downgraded from SUITABLE: no documented scope_of_service text or doctor note "
+            "supports this doctor for the stated need — only a specialty/subspecialty label "
+            "was available, which is insufficient evidence on its own. "
+            + str(data.get("reasoning") or "")
+        ).strip()
+        print(f"[doctor_scope]   outcome=UNCLEAR reason=missing_scope_data (downgraded from SUITABLE)", flush=True)
+
+    # Deterministic safety net #2 — an explicit, confidently-parsed
+    # patient-age violation of the doctor's documented eligibility range is
+    # strong enough to override a false SUITABLE; it never manufactures a
+    # positive when age_eligibility_hint is unavailable.
+    elif outcome == "SUITABLE" and age_hint == "outside_range":
+        outcome = "UNSUITABLE"
+        data["outcome"] = "UNSUITABLE"
+        data["is_violation"] = True
+        data["reasoning"] = (
+            f"Downgraded from SUITABLE: the patient's stated age ({patient_age}) falls outside "
+            f"the doctor's documented examination_age eligibility ({scope_ref.get('examination_age')}). "
+            + str(data.get("reasoning") or "")
+        ).strip()
+        print(f"[doctor_scope]   outcome=UNSUITABLE reason=age_ineligible (downgraded from SUITABLE)", flush=True)
+
+    data = _normalize_doctor_scope_result(data, outcome)
+    outcome = data["outcome"]
+    print(f"[doctor_scope]   outcome={outcome}", flush=True)
+    data["doctor_key"] = scope_ref.get("doctor_key")
+    return data, None
+
+
+def _aggregate_doctor_scope_outcomes(per_doctor: list[dict]) -> tuple[str, bool, str]:
+    """Combine N independent per-doctor scope verdicts (a recommendation
+    SET — see infer_doctor_scope_validation's multi-doctor path) into one
+    overall (outcome, is_violation, reasoning) using the SAME business
+    semantics as _aggregate_doctor_recommendation_outcomes on the
+    deterministic side: the first doctor's verdict never stands in for the
+    whole set.
+      - any UNSUITABLE           -> overall UNSUITABLE (a real violation)
+      - none UNSUITABLE, any UNCLEAR/NOT_APPLICABLE -> overall UNCLEAR
+      - every doctor SUITABLE    -> overall SUITABLE
+    """
+    outcomes = [d.get("outcome") for d in per_doctor]
+    if any(o == "UNSUITABLE" for o in outcomes):
+        bad = [d for d in per_doctor if d.get("outcome") == "UNSUITABLE"]
+        names = ", ".join(str(d.get("doctor_key")) for d in bad)
+        return "UNSUITABLE", True, f"{len(bad)} of {len(per_doctor)} recommended doctor(s) judged unsuitable (doctor_key(s): {names})."
+    if any(o != "SUITABLE" for o in outcomes):
+        return "UNCLEAR", False, f"{len(per_doctor)} recommended doctor(s) evaluated — at least one could not be confidently judged suitable."
+    return "SUITABLE", False, f"All {len(per_doctor)} recommended doctors are documented as suitable for the stated need."
+
+
+async def infer_doctor_scope_validation(state: AgentState, llm_client: LLMClient) -> dict:
+    """Call the LLM to judge doctor-recommendation suitability. Under normal
+    graph execution this node is only reached at all when app.agent.graph's
+    doctor-scope conditional edge (_doctor_scope_intent_router) has already
+    confirmed doctor_scope_validation_needed — see
+    app.service_hub.doctor_validation.doctor_scope_validation_needed /
+    doctor_scope_skip_reason, which the router reuses directly rather than
+    duplicating. The gate below is kept as a defensive fallback only (same
+    pattern as validate_doctor_node's internal gate).
+
+    Supports TWO shapes, mirroring validate_doctor_node/
+    validate_doctor_information's own single-vs-multi-doctor split:
+      - Single doctor (state["doctor_validation"] has no "doctors" list, or
+        exactly one entry) — the original, unchanged behaviour.
+      - A genuine recommendation SET (state["doctor_validation"]["doctors"]
+        has 2+ entries) — every INDEPENDENTLY RESOLVED doctor in the set is
+        judged against the SAME patient clinical need, concurrently
+        (asyncio.gather), all within this ONE graph node — never as
+        separate graph nodes/hops, so downstream single-execution
+        guarantees (infer_overall_scoring/aggregate_results/
+        integrity_check/save_to_database/finalize) are entirely
+        unaffected. The result adds a "doctors" list (one per-doctor scope
+        verdict) and an aggregated top-level outcome/is_violation (see
+        _aggregate_doctor_scope_outcomes) — never one LLM verdict applied
+        to all doctors, and never the first doctor's verdict standing in
+        for the whole set.
+    """
+    call = state["call"]
+    doctor_result = state.get("doctor_validation")
+    _p_mentions, _a_mentions, patient_text, _agent_text = detect_doctor_signals(call)
+
+    if not doctor_scope_validation_needed(doctor_result, patient_text, call):
+        reason = doctor_scope_skip_reason(doctor_result, patient_text, call) or "no_resolved_doctor"
+        logger.info("doctor_scope validation skipped | call_id=%s reason=%s", call.call_id, reason)
+        print(f"[doctor_scope] skipped | call_id={call.call_id} reason={reason}", flush=True)
+        return {
+            "doctor_scope_validation": _not_applicable_doctor_scope_result(
+                "No medical complaint, unresolved doctor, or no scope evidence available.",
+            ),
+            "node_trace": _trace(state, "infer_doctor_scope_validation"),
+        }
+
+    clinical_need = extract_patient_clinical_need(call) or patient_text
+    recommended = (doctor_result or {}).get("doctors") or []
+
+    if len(recommended) <= 1:
+        # Single-doctor path — EXACT current behaviour, including the
+        # hard-fail-on-LLM-error return, unchanged.
+        scope_ref = dict((doctor_result or {}).get("scope_reference") or {})
+        print(
+            f"[doctor_scope] validation started | call_id={call.call_id} "
+            f"doctor_key={scope_ref.get('doctor_key')} doctor='{scope_ref.get('doctor_name_ar') or scope_ref.get('doctor_name_en')}'",
+            flush=True,
+        )
+        data, err = await _infer_scope_for_one_doctor(call, scope_ref, clinical_need, patient_text, llm_client, state)
+        if err:
+            return err
+        logger.info("infer_doctor_scope_validation | call_id=%s outcome=%s", call.call_id, data["outcome"])
+        return {
+            "doctor_scope_validation": data,
+            "usage_list": [data.get("_usage", {})],
+            "node_trace": _trace(state, "infer_doctor_scope_validation"),
+        }
+
+    # ── Multi-doctor recommendation set: judge EVERY independently-resolved
+    # doctor against the SAME clinical need, concurrently, within this one
+    # node — never one LLM call whose verdict gets copy-pasted across all
+    # doctors. ──
+    print(f"[doctor_scope] validation started | call_id={call.call_id} recommended_doctor_count={len(recommended)}", flush=True)
+    print(f"[doctor_scope] patient_need: {clinical_need.strip()[:200]}", flush=True)
+
+    resolvable = [d for d in recommended if d.get("doctor_resolved") and _doctor_has_scope_evidence(d.get("scope_reference") or {})]
+    tasks = [
+        _infer_scope_for_one_doctor(call, d["scope_reference"], clinical_need, patient_text, llm_client, state)
+        for d in resolvable
+    ]
+    results = await asyncio.gather(*tasks) if tasks else []
+
+    usage_list = []
+    per_doctor: list[dict] = []
+    for d, (data, err) in zip(resolvable, results):
+        if err:
+            data = _normalize_doctor_scope_result(
+                {"reasoning": f"Scope evaluation failed for this doctor: {err.get('error', 'unknown error')}"},
+                "UNCLEAR",
+            )
+            data["doctor_key"] = d["scope_reference"].get("doctor_key")
+        usage_list.append(data.get("_usage", {}))
+        per_doctor.append(data)
+
+    # Doctors that never resolved (see validate_doctor_information's
+    # "doctors" list) or had no CRM scope evidence at all get an explicit
+    # NOT_APPLICABLE scope entry — never silently dropped from the set.
+    _resolvable_ids = {id(d) for d in resolvable}
+    for d in recommended:
+        if id(d) not in _resolvable_ids:
+            per_doctor.append({
+                **_not_applicable_doctor_scope_result(
+                    "Doctor was not resolved or has no CRM scope evidence to evaluate."
+                    if not d.get("doctor_resolved") else
+                    "No CRM specialty/subspecialty/scope-of-service evidence available for this doctor.",
+                ),
+                "doctor_key": (d.get("scope_reference") or {}).get("doctor_key"),
+                "input_name": d.get("input_name"),
+            })
+
+    if not per_doctor:
+        result = _not_applicable_doctor_scope_result("No resolved doctor in the recommendation set had scope evidence to evaluate.")
+        return {"doctor_scope_validation": result, "node_trace": _trace(state, "infer_doctor_scope_validation")}
+
+    judged = [d for d in per_doctor if d.get("outcome") in ("SUITABLE", "UNSUITABLE", "UNCLEAR")]
+    outcome, is_violation, reasoning = (
+        _aggregate_doctor_scope_outcomes(judged) if judged
+        else ("NOT_APPLICABLE", False, "No recommended doctor had evaluable scope evidence.")
+    )
+    logger.info(
+        "doctor_scope recommendation set | call_id=%s requested=%d judged=%d outcome=%s",
+        call.call_id, len(recommended), len(judged), outcome,
+    )
+    print(f"[doctor_scope] outcome: {outcome}", flush=True)
+
+    final = {
+        "applicable": True,
+        "outcome": outcome,
+        "patient_need_summary": clinical_need.strip()[:300],
+        "doctor_scope_summary": None,
+        "matched_scope_evidence": [],
+        "reasoning": reasoning,
+        "is_violation": is_violation,
+        "doctors": per_doctor,
+        "recommended_doctor_count": len(recommended),
+    }
+    return {
+        "doctor_scope_validation": final,
+        "usage_list": usage_list,
+        "node_trace": _trace(state, "infer_doctor_scope_validation"),
+    }

@@ -121,6 +121,19 @@ _AR_ALIAS: dict[str, str] = {
     "جراحة عامه":        "General Surgery",
     "جراحه":             "General Surgery",
     "جراحة عامة":        "General Surgery",
+    # ── Oncology — verified against real CRM doctor data (cr301_specialtyname/
+    # cr301_subspecialtyname = "Oncology" for a real, active doctor record;
+    # see app.service_hub.doctor_validation's specialty-canonicalisation
+    # comparison for how a CRM variant like "Medical Oncology" still safely
+    # matches this same category) ─────────────────────────────────────────
+    "اورام":             "Oncology",
+    "أورام":             "Oncology",
+    "الأورام":           "Oncology",
+    "الاورام":           "Oncology",
+    "طب اورام":          "Oncology",
+    "طب أورام":          "Oncology",
+    "عيادة الاورام":     "Oncology",
+    "عيادة الأورام":     "Oncology",
     # ── Endocrinology ────────────────────────────────────────────────────────
     "غدد":               "Endocrinology",
     "الغدد":             "Endocrinology",

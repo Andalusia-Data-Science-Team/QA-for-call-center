@@ -52,6 +52,18 @@ class AgentState(TypedDict, total=False):
     # Masked deterministic results retained so scoring and aggregation share
     # the same conclusion without passing financial identifiers to the LLM.
 
+    # Doctor validation is TWO independent checks (same "separate concerns"
+    # philosophy as bank/location being separate from each other):
+    #   doctor_validation       — deterministic factual-information check,
+    #                             written by validate_doctor_node.
+    #   doctor_scope_validation — separate, LLM-based semantic
+    #                             recommendation-suitability check, written
+    #                             by infer_doctor_scope_validation. Depends
+    #                             on doctor_validation's resolved doctor
+    #                             (never independently guesses one).
+    doctor_validation: Optional[dict[str, Any]]
+    doctor_scope_validation: Optional[dict[str, Any]]
+
     # ── Error handling ────────────────────────────────────────────────────
     # Last-write-wins, for the same reason `result` above needs it: when
     # multiple parallel LLM nodes (behavioral/compliance/offer/script) fail

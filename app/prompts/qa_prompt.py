@@ -366,6 +366,14 @@ def build_scoring_prompt(
     # app.service_hub).
     bank_summary: str = "",
     location_summary: str = "",
+    # Doctor validation is two independent checks, same pattern as bank/
+    # location: doctor_summary is the deterministic factual-information
+    # result (app.service_hub.doctor_validation), doctor_scope_summary is
+    # the separate, semantic recommendation-suitability result (LLM-based,
+    # app.agent.nodes.infer_doctor_scope_validation) — never merged into
+    # one opaque call.
+    doctor_summary: str = "",
+    doctor_scope_summary: str = "",
 ) -> str:
     """
     Prompt that synthesizes the three focused sub-evaluations into a final score.
@@ -487,6 +495,58 @@ never let this override a confident deterministic PASS/FAIL:
      Never penalize based on a home-service address, and never penalize a
      plausible branch redirection just because it left the deterministic
      resolver unable to confirm the alternative branch.
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 7 — DETERMINISTIC DOCTOR INFORMATION VALIDATION
+════════════════════════════════════════════════════════════
+{doctor_summary or "(not applicable)"}
+
+How to interpret the doctor result above — never override a confident
+deterministic PASS/FAIL:
+  - PASS: every factual claim the agent actually made about the doctor
+    (name/degree/specialty/subspecialty/business unit/notes/scope/
+    qualifications/examination age/walk-in fee) matches the authoritative
+    CRM record. Treat this as correct — no violation.
+  - FAIL: a confirmed mismatch between something the agent stated and the
+    CRM record (e.g. wrong degree, wrong fee, recommending an inactive or
+    non-OPD doctor). Treat this as a real violation — do not soften or
+    dismiss a confirmed FAIL.
+  - DOCTOR_UNRESOLVED / AMBIGUOUS_DOCTOR: the deterministic matcher could
+    not confidently identify which doctor was meant, or found multiple
+    equally plausible records. This is NOT automatically an agent error —
+    only flag a problem if the transcript itself gives clear evidence the
+    agent was wrong (e.g. a name/detail that plainly doesn't correspond to
+    any real doctor). A bare unresolved/ambiguous result on its own must
+    not lower the score.
+  - INSUFFICIENT_REFERENCE_DATA: CRM doctor data was unavailable. Never
+    penalize the agent for this — it is a system/reference-data condition.
+  - NOT_APPLICABLE: no specific doctor was mentioned or recommended. Do
+    not infer any doctor-information violation.
+  - A field the agent never mentioned is never checked (it will not appear
+    under validated_fields at all) — do not penalize for information the
+    agent simply didn't state.
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 8 — DOCTOR RECOMMENDATION SUITABILITY (semantic, LLM-based)
+════════════════════════════════════════════════════════════
+{doctor_scope_summary or "(not applicable)"}
+
+This is a SEPARATE check from Sub-Evaluation 7 — it judges whether the
+resolved doctor's documented CRM scope of service is a reasonable fit for
+what the patient described, not whether the agent's factual claims about
+the doctor were correct.
+  - SUITABLE: the recommendation fits the doctor's documented scope. No
+    violation.
+  - UNSUITABLE: the patient described a need that falls outside the
+    doctor's documented scope/specialty — this MAY become a QA issue,
+    since the agent recommended a doctor whose documented scope does not
+    match what the patient needed. Ground any flag strictly in the
+    provided reasoning/evidence, never in outside medical knowledge.
+  - UNCLEAR: the available scope evidence was too limited to decide
+    confidently. Do not automatically penalize an UNCLEAR result.
+  - NOT_APPLICABLE: the patient did not describe a medical complaint/need,
+    or no doctor was resolved, or no scope evidence was available. No
+    doctor-recommendation penalty in any of these cases.
 
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
@@ -650,6 +710,139 @@ NO_OFFER_AVAILABLE or OFFER_NOT_APPLICABLE.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NODE — Doctor Recommendation Suitability Prompt (semantic, LLM-based)
+#   Focus: is the ALREADY-RESOLVED doctor's authoritative CRM scope of
+#          service compatible with what the patient described?
+#   This is the separate, semantic half of doctor validation — the
+#   deterministic half (name/degree/specialty/BU/fee/... factual checks)
+#   lives entirely in app.service_hub.doctor_validation and never touches
+#   an LLM. This prompt receives ONLY the already-resolved doctor's CRM
+#   fields (never the full CRM dataset) and must NEVER be asked to pick a
+#   doctor itself — that decision is made deterministically before this
+#   prompt is ever built.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_doctor_scope_prompt(
+    call: CallTranscript,
+    patient_complaint: str = "",
+    doctor_reference: str = "",
+) -> str:
+    """
+    Determine whether a doctor's documented CRM scope of service reasonably
+    covers a patient's stated medical complaint/need.
+
+    Parameters
+    ----------
+    patient_complaint : str
+        The patient's own words describing their symptom/condition/desired
+        treatment (already extracted — never the full transcript re-parsed
+        by the LLM).
+    doctor_reference : str
+        Compact JSON of ONLY the CRM fields needed for this decision
+        (doctor_name_ar/en, degree, specialty, subspecialty, manual
+        specialty/subspecialty, scope_of_service(_ar), doctor_notes,
+        examination_age, qualifications, plus the deterministically
+        precomputed has_detailed_scope/patient_age/age_eligibility_hint
+        flags — see infer_doctor_scope_validation) — built from the
+        ALREADY-RESOLVED doctor record, never the full CRM dataset.
+    """
+    return f"""\
+You are checking whether a SPECIFIC, ALREADY-IDENTIFIED doctor's documented CRM scope of
+service reasonably covers a patient's stated medical need. This is NOT a diagnosis task —
+you are not determining what disease the patient has. You are only comparing the patient's
+stated complaint against the doctor's DOCUMENTED scope, notes, subspecialty, and specialty.
+
+## YOUR TASK
+1. Read the patient's stated complaint/need below.
+2. Read the doctor's authoritative CRM reference (already resolved — do not question or
+   change which doctor this is; you are only judging fit, not identity).
+3. Decide whether the complaint reasonably falls within the doctor's documented scope, using
+   this evidence hierarchy in order of authority (highest first):
+     1. scope_of_service / scope_of_service_ar — the most authoritative evidence: exact
+        documented services/procedures. Prefer this over any category label below.
+     2. doctor_notes — especially an EXPLICIT restriction or inclusion statement (e.g. "new
+        cases only", "does not accept reviews except Sunday", a specific service the doctor
+        does NOT provide, a branch restriction, an age/case-type restriction). An explicit
+        note MAY OVERRIDE an otherwise-suitable scope/specialty reading in either direction.
+     3. subspecialty / manual subspecialty — narrower than specialty, but still just a
+        category label, not proof of exact coverage.
+     4. specialty / manual specialty — the broadest, weakest tier. NEVER treat a specialty
+        match alone as sufficient: two doctors can share the exact same specialty (e.g. both
+        "Orthopedics") while one handles spine surgery and the other handles sports injuries/
+        ACL reconstruction — a specialty label says nothing about which.
+     5. examination_age / patient_age / age_eligibility_hint — see the age-eligibility rule
+        below.
+     6. qualifications / qualifications_ar — CONTEXT ONLY. A doctor's degree or years of
+        experience is never proof they handle a specific condition; never use it alone to
+        justify SUITABLE.
+4. Choose exactly ONE outcome.
+
+## SPECIALTY-ALONE SAFEGUARD (critical)
+If has_detailed_scope is false (no scope_of_service/scope_of_service_ar text at all) and
+doctor_notes gives no explicit relevant signal, do NOT return a confident SUITABLE based on
+specialty or subspecialty alone — prefer UNCLEAR. A bare specialty/subspecialty label is
+supporting context, never the primary decision source.
+
+## OUTCOME DEFINITIONS
+- SUITABLE     : The complaint clearly falls within the doctor's documented scope (or, absent
+                 detailed scope text, a specific and directly-relevant subspecialty/note), and
+                 no doctor_notes restriction rules it out.
+- UNSUITABLE   : The complaint clearly falls OUTSIDE the doctor's documented scope, a
+                 doctor_notes restriction explicitly excludes this kind of case, or
+                 age_eligibility_hint is "outside_range".
+- UNCLEAR      : The documented evidence is too limited, generic (e.g. specialty-only with no
+                 detailed scope), or ambiguous to confidently decide either way — do NOT guess;
+                 this is the safe default when evidence is thin.
+- NOT_APPLICABLE : Use only if the reference data given to you is empty/unusable (this should
+                 be rare — the caller already checked for a complaint and reference data
+                 before invoking you).
+
+## AGE-ELIGIBILITY RULE
+age_eligibility_hint is precomputed deterministically from an explicitly-stated patient age
+compared against examination_age — trust it when present: "outside_range" is strong evidence
+toward UNSUITABLE; "within_range" supports (but does not alone prove) SUITABLE. When
+age_eligibility_hint is null/absent (no explicit patient age was stated), do NOT infer or
+penalize based on age — proceed on the other evidence only.
+
+## MEDICAL-SAFETY RULES (read carefully)
+- Do NOT diagnose the patient. Never state what disease/condition the patient "has".
+- Only state whether the stated symptoms/need appear within or outside the doctor's
+  DOCUMENTED scope — ground every claim in the CRM reference text given below, not in your
+  own general medical knowledge.
+- Do not invent scope-of-service content that isn't present in the reference below.
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+
+════════════════════════════════════════════════════════════
+PATIENT'S STATED COMPLAINT / NEED
+════════════════════════════════════════════════════════════
+{patient_complaint or "(not available)"}
+
+════════════════════════════════════════════════════════════
+DOCTOR CRM REFERENCE  (already resolved — the authoritative record for this specific doctor)
+════════════════════════════════════════════════════════════
+{doctor_reference or "(not available)"}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "outcome": "<SUITABLE | UNSUITABLE | UNCLEAR | NOT_APPLICABLE>",
+  "patient_need_summary": "<1 sentence, patient's own words/summary — no diagnosis>",
+  "doctor_scope_summary": "<1 sentence summarising the doctor's relevant documented scope>",
+  "matched_scope_evidence": ["<verbatim snippet(s) from the CRM reference that drove your decision>"],
+  "reasoning": "<2-3 sentences, grounded ONLY in the CRM reference text above>",
+  "is_violation": <true if outcome == "UNSUITABLE", else false>
+}}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LEGACY — build_user_prompt()
 #   Kept for backward-compatibility with the non-graph CallAnalyzer path.
 #   The new graph pipeline uses the four focused builders above instead.
@@ -758,6 +951,107 @@ Do Not include any additional commentary or explanation.
 If there is not a clear date provided map between the call date :{date} and the nearest date of the week day mentioned for reservation from the call date in 2026. If the date is not mentioned, return null.
 
 Respond ONLY with a valid JSON object with keys:"appointment_date", "doctor_name", "specialty_name","Patient_name","offer_name".
+
+Transcript:
+{transcript}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE F — Doctor Validation Name-Extraction Prompt
+#   Focus: same conversation-reading judgment APPOINTMENT_EXTRACTION_PROMPT
+#   already gets right (e.g. it correctly returns doctor_name='وصال',
+#   specialty_name='اورام' for a call that also contains "وصال بعيادة
+#   الاورام" and "دكتور اورام") — reused here as its OWN dedicated prompt
+#   for app.service_hub.doctor_validation's factual-information check,
+#   never by calling or altering the appointment-extraction flow itself
+#   (that node only runs on a booking intent; doctor validation must work
+#   with or without one). Consumed by app.agent.nodes.
+#   extract_doctor_semantic_context via the SAME app.agent.nodes.
+#   _focused_llm_call helper appointment extraction uses.
+#
+#   The output is an ADDITIVE quality layer, never the sole gate: when it
+#   returns nothing usable (LLM failure, or a genuinely doctor-less call),
+#   app.service_hub.doctor_validation's existing deterministic candidate
+#   extraction is left to decide on its own, unchanged — see
+#   validate_doctor_information's semantic_doctor_name docstring. The one
+#   exception is "doctor_role" == "agent_self_introduction": that is a
+#   POSITIVE assertion the LLM actively made (never a default/empty
+#   value), and app.agent.nodes.validate_doctor_node treats it as an
+#   authoritative signal to skip Doctor Validation entirely — see that
+#   node's docstring.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DOCTOR_NAME_EXTRACTION_PROMPT = """
+You are extracting which HUMAN DOCTOR, if any, is the active booking/inquiry target in this call-center transcript — nothing else.
+
+════════════════════════════════════════════════════════════
+RULE #1 (HIGHEST PRIORITY) — AGENT SELF-INTRODUCTION
+════════════════════════════════════════════════════════════
+Before accepting ANY doctor name, first determine whether that name belongs to the speaking AGENT introducing himself/herself, rather than to a doctor being discussed, recommended, or booked for the patient.
+
+Names introduced in phrases such as "مع حضرتك دكتور X", "مع حضرتك د X", "معك دكتور X", "أنا دكتور X", "أنا الدكتور X", or any equivalent greeting/self-identification pattern (in Arabic or English: "this is Dr X", "you're speaking with Dr X", "I'm Dr X") are the AGENT'S OWN IDENTITY, never a doctor target. This applies to EVERY agent turn in the conversation, not only the first greeting — a call can be transferred through multiple agents, each introducing themselves the same way, and NONE of those names is ever a doctor target.
+
+A Patient turn that merely ADDRESSES that same agent by the name/title they introduced themselves with — a greeting, a thanks, an acknowledgement ("حياك الله دكتور محمد", "شكرا دكتور محمد", "اهلا دكتور محمد") — does NOT change this. That name stays the agent's identity; it does not become patient_selected, agent_recommended, a booking_target, or a booking_confirmation just because the patient used it too.
+
+When the ONLY doctor-shaped name(s) anywhere in the conversation come from self-introduction(s) (optionally echoed back by the patient), you MUST return:
+  "doctor_name": null
+  "doctor_role": "agent_self_introduction"
+  "doctor_validation_needed": false
+Do not partially "rescue" a self-introduced name into any other role.
+
+This exclusion is NEVER global or permanent for that name string, only for THAT specific self-introduction mention: if a SEPARATE, later, independent part of the SAME conversation clearly and unambiguously names a real third-party clinical doctor for the patient to see (a recommendation, a booking, an inquiry) — even one who happens to share the same first name as an agent who introduced themselves earlier — that later mention IS a real doctor target and must be extracted normally, with doctor_role reflecting that real interaction (e.g. "agent_recommended", "patient_selected").
+
+Examples that must produce doctor_name=null / doctor_role="agent_self_introduction" / doctor_validation_needed=false:
+- "السلام عليكم مع حضرتك دكتور محمد من مجموعة اندلسية صحة"
+- "السلام عليكم مع حضرتك د ابانوب من قسم الرعاية المنزلية"
+- "مع حضرتك دكتور هشام" / "مع حضرتك د ابانوب"
+- "انا الدكتور محمد" / "أنا دكتور يوسف"
+- "السلام عليكم مع حضرتك دكتور محمد" followed later by "Patient: حياك الله دكتور محمد" / "شكرا دكتور محمد"
+
+Examples that ARE real doctor targets (do NOT treat as self-introduction):
+- "متاح معانا دكتور شريف" -> شريف, agent_recommended
+- "متاح معنا الاستشاري اسامة عبد السلام" -> اسامة عبد السلام, agent_recommended
+- "متاح معانا دكتورة وصال" -> وصال, agent_recommended
+- "ابغى احجز مع دكتور احمد أفندي" -> احمد أفندي, patient_selected
+- An agent who introduced themselves as "دكتور محمد" earlier, followed LATER by a genuinely separate "متاح معانا دكتور شريف عظام" -> شريف is still the valid target; محمد stays excluded
+
+════════════════════════════════════════════════════════════
+RULE #2 — ONLY A PLAUSIBLE HUMAN NAME, NEVER A FRAGMENT
+════════════════════════════════════════════════════════════
+Before returning a doctor name, you must be able to answer YES to this exact question: "Is this text actually being used as the name of a human doctor in this conversation?" If the answer is no, unclear, or the text is anything else, return null — do not guess, do not soften a rejection into a weaker candidate.
+
+A دكتور/طبيب/Dr TITLE does NOT automatically mean whatever word or phrase follows it is a name. Read the surrounding sentence and judge what the word is actually doing.
+
+Never return any of the following as a doctor name, even when they immediately follow a doctor title:
+- a verb, verb phrase, or sentence fragment (e.g. "بعدين", "بتكتب", "بيكون", "لعمل", "وبعدها بتذهب للاستقبال", "تجنبا لطلب", "وبتسال الاستقبال")
+- a medical specialty, subspecialty, or service name (e.g. "اورام", "عصب", "مخ واعصاب", "عصب ود تركيبات", "تركيبات") — "دكتور اورام" means the specialty is Oncology, not a doctor literally named "اورام"
+- a department/team name (e.g. "التمريض" nursing, "قسم الاشعة" the radiology department) — "التمريض بيكون" is a sentence fragment about the nursing team, never a name
+- a generic, unnamed doctor role or reference ("الطبيب المعالج", "الطبيب المختص", "اى طبيب", "زيارة طبيب", "مين", "مين / يوم ايه", "اخصائيين ممتازين")
+- a restrictive/quantifying word attached to the title ("دكتور فقط" = "male doctors ONLY" — "فقط" is not a name; if a list follows such as "دكتور فقط\\nدكتور شريف\\nودكتور احمد", the real names are شريف and احمد, "فقط" is excluded)
+- a question, booking/administrative/temporal phrase, location, price, or duration ("حجز موعد مع اى طبيب؟", "مواعيد متاحة", "في الطوارئ")
+- any other text that is not, on its own, a plausible human personal name
+
+A doctor name MAY be just ONE token (a first name only) when that is genuinely all the conversation ever states — never require two tokens, and never invent or pad a second token. Just as important: never let a real first name absorb an adjacent specialty/location/service word into the returned name. For example, "دكتورة وصال بعيادة الاورام" must yield doctor_name "وصال" (specialty context "اورام"), never "وصال بعياده" or "وصال بعيادة الاورام".
+
+When the SAME doctor is referred to more than once in the conversation at different levels of completeness (e.g. "وصال" earlier, then the fuller "وصال محمد" later), return only the FULLEST name actually stated anywhere in the conversation — never both forms, never the shorter one once a fuller one appears.
+
+If a doctor title appears with no name attached at all and no specific person is ever named ("ممكن نعمل زيارة طبيب في البداية", "ممكن نعمل زيارة طبيب عظام في البداية"), doctor_name is null — never invent a placeholder doctor. Still extract the specialty context when one is present ("عظام" in the second example).
+
+════════════════════════════════════════════════════════════
+SPECIALTY CONTEXT
+════════════════════════════════════════════════════════════
+Separately, extract the medical specialty/service/department context surrounding the doctor mention — or, when no doctor name qualifies at all, whatever specialty is still being discussed (e.g. "اورام" for oncology, "عصب" / "تركيبات" for endodontic/prosthodontic dental work, "الأنف والأذن والحنجرة" for ENT). This is conversational context only — never treat it as the doctor's authoritative CRM specialty, and never let it leak into the doctor name itself.
+
+Do not guess or infer information that is not explicitly stated in the transcript. Do not include any additional commentary or explanation.
+
+Respond ONLY with a valid JSON object, no markdown fences, with exactly these keys:
+{{
+  "doctor_name": "<the single fullest plausible human doctor name actually used as the active target in this conversation, or null if none qualifies>",
+  "doctor_role": "<one of: agent_self_introduction, patient_selected, agent_recommended, booking_confirmation, mention, or null if no doctor name qualifies>",
+  "doctor_context_specialty": "<the specialty/service/department phrase discussed around the doctor (or, if no doctor qualifies, around the request generally), or null if none is mentioned>",
+  "doctor_validation_needed": <true if doctor_name is a genuine third-party clinical doctor target, false if it is null or the only mention was an agent self-introduction>
+}}
 
 Transcript:
 {transcript}

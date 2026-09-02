@@ -68,6 +68,12 @@ class QAAnalysisResult(BaseModel):
     # when its own request type wasn't present in the call.
     bank_validation: Optional[dict[str, Any]] = None
     location_validation: Optional[dict[str, Any]] = None
+    # Doctor validation is two independent checks (deterministic factual
+    # info + separate LLM-based recommendation-suitability) — same pattern
+    # as bank/location being independent of each other. Either is None
+    # when its own applicability condition wasn't met for this call.
+    doctor_validation: Optional[dict[str, Any]] = None
+    doctor_scope_validation: Optional[dict[str, Any]] = None
 
     # monitoring only — not part of the public schema
     _latency_ms: Optional[float] = None
@@ -103,6 +109,8 @@ class QAAnalysisResult(BaseModel):
             qa_review_comment=None,
             bank_validation=None,
             location_validation=None,
+            doctor_validation=None,
+            doctor_scope_validation=None,
         )
 
 
