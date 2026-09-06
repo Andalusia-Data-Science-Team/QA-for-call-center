@@ -64,6 +64,16 @@ class AgentState(TypedDict, total=False):
     doctor_validation: Optional[dict[str, Any]]
     doctor_scope_validation: Optional[dict[str, Any]]
 
+    # COE (Center of Excellence) validation — a single independent check
+    # (separate graph node, separate CRM fetch via app.service_hub.crm_coe,
+    # separate state key) bundling two related sub-results: whether the
+    # agent recommended the correct COE for the patient's primary complaint,
+    # and whether the initial COE booking started with an approved primary
+    # doctor. Written by app.agent.nodes.infer_coe_validation /
+    # skip_coe_validation — NOT_APPLICABLE when no COE/specialized-center
+    # trigger was detected (see app.service_hub.coe_validation).
+    coe_validation: Optional[dict[str, Any]]
+
     # ── Error handling ────────────────────────────────────────────────────
     # Last-write-wins, for the same reason `result` above needs it: when
     # multiple parallel LLM nodes (behavioral/compliance/offer/script) fail

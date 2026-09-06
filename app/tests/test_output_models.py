@@ -1,4 +1,4 @@
-from models.output import QAAnalysisResult
+from app.models.output import QAAnalysisResult
 
 def test_qaanalysisresult_preserves_conversation_link():
     result = QAAnalysisResult(

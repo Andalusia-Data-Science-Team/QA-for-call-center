@@ -74,6 +74,10 @@ class QAAnalysisResult(BaseModel):
     # when its own applicability condition wasn't met for this call.
     doctor_validation: Optional[dict[str, Any]] = None
     doctor_scope_validation: Optional[dict[str, Any]] = None
+    # COE (Center of Excellence) validation — bundles the correct-COE-
+    # recommendation and correct-primary-doctor checks. None when no COE
+    # trigger was present for this call (the normal/expected case).
+    coe_validation: Optional[dict[str, Any]] = None
 
     # monitoring only — not part of the public schema
     _latency_ms: Optional[float] = None
@@ -111,6 +115,7 @@ class QAAnalysisResult(BaseModel):
             location_validation=None,
             doctor_validation=None,
             doctor_scope_validation=None,
+            coe_validation=None,
         )
 
 

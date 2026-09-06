@@ -374,6 +374,12 @@ def build_scoring_prompt(
     # one opaque call.
     doctor_summary: str = "",
     doctor_scope_summary: str = "",
+    # COE (Center of Excellence) validation — two independent checks bundled
+    # in one result (correct-COE-recommendation + correct-primary-doctor),
+    # written by app.agent.nodes.infer_coe_validation /
+    # skip_coe_validation. None/"not applicable" when no COE trigger was
+    # detected for this call — see app.service_hub.coe_validation.
+    coe_summary: str = "",
 ) -> str:
     """
     Prompt that synthesizes the three focused sub-evaluations into a final score.
@@ -547,6 +553,33 @@ the doctor were correct.
   - NOT_APPLICABLE: the patient did not describe a medical complaint/need,
     or no doctor was resolved, or no scope evidence was available. No
     doctor-recommendation penalty in any of these cases.
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 9 — COE (CENTER OF EXCELLENCE) VALIDATION
+════════════════════════════════════════════════════════════
+{coe_summary or "(not applicable)"}
+
+This checks two SEPARATE things — never double-penalize the same underlying issue twice:
+  1. coe_match_status — did the agent recommend/confirm the COE that actually matches the
+     patient's primary complaint (IBD/Headache/Asthma/Diabetes)?
+       - pass: correct COE recommended. No violation.
+       - fail: the agent recommended a different supported COE than the complaint warrants —
+         a real violation.
+       - uncertain: the complaint or recommendation could not be reliably identified. Do NOT
+         penalize an uncertain result.
+       - not_applicable: no COE/specialized-center trigger existed for this call at all (most
+         calls). No violation, and this is the normal/expected case — do not treat it as
+         missing information.
+  2. primary_doctor_status — did the agent start the new COE booking with an approved primary
+     doctor for that COE's first clinic?
+       - pass: an approved primary doctor was clearly offered for the initial appointment.
+       - fail: the initial COE booking started with an unapproved or secondary-specialty
+         doctor — a real violation.
+       - uncertain / not_applicable: the call never reached doctor selection, an
+         existing-patient follow-up exception applies, or it is unclear which doctor was
+         intended for the initial appointment. Do NOT penalize either of these.
+  Ground any COE-related flag strictly in the reasoning/evidence provided above — never in
+  outside knowledge about doctors or specialties.
 
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
@@ -838,6 +871,114 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "matched_scope_evidence": ["<verbatim snippet(s) from the CRM reference that drove your decision>"],
   "reasoning": "<2-3 sentences, grounded ONLY in the CRM reference text above>",
   "is_violation": <true if outcome == "UNSUITABLE", else false>
+}}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE — COE (Center of Excellence) Validation Prompt (semantic, LLM-based)
+#   Focus: given that a COE/specialized-center trigger was ALREADY confirmed
+#          deterministically (app.service_hub.coe_validation.
+#          classify_coe_trigger — this prompt is never built otherwise),
+#          extract the patient's primary complaint, the COE the agent
+#          actually recommended/confirmed, and which named doctor(s) the
+#          agent offered/selected for the INITIAL COE appointment vs. only
+#          as a possible LATER referral.
+#   This prompt must NEVER decide whether a doctor is an approved primary
+#   doctor — that is a deterministic, hardcoded lookup
+#   (coe_validation.match_primary_doctor) applied by the caller AFTER this
+#   extraction, never an LLM judgment call.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_coe_prompt(
+    call: CallTranscript,
+    coe_reference: str = "",
+    trigger_reason: str = "",
+) -> str:
+    """
+    Parameters
+    ----------
+    coe_reference : str
+        Compact JSON of the four supported COEs' first clinic + approved
+        script (already CRM-resolved and HTML-stripped where needed — see
+        app.service_hub.coe_validation.build_coe_reference). Context only —
+        never asked to judge doctor approval.
+    trigger_reason : str
+        Why COE validation was triggered (see classify_coe_trigger) —
+        included so the model grounds its extraction in the same evidence
+        that triggered this check, rather than re-deciding applicability.
+    """
+    return f"""\
+You are extracting facts about a Center of Excellence (COE) discussion in a call-center
+transcript — nothing else. A deterministic check already confirmed this call DOES contain a
+genuine COE/specialized-center discussion (reason below); do not re-decide that.
+
+## SPEAKER ATTRIBUTION (critical)
+Only what the AGENT (human call-center employee) says counts as a recommendation,
+confirmation, offer, or booking action. Never treat something the CUSTOMER/PATIENT says as if
+the agent said or did it.
+
+## YOUR TASK
+1. Identify the patient's PRIMARY complaint — their main reason for calling / the complaint
+   they request an appointment for / the complaint most clearly discussed or connected to the
+   COE recommendation. If several unrelated complaints appear and none is clearly primary,
+   say so (primary_complaint_category = null) rather than guessing.
+2. Classify that primary complaint into exactly one of: IBD (gastrointestinal/digestive),
+   Headache, Asthma (chest/pulmonary/respiratory), Diabetes (diabetes/endocrinology), or null
+   if it does not clearly fit one of these four.
+3. Identify which of the four supported COEs (IBD | Headache | Asthma | Diabetes) the AGENT
+   actually recommended or confirmed — grounded in what the agent said, never inferred merely
+   because a doctor happens to be a COE member.
+4. List every doctor name the AGENT offered, recommended, selected, confirmed, or booked for
+   the patient's INITIAL COE appointment, separately from any doctor mentioned ONLY as a
+   possible LATER referral (e.g. "an ENT doctor may get involved after the initial pulmonology
+   assessment" is a later-referral mention, not an initial doctor).
+5. Determine whether the transcript clearly establishes the customer as an EXISTING patient
+   with an established treating doctor (continuing follow-up), as opposed to starting a new
+   COE journey. Only mark this true when the evidence is explicit and clear.
+
+## RULES
+- Never invent a complaint, COE, or doctor name that is not actually present in the transcript.
+- A qualifying medical complaint alone, without any COE/specialized-center discussion, is
+  already excluded by the deterministic trigger check — you do not need to re-verify that.
+- Do not decide whether an extracted doctor is an "approved" COE doctor — that is decided
+  separately, deterministically, after your extraction.
+
+════════════════════════════════════════════════════════════
+WHY THIS CALL TRIGGERED COE VALIDATION
+════════════════════════════════════════════════════════════
+{trigger_reason or "(not available)"}
+
+════════════════════════════════════════════════════════════
+SUPPORTED COE REFERENCE (first clinic + approved script per COE — context only)
+════════════════════════════════════════════════════════════
+{coe_reference or "(not available)"}
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+
+════════════════════════════════════════════════════════════
+TRANSCRIPT
+════════════════════════════════════════════════════════════
+{call.transcript}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "primary_complaint": "<1 sentence, patient's own words/summary, or null>",
+  "primary_complaint_category": "<IBD | Headache | Asthma | Diabetes | null>",
+  "recommended_coe": "<IBD | Headache | Asthma | Diabetes | null>",
+  "coe_recommendation_evidence": "<verbatim agent excerpt, or null>",
+  "initial_doctors": ["<doctor name offered/selected/confirmed/booked for the INITIAL appointment>"],
+  "referral_only_doctors": ["<doctor name mentioned ONLY as a possible later referral>"],
+  "existing_patient_exception": <true | false>,
+  "existing_patient_evidence": "<verbatim patient excerpt establishing an existing treating-doctor relationship, or null>",
+  "reasoning": "<2-3 sentences grounded only in the transcript above>"
 }}
 """
 

@@ -39,6 +39,7 @@ from sqlalchemy import create_engine, text as sa_text
 from arabic_reshaper import reshape
 
 from app.agent.state import AgentState
+from app.models.input import CallTranscript
 from app.models.output import QAAnalysisResult
 from app.prompts.qa_prompt import (
     SYSTEM_PROMPT,
@@ -51,6 +52,7 @@ from app.prompts.qa_prompt import (
     build_script_prompt,
     build_scoring_prompt,
     build_doctor_scope_prompt,
+    build_coe_prompt,
     build_user_prompt,   # kept for legacy path
 )
 from app.services.criteria_loader import CriteriaLoader
@@ -67,11 +69,24 @@ from app.service_hub.doctor_validation import (
     doctor_scope_skip_reason,
     doctor_scope_validation_needed,
     extract_doctor_context_specialty,
+    extract_doctor_turn_candidates,
     extract_patient_clinical_need,
     extract_patient_stated_age,
     has_detailed_scope_evidence,
     patient_describes_medical_complaint,
     validate_doctor_information,
+)
+from app.service_hub.coe_validation import (
+    AUTHORITATIVE_PRIMARY_DOCTORS,
+    build_coe_reference,
+    classify_coe_trigger,
+    existing_patient_exception_evidence,
+    ground_doctor_names,
+    normalize_doctor_name_for_match,
+    resolve_primary_complaint,
+    resolve_primary_doctor_identity,
+    resolve_recommended_coe,
+    scripts_from_reference,
 )
 from app.services.text_helpers import (
     _normalize_arabic,
@@ -79,6 +94,7 @@ from app.services.text_helpers import (
     _strip_markdown_fences,
     _norm_score,
     normalize_arabic_text,
+    split_transcript_turns,
 )
 
 logger = logging.getLogger(__name__)
@@ -702,6 +718,7 @@ async def infer_overall_scoring(
     location_summary   = json.dumps(state.get("location_validation") or {}, ensure_ascii=False)
     doctor_summary       = json.dumps(state.get("doctor_validation") or {}, ensure_ascii=False)
     doctor_scope_summary = json.dumps(state.get("doctor_scope_validation") or {}, ensure_ascii=False)
+    coe_summary          = json.dumps(state.get("coe_validation") or {}, ensure_ascii=False)
 
     user_prompt = build_scoring_prompt(
         call,
@@ -714,6 +731,7 @@ async def infer_overall_scoring(
         location_summary=location_summary,
         doctor_summary=doctor_summary,
         doctor_scope_summary=doctor_scope_summary,
+        coe_summary=coe_summary,
     )
     logger.debug(
         "infer_overall_scoring | call_id=%s prompt_len=%d",
@@ -771,6 +789,7 @@ async def aggregate_results(state: AgentState) -> dict:
     location    = state.get("location_validation") or {}
     doctor        = state.get("doctor_validation") or {}
     doctor_scope  = state.get("doctor_scope_validation") or {}
+    coe           = state.get("coe_validation") or {}
 
     # Normalise offer_flags: the offer node uses "C2B"/"NC"/"positive" as type
     # but the ComplianceFlag schema expects type in {C2Com,C2C,C2B,NC}.
@@ -818,6 +837,23 @@ async def aggregate_results(state: AgentState) -> dict:
             "description": doctor_scope.get("reasoning", "The recommended doctor's documented scope does not match the patient's stated need."),
             "transcript_excerpt": "Doctor recommendation given by agent.",
         })
+    # COE (Center of Excellence) is a separate, independent check bundling
+    # two sub-results (correct COE recommendation + correct primary doctor)
+    # — never double-flagged for the same underlying issue: each sub-result
+    # gets its OWN flag only when IT independently indicates a violation.
+    coe_flags = []
+    if coe.get("coe_match_status") == "fail":
+        coe_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": coe.get("reason", "The agent recommended a Center of Excellence that does not match the patient's primary complaint."),
+            "transcript_excerpt": (coe.get("evidence") or [""])[0] or "COE recommendation given by agent.",
+        })
+    if coe.get("primary_doctor_status") == "fail":
+        coe_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": coe.get("reason", "The initial COE booking did not start with an approved primary doctor."),
+            "transcript_excerpt": "Initial COE doctor offered by agent.",
+        })
 
     # Merge all compliance flag lists from all focused evaluations
     all_flags: list[dict] = (
@@ -828,6 +864,7 @@ async def aggregate_results(state: AgentState) -> dict:
         + bank_flags
         + location_flags
         + doctor_flags
+        + coe_flags
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
@@ -879,6 +916,7 @@ async def aggregate_results(state: AgentState) -> dict:
         "location_validation": location,
         "doctor_validation": doctor,
         "doctor_scope_validation": doctor_scope,
+        "coe_validation": coe,
     }
 
     logger.debug(
@@ -942,7 +980,8 @@ async def integrity_check(state: AgentState) -> dict:
     location_violation = (state.get("location_validation") or {}).get("is_violation")
     doctor_violation = (state.get("doctor_validation") or {}).get("is_violation")
     doctor_scope_violation = (state.get("doctor_scope_validation") or {}).get("is_violation")
-    if (bank_violation or location_violation or doctor_violation or doctor_scope_violation) and result.overall_assessment == "pass":
+    coe_violation = (state.get("coe_validation") or {}).get("is_violation")
+    if (bank_violation or location_violation or doctor_violation or doctor_scope_violation or coe_violation) and result.overall_assessment == "pass":
         result = result.model_copy(update={"overall_assessment": "needs_review"})
 
     if result.overall_assessment == "escalate" and not result.escalation_required:
@@ -2221,4 +2260,314 @@ async def infer_doctor_scope_validation(state: AgentState, llm_client: LLMClient
         "doctor_scope_validation": final,
         "usage_list": usage_list,
         "node_trace": _trace(state, "infer_doctor_scope_validation"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node – infer_coe_validation (COE / Center of Excellence validation)
+#   Two related checks bundled in one result:
+#     1. Did the human agent recommend the COE that matches the patient's
+#        primary complaint?
+#     2. Did the human agent start the new COE booking with an approved
+#        primary doctor from that COE's first clinic?
+#   Trigger detection (app.service_hub.coe_validation.classify_coe_trigger)
+#   is fully deterministic and is decided at the GRAPH level by
+#   _coe_intent_router (app.agent.graph) — when it's not applicable, this
+#   node never executes at all (see skip_coe_validation). Its own internal
+#   gate remains as a defensive fallback only, mirroring
+#   infer_doctor_scope_validation/validate_doctor_node.
+#   The LLM is used ONLY for the semantic sub-tasks a regex genuinely
+#   cannot do reliably (identifying the primary complaint among several,
+#   recognising a faithful paraphrase of the approved script, and telling
+#   an INITIAL-appointment doctor apart from a later-referral mention) —
+#   every extracted doctor name is re-grounded against the deterministic
+#   transcript extraction, and doctor approval itself is always decided
+#   deterministically (coe_validation.resolve_primary_doctor_identity,
+#   which resolves an Arabic OR English extracted name to its canonical
+#   approved-doctor identity via an explicit alias table — never by
+#   comparing an Arabic string to an English one with fuzzy similarity),
+#   never by the LLM. A COE reference/CRM lookup failure never crashes the
+#   pipeline — it degrades to the safe DEFAULT_SCRIPTS_AR fallback.
+# ---------------------------------------------------------------------------
+def _doctor_offering_evidence(call: CallTranscript, initial_grounded: list[str]) -> str | None:
+    """Find the Agent turn that actually offered/booked one of
+    *initial_grounded*'s doctors, for use as speaker-attributed evidence
+    (see infer_coe_validation) — the doctor-offering/booking excerpt
+    itself, not just the COE introductory-script excerpt. Returns the
+    ORIGINAL raw turn text (never a translated/altered form)."""
+    if not initial_grounded:
+        return None
+    targets = {normalize_doctor_name_for_match(d) for d in initial_grounded if d}
+    targets.discard("")
+    if not targets:
+        return None
+    for speaker, text in split_transcript_turns(call.transcript):
+        if speaker != "agent":
+            continue
+        norm_text = normalize_doctor_name_for_match(text)
+        if any(t in norm_text for t in targets):
+            return text.strip()[:300]
+    return None
+
+
+def _not_applicable_coe_result(reason: str) -> dict:
+    return {
+        "applicable": False,
+        "triggered": False,
+        "trigger_path": None,
+        "trigger_reason": reason,
+        "primary_complaint": None,
+        "expected_coe": None,
+        "recommended_coe": None,
+        "coe_match_status": "not_applicable",
+        "booking_discussed": False,
+        "recommended_or_selected_doctors": [],
+        "approved_primary_doctors": [],
+        "matched_primary_doctors": [],
+        "primary_doctor_status": "not_applicable",
+        "existing_patient_exception": False,
+        "evidence": [],
+        "reason": reason,
+        "confidence": 1.0,
+        "is_violation": False,
+    }
+
+
+def skip_coe_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's COE-intent router
+    (_coe_intent_router) when classify_coe_trigger found no COE/specialized-
+    center trigger at all — reusing the exact same deterministic gate
+    infer_coe_validation itself uses defensively, so the decision is never
+    duplicated. infer_coe_validation is not on this path: no CRM COE fetch,
+    no LLM call, and — deliberately — no node_trace entry for
+    'infer_coe_validation', since the node never actually ran.
+    """
+    call = state["call"]
+    trigger_ctx = classify_coe_trigger(call)
+    logger.info("coe validation skipped | call_id=%s reason=%s", call.call_id, trigger_ctx["trigger_reason"])
+    print(f"[coe] skipped | call_id={call.call_id} reason={trigger_ctx['trigger_reason']}", flush=True)
+    return {"coe_validation": _not_applicable_coe_result(trigger_ctx["trigger_reason"])}
+
+
+async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict:
+    """Run COE validation. See module-level comment above for the overall
+    deterministic-gate + LLM-semantic-extraction + deterministic-safety-net
+    design, mirroring infer_doctor_scope_validation's architecture.
+    """
+    call = state["call"]
+    trigger_ctx = classify_coe_trigger(call)
+    if not trigger_ctx["triggered"]:
+        result = _not_applicable_coe_result(trigger_ctx["trigger_reason"])
+        return {"coe_validation": result, "node_trace": _trace(state, "infer_coe_validation")}
+
+    # ── Deterministic extraction (never depends on the LLM) ────────────────
+    det_primary, det_categories = resolve_primary_complaint(call)
+    patient_doctors, agent_doctors, _ignored = extract_doctor_turn_candidates(call)
+    booking_discussed = bool(agent_doctors)
+    existing_evidence_det = existing_patient_exception_evidence(call)
+
+    # ── COE reference (CRM, non-fatal on failure) ───────────────────────────
+    try:
+        from app.service_hub.crm_coe import fetch_coe_reference
+        coe_rows = fetch_coe_reference()
+    except Exception as exc:  # noqa: BLE001 — a COE lookup failure must never crash the pipeline
+        logger.warning("coe validation | call_id=%s CRM COE fetch failed (non-fatal) | %s", call.call_id, exc)
+        coe_rows = []
+    reference = build_coe_reference(coe_rows)
+    scripts = scripts_from_reference(reference)
+    det_recommended = resolve_recommended_coe(call, scripts)
+
+    # ── Semantic extraction (LLM) — only for what regex genuinely can't do
+    # reliably: disambiguating a primary complaint among several, faithful-
+    # paraphrase recognition, and initial-vs-referral doctor intent. ───────
+    coe_reference_json = json.dumps(
+        {key: {"first_clinic": entry["first_clinic"], "approved_script": entry["script_ar"]} for key, entry in reference.items()},
+        ensure_ascii=False,
+    )
+    user_prompt = build_coe_prompt(call, coe_reference=coe_reference_json, trigger_reason=trigger_ctx["trigger_reason"])
+    data, err = await _focused_llm_call("infer_coe_validation", call.call_id, user_prompt, llm_client, state)
+    if err:
+        # A COE check must never crash the whole pipeline — degrade to a
+        # safe, non-punitive uncertain result instead of propagating the
+        # LLM failure to handle_error.
+        logger.warning("coe validation | call_id=%s LLM call failed (non-fatal) | %s", call.call_id, err.get("error"))
+        data = {}
+    usage = [data.get("_usage", {})] if isinstance(data, dict) else []
+
+    llm_category = data.get("primary_complaint_category")
+    llm_category = llm_category if llm_category in AUTHORITATIVE_PRIMARY_DOCTORS else None
+    llm_recommended = data.get("recommended_coe")
+    llm_recommended = llm_recommended if llm_recommended in AUTHORITATIVE_PRIMARY_DOCTORS else None
+    llm_primary_complaint_text = data.get("primary_complaint") if isinstance(data.get("primary_complaint"), str) else None
+    initial_doctors_raw = data.get("initial_doctors") if isinstance(data.get("initial_doctors"), list) else []
+    referral_only_raw = data.get("referral_only_doctors") if isinstance(data.get("referral_only_doctors"), list) else []
+    llm_existing = bool(data.get("existing_patient_exception"))
+    llm_existing_evidence = data.get("existing_patient_evidence") if isinstance(data.get("existing_patient_evidence"), str) else None
+
+    # ── Deterministic safety net: a confident single-category keyword hit
+    # always wins over the LLM; the LLM's category is only trusted when the
+    # deterministic pass found nothing, or agrees with it. ──────────────────
+    if det_primary:
+        expected_coe = det_primary
+    elif llm_category and (not det_categories or llm_category in det_categories):
+        expected_coe = llm_category
+    else:
+        expected_coe = None
+    primary_complaint = llm_primary_complaint_text or det_primary
+
+    # Deterministic script/marker match wins over the LLM's own reading.
+    recommended_coe = det_recommended or llm_recommended
+
+    if expected_coe is None:
+        coe_match_status = "uncertain"
+        coe_reason = (
+            "No primary complaint mapping to a supported COE (IBD/Headache/Asthma/Diabetes) "
+            "could be reliably established."
+            if not det_categories and not llm_category else
+            "Multiple complaints were mentioned and no single primary complaint could be established."
+        )
+    elif recommended_coe is None:
+        coe_match_status = "uncertain"
+        coe_reason = "A COE trigger was detected but the specific COE recommended/confirmed by the agent could not be identified."
+    elif recommended_coe == expected_coe:
+        coe_match_status = "pass"
+        coe_reason = f"The agent recommended the {recommended_coe} COE, matching the patient's primary complaint ({expected_coe})."
+    else:
+        coe_match_status = "fail"
+        coe_reason = f"The patient's primary complaint maps to the {expected_coe} COE, but the agent recommended the {recommended_coe} COE."
+
+    # ── Doctor extraction, grounded against the deterministic transcript
+    # candidates — never trusting an LLM-invented name. ─────────────────────
+    referral_only_grounded = ground_doctor_names(referral_only_raw, agent_doctors)
+    initial_grounded = ground_doctor_names(initial_doctors_raw, agent_doctors)
+    if not initial_grounded:
+        # The LLM didn't (or couldn't) distinguish — fall back to every
+        # agent-named doctor that isn't already classified as referral-only.
+        initial_grounded = [d for d in agent_doctors if d not in referral_only_grounded]
+    # The same doctor can legitimately be named in more than one Agent turn
+    # (offered, then re-confirmed at booking) — dedupe by normalised
+    # identity (order-preserving, keeps the FIRST exact wording) so the
+    # reason/evidence never repeats the same doctor twice.
+    _seen_doctor_keys: set[str] = set()
+    _deduped_initial: list[str] = []
+    for _d in initial_grounded:
+        _key = normalize_doctor_name_for_match(_d) or _d
+        if _key not in _seen_doctor_keys:
+            _seen_doctor_keys.add(_key)
+            _deduped_initial.append(_d)
+    initial_grounded = _deduped_initial
+
+    existing_exception = bool(existing_evidence_det) or (
+        llm_existing and bool(llm_existing_evidence) and normalize_arabic_text(llm_existing_evidence) in normalize_arabic_text(call.transcript)
+    )
+    existing_evidence = existing_evidence_det or (llm_existing_evidence if existing_exception else None)
+
+    coe_for_doctor_check = recommended_coe or expected_coe
+    approved_list = AUTHORITATIVE_PRIMARY_DOCTORS.get(coe_for_doctor_check, []) if coe_for_doctor_check else []
+    # Resolve each initial doctor's CANONICAL approved identity — this is
+    # the fix for Arabic-vs-English cross-script matching: an Arabic
+    # extraction (e.g. "اسامه عبد السلام") is resolved against the
+    # explicit PRIMARY_DOCTOR_ALIASES table, never compared directly to the
+    # English canonical name via fuzzy string similarity. The ORIGINAL
+    # extracted string is preserved alongside its resolved identity so
+    # both can be reported (see doctor_reason below and
+    # recommended_or_selected_doctors, which always keeps the original
+    # transcript evidence unchanged).
+    matched_pairs = [
+        (extracted, canonical)
+        for extracted in initial_grounded
+        for canonical in [resolve_primary_doctor_identity(extracted, coe_for_doctor_check)]
+        if canonical
+    ]
+    matched_primary_doctors = []
+    for _extracted, canonical in matched_pairs:
+        if canonical not in matched_primary_doctors:
+            matched_primary_doctors.append(canonical)
+
+    def _describe_pair(extracted: str, canonical: str) -> str:
+        # Skip the redundant "(same text)" parenthetical only when the
+        # original extraction already IS the canonical spelling.
+        if normalize_doctor_name_for_match(extracted) == normalize_doctor_name_for_match(canonical):
+            return canonical
+        return f"{canonical} ({extracted})"
+
+    if existing_exception:
+        primary_doctor_status = "not_applicable"
+        doctor_reason = (
+            "Existing-patient exception: the transcript establishes an existing follow-up "
+            "relationship with a treating doctor, so normal follow-up booking is not judged "
+            "against the COE primary-doctor list."
+        )
+    elif not booking_discussed:
+        primary_doctor_status = "not_applicable"
+        doctor_reason = "The conversation did not reach doctor selection or booking."
+    elif coe_for_doctor_check is None:
+        primary_doctor_status = "uncertain"
+        doctor_reason = "A doctor was mentioned but the COE could not be confidently identified, so primary-doctor eligibility cannot be determined."
+    elif matched_pairs:
+        primary_doctor_status = "pass"
+        described = [_describe_pair(extracted, canonical) for extracted, canonical in matched_pairs]
+        doctor_reason = (
+            f"The initial {coe_for_doctor_check} COE booking included approved primary "
+            f"doctor(s): {', '.join(described)}."
+        )
+    elif initial_grounded:
+        primary_doctor_status = "fail"
+        doctor_reason = (
+            f"The initial {coe_for_doctor_check} COE booking started with a doctor "
+            f"({', '.join(initial_grounded)}) who is not on the approved primary-doctor list "
+            f"({', '.join(approved_list)})."
+        )
+    elif referral_only_grounded:
+        primary_doctor_status = "not_applicable"
+        doctor_reason = "Only a later-referral doctor was mentioned; no initial COE appointment doctor was established."
+    else:
+        primary_doctor_status = "uncertain"
+        doctor_reason = "A doctor was mentioned, but the transcript does not clearly establish whether they were intended for the initial appointment."
+
+    evidence: list[str] = []
+    if trigger_ctx.get("evidence"):
+        evidence.append(trigger_ctx["evidence"])
+    # The doctor-offering/booking excerpt itself — not only the COE
+    # introductory-script excerpt — so a reader can see WHICH doctor(s)
+    # were actually offered, in the agent's own words.
+    doctor_evidence = _doctor_offering_evidence(call, initial_grounded)
+    if doctor_evidence and doctor_evidence not in evidence:
+        evidence.append(doctor_evidence)
+    if existing_evidence:
+        evidence.append(existing_evidence)
+
+    result = {
+        "applicable": True,
+        "triggered": True,
+        "trigger_path": trigger_ctx["trigger_path"],
+        "trigger_reason": trigger_ctx["trigger_reason"],
+        "primary_complaint": primary_complaint,
+        "expected_coe": expected_coe,
+        "recommended_coe": recommended_coe,
+        "coe_match_status": coe_match_status,
+        "booking_discussed": booking_discussed,
+        "recommended_or_selected_doctors": initial_grounded,
+        "approved_primary_doctors": approved_list,
+        "matched_primary_doctors": matched_primary_doctors,
+        "primary_doctor_status": primary_doctor_status,
+        "existing_patient_exception": existing_exception,
+        "evidence": evidence,
+        "reason": f"{coe_reason} {doctor_reason}".strip(),
+        "confidence": 0.9 if coe_match_status in ("pass", "fail") and primary_doctor_status != "uncertain" else 0.5,
+        "is_violation": coe_match_status == "fail" or primary_doctor_status == "fail",
+    }
+    logger.info(
+        "coe validation | call_id=%s coe_match=%s primary_doctor=%s expected=%s recommended=%s",
+        call.call_id, coe_match_status, primary_doctor_status, expected_coe, recommended_coe,
+    )
+    print(
+        f"[coe] outcome | coe_match={coe_match_status} primary_doctor={primary_doctor_status} "
+        f"expected={expected_coe} recommended={recommended_coe} doctors={initial_grounded}",
+        flush=True,
+    )
+    return {
+        "coe_validation": result,
+        "usage_list": usage,
+        "node_trace": _trace(state, "infer_coe_validation"),
     }

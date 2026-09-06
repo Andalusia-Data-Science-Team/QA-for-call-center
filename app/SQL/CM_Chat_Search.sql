@@ -52,7 +52,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
     WHERE
         (@ConversationId IS NULL OR c.UniqueId = @ConversationId)
         AND (@AgentFullName IS NULL OR (p.FirstName + ' ' + p.LastName) LIKE '%' + @AgentFullName + '%')
-        AND (@AgentEmail IS NULL OR a.EmailAddress LIKE '%' + @AgentEmail + '%')
+        --AND (@AgentEmail IS NULL OR a.EmailAddress LIKE '%' + @AgentEmail + '%')
         AND (
             @FilterDate IS NULL
             OR (
@@ -98,7 +98,8 @@ SELECT
 FROM TopConversations tc
 INNER JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[MessagesTotal] m
     ON m.ConversationId = tc.UniqueId
---WHERE m.ConversationId = '459E4C5D-6699-F111-9B33-000D3AA9D409'
+
+WHERE m.ConversationId = 'CBB4C284-8799-F111-9B33-000D3AA9D409'
 ORDER BY
     tc.Start_DateTime DESC,
     tc.UniqueId,

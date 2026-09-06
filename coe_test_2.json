@@ -1,0 +1,21 @@
+{
+  "call_id": "COE-TEST-ASTHMA-002",
+  "conversation_link": null,
+  "agent_name": "COE Test Agent",
+  "agent_email": "coe.test@andalusiagroup.net",
+  "Patient_Phone": "0509876543",
+  "call_date": "2026-09-06",
+  "call_duration_seconds": 360,
+  "first_response_minutes": 0,
+  "department": "Scheduling",
+  "topic": "COE Asthma Booking",
+  "business_unit": "AHJ",
+  "channel": "WhatsApp",
+  "answer_state": "OnTime",
+  "service_level_on_time": true,
+  "is_answered": true,
+  "was_forwarded": false,
+  "transcript": "Agent: السلام عليكم، مع حضرتك سارة من مجموعة أندلسية صحة. كيف أقدر أساعد حضرتك؟\nPatient: وعليكم السلام، عندي ربو وضيق في التنفس وأريد أعرف هل عندكم مركز متخصص لأمراض الصدر؟\nAgent: نعم، لضمان تحقيق أقصى استفادة والوصول إلى تشخيص دقيق لحالتك من جميع الجوانب الطبية، سيتم حجز موعد لحضرتك بمركز التميز المتخصص في علاج أمراض الصدر والجهاز التنفسي، والذي يضم نخبة من أفضل الاستشاريين والأخصائيين.\nPatient: ممتاز، أريد أحجز في مركز التميز.\nAgent: يبدأ الحجز أولاً في عيادة الصدرية، والمتاح لحضرتك دكتورة نجوى الحلواني أو دكتور عيد العجمي.\nPatient: أحجز مع دكتورة نجوى الحلواني لو سمحت.\nAgent: تم تأكيد حجز موعدك مع دكتورة نجوى الحلواني في عيادة الصدرية ضمن مركز التميز لعلاج أمراض الصدر والجهاز التنفسي.",
+  "message_count": 7,
+  "bot_handoff_occurred": false
+}

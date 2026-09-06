@@ -1,3 +1,4 @@
+import html
 import re
 import unicodedata
 
@@ -264,6 +265,24 @@ def split_transcript_by_speaker(transcript: str | None) -> tuple[str, str]:
     patient = "\n".join(t for s, t in turns if s == "patient")
     agent = "\n".join(t for s, t in turns if s == "agent")
     return patient, agent
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def strip_html_tags(text: str | None) -> str:
+    """Remove HTML markup and decode HTML entities from *text*, returning
+    plain text. Used for CRM fields that may contain raw HTML (e.g. the
+    Asthma COE's cr301_arabicscript — see app.service_hub.coe_validation)
+    before the value is compared for semantic script-adherence or included
+    in an LLM prompt. Never executes/evaluates the markup — this is a plain
+    string transform (tag removal + entity decoding), not an HTML parser.
+    """
+    if not text:
+        return ""
+    without_tags = _HTML_TAG_RE.sub(" ", str(text))
+    decoded = html.unescape(without_tags)
+    return re.sub(r"\s+", " ", decoded).strip()
 
 
 def mask_financial_identifier(value: str | None) -> str:
