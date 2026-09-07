@@ -80,9 +80,12 @@ from app.service_hub.coe_validation import (
     AUTHORITATIVE_PRIMARY_DOCTORS,
     build_coe_reference,
     classify_coe_trigger,
+    clean_extracted_doctor_name,
     existing_patient_exception_evidence,
     ground_doctor_names,
+    ground_llm_coe_value,
     normalize_doctor_name_for_match,
+    resolve_campaign_coe,
     resolve_primary_complaint,
     resolve_primary_doctor_identity,
     resolve_recommended_coe,
@@ -2324,6 +2327,8 @@ def _not_applicable_coe_result(reason: str) -> dict:
         "recommended_or_selected_doctors": [],
         "approved_primary_doctors": [],
         "matched_primary_doctors": [],
+        "campaign_coe": None,
+        "validation_coe": None,
         "primary_doctor_status": "not_applicable",
         "existing_patient_exception": False,
         "evidence": [],
@@ -2363,8 +2368,19 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     # ── Deterministic extraction (never depends on the LLM) ────────────────
     det_primary, det_categories = resolve_primary_complaint(call)
     patient_doctors, agent_doctors, _ignored = extract_doctor_turn_candidates(call)
+    # Trim a trailing clinic/department/specialty connector (e.g. "بعياده
+    # المخ") that the shared extraction engine's stop-marker regex doesn't
+    # catch when fused with a leading "ب" — see clean_extracted_doctor_
+    # name's docstring. COE-local cleanup only; the shared extraction
+    # engine itself (used by other, unrelated validators) is untouched.
+    agent_doctors = [clean_extracted_doctor_name(d) for d in agent_doctors]
     booking_discussed = bool(agent_doctors)
     existing_evidence_det = existing_patient_exception_evidence(call)
+    # campaign_coe is the AUTHORITATIVE COE established by a campaign/post
+    # message's own text (e.g. "مركز تميز الصداع" -> Headache) — never
+    # something an LLM is trusted to override (see resolve_campaign_coe).
+    # None for every non-campaign_origin trigger path.
+    campaign_coe = resolve_campaign_coe(call)
 
     # ── COE reference (CRM, non-fatal on failure) ───────────────────────────
     try:
@@ -2384,7 +2400,12 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         {key: {"first_clinic": entry["first_clinic"], "approved_script": entry["script_ar"]} for key, entry in reference.items()},
         ensure_ascii=False,
     )
-    user_prompt = build_coe_prompt(call, coe_reference=coe_reference_json, trigger_reason=trigger_ctx["trigger_reason"])
+    user_prompt = build_coe_prompt(
+        call,
+        coe_reference=coe_reference_json,
+        trigger_reason=trigger_ctx["trigger_reason"],
+        trigger_path=trigger_ctx["trigger_path"],
+    )
     data, err = await _focused_llm_call("infer_coe_validation", call.call_id, user_prompt, llm_client, state)
     if err:
         # A COE check must never crash the whole pipeline — degrade to a
@@ -2396,8 +2417,13 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
 
     llm_category = data.get("primary_complaint_category")
     llm_category = llm_category if llm_category in AUTHORITATIVE_PRIMARY_DOCTORS else None
-    llm_recommended = data.get("recommended_coe")
-    llm_recommended = llm_recommended if llm_recommended in AUTHORITATIVE_PRIMARY_DOCTORS else None
+    # An LLM-claimed recommended_coe is discarded unless an actual Agent
+    # turn contains real transcript evidence for it — never accepted
+    # merely because it's one of the four categories shown as reference
+    # data (see ground_llm_coe_value's docstring). This is what stops a
+    # hallucinated value (e.g. "IBD" with zero supporting agent evidence)
+    # from producing a false mismatch.
+    llm_recommended = ground_llm_coe_value(call, data.get("recommended_coe"))
     llm_primary_complaint_text = data.get("primary_complaint") if isinstance(data.get("primary_complaint"), str) else None
     initial_doctors_raw = data.get("initial_doctors") if isinstance(data.get("initial_doctors"), list) else []
     referral_only_raw = data.get("referral_only_doctors") if isinstance(data.get("referral_only_doctors"), list) else []
@@ -2415,8 +2441,28 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         expected_coe = None
     primary_complaint = llm_primary_complaint_text or det_primary
 
-    # Deterministic script/marker match wins over the LLM's own reading.
+    # Deterministic script/marker match wins over the LLM's own (now
+    # grounded) reading. recommended_coe represents ONLY an actual Agent
+    # recommendation/confirmation — never the campaign context (see
+    # validation_coe below for the value primary-doctor eligibility
+    # should actually be checked against).
     recommended_coe = det_recommended or llm_recommended
+
+    # validation_coe is the COE whose primary-doctor rules apply — kept
+    # SEPARATE from recommended_coe so a campaign-established context is
+    # never misreported as something the human agent recommended (see
+    # module docstring / speaker-attribution rule):
+    #   1. campaign_origin conversation with an explicit campaign_coe ->
+    #      that campaign_coe is authoritative (an LLM value never
+    #      overrides deterministic campaign evidence).
+    #   2. otherwise, a grounded agent recommended_coe.
+    #   3. otherwise, an unambiguous expected_coe (patient's complaint).
+    if trigger_ctx["trigger_path"] == "campaign_origin" and campaign_coe:
+        validation_coe = campaign_coe
+    elif recommended_coe:
+        validation_coe = recommended_coe
+    else:
+        validation_coe = expected_coe
 
     if expected_coe is None:
         coe_match_status = "uncertain"
@@ -2427,8 +2473,19 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
             "Multiple complaints were mentioned and no single primary complaint could be established."
         )
     elif recommended_coe is None:
-        coe_match_status = "uncertain"
-        coe_reason = "A COE trigger was detected but the specific COE recommended/confirmed by the agent could not be identified."
+        if trigger_ctx["trigger_path"] == "campaign_origin" and campaign_coe:
+            # The COE context came from the campaign/post message, not
+            # from an explicit agent recommendation — never report a
+            # false "pass" attribution to the agent for this.
+            coe_match_status = "not_applicable"
+            coe_reason = (
+                f"The {campaign_coe} COE context was established by the marketing campaign/post "
+                "message, not by an explicit agent recommendation — no agent-recommendation "
+                "comparison applies for this call."
+            )
+        else:
+            coe_match_status = "uncertain"
+            coe_reason = "A COE trigger was detected but the specific COE recommended/confirmed by the agent could not be identified."
     elif recommended_coe == expected_coe:
         coe_match_status = "pass"
         coe_reason = f"The agent recommended the {recommended_coe} COE, matching the patient's primary complaint ({expected_coe})."
@@ -2462,7 +2519,9 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     )
     existing_evidence = existing_evidence_det or (llm_existing_evidence if existing_exception else None)
 
-    coe_for_doctor_check = recommended_coe or expected_coe
+    # Primary-doctor eligibility is checked against validation_coe (never
+    # an ungrounded LLM recommended_coe) — see its computation above.
+    coe_for_doctor_check = validation_coe
     approved_list = AUTHORITATIVE_PRIMARY_DOCTORS.get(coe_for_doctor_check, []) if coe_for_doctor_check else []
     # Resolve each initial doctor's CANONICAL approved identity — this is
     # the fix for Arabic-vs-English cross-script matching: an Arabic
@@ -2544,7 +2603,9 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         "trigger_reason": trigger_ctx["trigger_reason"],
         "primary_complaint": primary_complaint,
         "expected_coe": expected_coe,
+        "campaign_coe": campaign_coe,
         "recommended_coe": recommended_coe,
+        "validation_coe": validation_coe,
         "coe_match_status": coe_match_status,
         "booking_discussed": booking_discussed,
         "recommended_or_selected_doctors": initial_grounded,
@@ -2558,12 +2619,15 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         "is_violation": coe_match_status == "fail" or primary_doctor_status == "fail",
     }
     logger.info(
-        "coe validation | call_id=%s coe_match=%s primary_doctor=%s expected=%s recommended=%s",
-        call.call_id, coe_match_status, primary_doctor_status, expected_coe, recommended_coe,
+        "coe validation | call_id=%s coe_match=%s primary_doctor=%s expected=%s campaign=%s "
+        "recommended=%s validation=%s",
+        call.call_id, coe_match_status, primary_doctor_status, expected_coe, campaign_coe,
+        recommended_coe, validation_coe,
     )
     print(
         f"[coe] outcome | coe_match={coe_match_status} primary_doctor={primary_doctor_status} "
-        f"expected={expected_coe} recommended={recommended_coe} doctors={initial_grounded}",
+        f"expected={expected_coe} campaign={campaign_coe} recommended={recommended_coe} "
+        f"validation={validation_coe} doctors={initial_grounded}",
         flush=True,
     )
     return {

@@ -2,13 +2,14 @@ DECLARE @ConversationId UNIQUEIDENTIFIER = :ConversationId ;
 DECLARE @AgentFullName  NVARCHAR(200) = :AgentFullName;
 DECLARE @AgentEmail     NVARCHAR(200) = :AgentEmail;
 DECLARE @FilterDate     DATE = :FilterDate;
-
+ 
 ;WITH ConvSummary AS
 (
     -- Your existing CTE exactly as it is
     SELECT
         c.UniqueId,
         a.EmailAddress,
+        p.UserEmailAddress,
         p.FirstName + ' ' + p.LastName AS AgentFullName,
         DATEADD(HOUR, 3, c.StartDateTime)       AS Start_DateTime,
         DATEADD(HOUR, 3, c.AnswerDateTime)      AS Answer_DateTime,
@@ -52,7 +53,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
     WHERE
         (@ConversationId IS NULL OR c.UniqueId = @ConversationId)
         AND (@AgentFullName IS NULL OR (p.FirstName + ' ' + p.LastName) LIKE '%' + @AgentFullName + '%')
-        --AND (@AgentEmail IS NULL OR a.EmailAddress LIKE '%' + @AgentEmail + '%')
+        AND (@AgentEmail IS NULL OR p.UserEmailAddress LIKE '%' + @AgentEmail + '%')
         AND (
             @FilterDate IS NULL
             OR (
@@ -63,7 +64,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
 ),
 TopConversations AS
 (
-    SELECT TOP (10) *
+    SELECT TOP (100) *
     FROM ConvSummary
     ORDER BY Start_DateTime DESC
 )
@@ -98,8 +99,7 @@ SELECT
 FROM TopConversations tc
 INNER JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[MessagesTotal] m
     ON m.ConversationId = tc.UniqueId
-
-WHERE m.ConversationId = 'CBB4C284-8799-F111-9B33-000D3AA9D409'
+where m.ConversationId = UPPER('725b6409-bd99-f111-9b33-000d3aa9d409')
 ORDER BY
     tc.Start_DateTime DESC,
     tc.UniqueId,

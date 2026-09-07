@@ -24,12 +24,17 @@ from app.service_hub.coe_validation import (
     AUTHORITATIVE_PRIMARY_DOCTORS,
     DEFAULT_SCRIPTS_AR,
     PRIMARY_DOCTOR_ALIASES,
+    _agent_turn_supports_category,
     build_coe_reference,
+    campaign_origin_evidence,
     classify_coe_trigger,
+    clean_extracted_doctor_name,
     coe_validation_needed,
     existing_patient_exception_evidence,
+    ground_llm_coe_value,
     match_primary_doctor,
     normalize_doctor_name_for_match,
+    resolve_campaign_coe,
     resolve_primary_complaint,
     resolve_primary_doctor_identity,
     resolve_recommended_coe,
@@ -163,6 +168,333 @@ def test_speaker_attribution_customer_statement_not_agent_recommendation():
     ctx = classify_coe_trigger(c)
     assert ctx["triggered"] is False
     assert resolve_recommended_coe(c) is None
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Campaign/post-origin trigger (Path C, "campaign_origin")
+#
+# A conversation may begin with an automatically populated Patient message
+# from clicking a COE ad/post — a STRUCTURED campaign identifier containing
+# "COE" (e.g. "BU-AHJ-COE-...") is stronger evidence than a bare "مركز
+# تميز" mention, and TRIGGERS the check immediately even when the agent
+# never repeats COE language afterward.
+# ═════════════════════════════════════════════════════════════════════════
+
+BU_AHJ_COE_HEADACHE_TRANSCRIPT = (
+    "Patient: BU-AHJ-COE- أضغطي علي أرسال للأستفادة بعروضنا في مركز تميز الصداع\n"
+    "Patient: انا عندي صداع مزمن عايزه احجز اون لاين عند اخصائي الألم\n"
+    "Agent: بيكون كشفية اون لاين مع دكتور محمود الحوراني بعيادة المخ والاعصاب"
+)
+
+
+def test_campaign_origin_marker_triggers_even_without_agent_repeating_coe_language():
+    """Item 1 — the exact BU-AHJ-COE headache campaign scenario: triggered
+    via campaign_origin even though the agent's reply never says 'مركز
+    تميز' or otherwise mentions a COE."""
+    c = call(BU_AHJ_COE_HEADACHE_TRANSCRIPT)
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True
+    assert ctx["trigger_path"] == "campaign_origin"
+    assert "BU-AHJ-COE" in ctx["evidence"]
+    # The primary complaint still resolves correctly from the patient's own
+    # words (both the campaign line's "الصداع" and the follow-up complaint
+    # line agree on Headache).
+    primary, categories = resolve_primary_complaint(c)
+    assert primary == "Headache"
+
+
+def test_campaign_origin_evidence_helper_matches_only_the_structured_identifier():
+    assert campaign_origin_evidence(call(BU_AHJ_COE_HEADACHE_TRANSCRIPT)) is not None
+    # A bare "مركز تميز" mention alone — no structured campaign code — must
+    # NOT be picked up by the campaign-origin path (see item 3 below); it
+    # stays governed by the existing proactive/customer_inquiry paths.
+    plain = call("Patient: عايز احجز في مركز تميز للسكر\nAgent: تمام هحجزلك")
+    assert campaign_origin_evidence(plain) is None
+
+
+def test_campaign_origin_followed_by_agent_discussing_clinic_without_coe_wording():
+    """Item 2 — campaign-origin followed by an agent response that
+    discusses the matching complaint/clinic (booking into the Neurology/
+    'عيادة المخ والاعصاب' clinic that IS the Headache COE's first clinic)
+    without ever saying 'مركز تميز' — still triggered, and the established
+    COE context is still usable for the doctor check."""
+    transcript = (
+        "Patient: BU-AHJ-COE- أضغطي علي أرسال للأستفادة بعروضنا في مركز تميز الصداع\n"
+        "Patient: بعاني من صداع نصفي متكرر\n"
+        "Agent: تمام، هحجزلك في عيادة المخ والاعصاب مع دكتور عمر أيوب"
+    )
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is True
+    assert result["trigger_path"] == "campaign_origin"
+    assert result["expected_coe"] == "Headache"
+
+
+def test_ordinary_customer_only_coe_mention_still_does_not_trigger():
+    """Item 3 — an ordinary Patient-only 'مركز متخصص' mention with an
+    unrelated normal-booking Agent reply must remain untriggered; this
+    must NOT be reclassified as campaign_origin."""
+    c = call("Patient: سمعت إن في مركز متخصص للسكر\nAgent: تمام، حابب تحجز كشف عادي امتى؟")
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is False
+    assert ctx["trigger_path"] is None
+
+
+def test_complaint_without_campaign_marker_or_center_discussion_does_not_trigger():
+    """Item 4 — a plain medical complaint with no campaign marker and no
+    specialized-center discussion at all must not trigger."""
+    c = call("Patient: عندي صداع بسيط من ساعتين\nAgent: تمام هحجزلك كشف عادي بكرة")
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is False
+    assert campaign_origin_evidence(c) is None
+
+
+def test_campaign_text_never_attributed_to_the_agent():
+    """Item 5 — the campaign message is Patient-side marketing/system
+    context; resolve_recommended_coe (Agent-only) must never pick it up,
+    and the trigger_reason must explicitly say it is not agent wording."""
+    c = call(BU_AHJ_COE_HEADACHE_TRANSCRIPT)
+    ctx = classify_coe_trigger(c)
+    assert "not something the human agent wrote" in ctx["trigger_reason"] or "human agent" in ctx["trigger_reason"]
+    # The agent's actual turn ("بيكون كشفية اون لاين مع دكتور محمود
+    # الحوراني...") contains no explicit COE-name marker and is not
+    # script-similar enough on its own — resolve_recommended_coe must not
+    # fabricate a match from the campaign (Patient-side) text.
+    assert resolve_recommended_coe(c) is None
+
+    # Node-level: the campaign excerpt appears in evidence (as context),
+    # never disguised as something the agent said.
+    result, stub = run_coe_node(BU_AHJ_COE_HEADACHE_TRANSCRIPT)
+    assert any("BU-AHJ-COE" in ev for ev in result["evidence"])
+
+
+def test_campaign_origin_node_extracts_agent_offered_doctor_and_evaluates_eligibility():
+    """Item 7 (node-level) — for the supplied regression conversation: the
+    node runs (never skipped), 'محمود الحوراني' is extracted as the
+    initial doctor via the deterministic transcript extraction, and
+    primary-doctor eligibility is evaluated against the authoritative
+    Headache list (he is not on it, so this must not be a false pass)."""
+    result, stub = run_coe_node(
+        BU_AHJ_COE_HEADACHE_TRANSCRIPT,
+        {
+            "primary_complaint_category": "Headache",
+            "recommended_coe": "Headache",
+            "initial_doctors": ["محمود الحوراني"],
+        },
+    )
+    assert result["applicable"] is True
+    assert result["triggered"] is True
+    assert result["trigger_path"] == "campaign_origin"
+    assert result["expected_coe"] == "Headache"
+    assert result["booking_discussed"] is True
+    joined = " ".join(result["recommended_or_selected_doctors"])
+    assert "حوراني" in joined
+    # Not one of the four authoritative Headache doctors -> correctly not
+    # matched as an approved primary doctor.
+    assert result["primary_doctor_status"] == "fail"
+    # Never falsely credited as a match — the approved names may still
+    # appear in the reason as the (unmet) approved-list context, but never
+    # as matched_primary_doctors.
+    assert result["matched_primary_doctors"] == []
+
+
+def test_campaign_message_not_presented_as_agent_quotation_in_reason():
+    """Item 7 — the campaign message must not be presented as an agent
+    quotation anywhere in the human-readable reason/coe_reason text."""
+    result, stub = run_coe_node(
+        BU_AHJ_COE_HEADACHE_TRANSCRIPT,
+        {"primary_complaint_category": "Headache", "recommended_coe": "Headache"},
+    )
+    assert "BU-AHJ-COE" not in result["reason"]
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# campaign_coe / recommended_coe / validation_coe separation
+#
+# Regression coverage for a campaign-origin conversation where the agent
+# books a doctor within the already-established COE context WITHOUT
+# repeating COE language — expected_coe, campaign_coe, recommended_coe,
+# and validation_coe must never be conflated, an ungrounded LLM
+# recommended_coe (e.g. a hallucinated "IBD") must be rejected, and the
+# doctor name must be extracted cleanly (no trailing clinic phrase).
+# ═════════════════════════════════════════════════════════════════════════
+
+MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT = (
+    "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+    "Patient: انا عندي صداع مزمن عايزه احجز اون لاين عند اخصائي الألم\n"
+    "Agent: بيكون كشفية اون لاين مع دكتور محمود الحوراني بعيادة المخ والاعصاب"
+)
+
+
+def test_full_regression_conversation_produces_expected_result():
+    """Item 1 — the complete supplied conversation, with a stub LLM
+    reproducing the reported bug (hallucinated recommended_coe='IBD'),
+    must produce the exact corrected result."""
+    result, stub = run_coe_node(
+        MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT,
+        {
+            "primary_complaint_category": "Headache",
+            "recommended_coe": "IBD",
+            "initial_doctors": ["محمود الحوراني"],
+        },
+    )
+    assert result["triggered"] is True
+    assert result["trigger_path"] == "campaign_origin"
+    assert result["expected_coe"] == "Headache"
+    assert result["campaign_coe"] == "Headache"
+    assert result["recommended_coe"] is None
+    assert result["validation_coe"] == "Headache"
+    assert result["recommended_or_selected_doctors"] == ["محمود الحوراني"]
+    assert result["matched_primary_doctors"] == []
+    assert result["primary_doctor_status"] == "fail"
+    assert result["is_violation"] is True
+    # coe_match_status truthfully reflects that the COE came from the
+    # campaign, not from an explicit agent recommendation.
+    assert result["coe_match_status"] in ("not_applicable", "uncertain")
+    assert "IBD" not in result["reason"]
+
+
+def test_campaign_phrase_resolves_deterministically_to_headache():
+    """Item 2 — "مركز تميز الصداع" resolves deterministically to
+    campaign_coe = Headache."""
+    c = call(
+        "Patient: BU-AHJ-COE- اضغط هنا مركز تميز الصداع\n"
+        "Agent: تمام"
+    )
+    assert resolve_campaign_coe(c) == "Headache"
+
+
+@pytest.mark.parametrize("neurology_phrase", [
+    "مخ واعصاب", "المخ والاعصاب", "مخ وأعصاب", "مخ و اعصاب", "اعصاب", "أعصاب",
+])
+def test_neurology_language_supports_headache_in_campaign_context(neurology_phrase):
+    """Item 3 — neurology expressions and their spelling variants support
+    Headache when used as campaign/COE context."""
+    c = call(f"Patient: BU-AHJ-COE- استفسار عن عيادة {neurology_phrase}\nAgent: تمام")
+    assert resolve_campaign_coe(c) == "Headache"
+
+
+def test_unsupported_llm_recommended_coe_is_rejected():
+    """Item 4 — an LLM response containing unsupported recommended_coe=IBD
+    (no IBD/gastrointestinal evidence anywhere in an Agent turn) is
+    rejected, never producing a false mismatch."""
+    c = call(MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT)
+    assert ground_llm_coe_value(c, "IBD") is None
+    assert _agent_turn_supports_category(c, "IBD") is False
+
+
+def test_reference_data_alone_cannot_ground_an_llm_selected_coe():
+    """Item 5 — reference data shown to the LLM lists all four COEs; an
+    LLM claiming a category with NO real transcript evidence (here:
+    Diabetes, never mentioned anywhere) must be discarded regardless of
+    what the reference section contained."""
+    result, stub = run_coe_node(
+        MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT,
+        {"primary_complaint_category": "Headache", "recommended_coe": "Diabetes"},
+    )
+    assert result["recommended_coe"] is None
+    assert result["coe_match_status"] != "fail"
+
+
+def test_doctor_name_extraction_stops_before_clinic_connector():
+    """Item 6 — "دكتور محمود الحوراني بعيادة المخ والاعصاب" extracts
+    exactly "محمود الحوراني", never including "بعيادة ..."."""
+    assert clean_extracted_doctor_name("محمود الحوراني بعياده المخ") == "محمود الحوراني"
+    assert clean_extracted_doctor_name("محمود الحوراني بعيادة المخ والاعصاب") == "محمود الحوراني"
+    # Idempotent on an already-clean name.
+    assert clean_extracted_doctor_name("محمود الحوراني") == "محمود الحوراني"
+    # A genuine multi-token compound name with no clinic connector must
+    # never be truncated.
+    assert clean_extracted_doctor_name("عبدالرحمن الشهري") == "عبدالرحمن الشهري"
+
+    result, stub = run_coe_node(
+        MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT,
+        {"primary_complaint_category": "Headache", "initial_doctors": ["محمود الحوراني"]},
+    )
+    assert result["recommended_or_selected_doctors"] == ["محمود الحوراني"]
+    assert not any("بعياده" in d or "بعيادة" in d for d in result["recommended_or_selected_doctors"])
+
+
+def test_mahmoud_elhorany_fails_headache_primary_doctor_check():
+    """Item 7 — Mahmoud El Horany (any common spelling) is NOT an approved
+    Headache primary doctor."""
+    assert resolve_primary_doctor_identity("محمود الحوراني", "Headache") is None
+    assert match_primary_doctor("محمود الحوراني", "Headache") is False
+
+
+def test_mahmoud_elhorany_not_added_to_authoritative_list():
+    """Item 8 (part) — the authoritative Headache primary-doctor list is
+    unchanged; Mahmoud El Horany must never appear in it."""
+    headache_list = AUTHORITATIVE_PRIMARY_DOCTORS["Headache"]
+    assert headache_list == ["Osama Abdel Salam", "Abdelrhman Alshehri", "Omar Ayoub", "Abdulrahman Bogus"]
+    assert not any("حوراني" in d or "horany" in d.lower() for d in headache_list)
+
+
+@pytest.mark.parametrize("doctor_name", [
+    "Osama Abdel Salam", "Abdelrhman Alshehri", "Omar Ayoub", "Abdulrahman Bogus",
+])
+def test_approved_headache_primary_doctors_still_pass_in_campaign_context(doctor_name):
+    """Item 8 — approved Headache primary doctors still pass, including
+    within a campaign-origin conversation."""
+    transcript = (
+        "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+        "Patient: عندي صداع نصفي شديد جدا من فتره طويلة\n"
+        f"Agent: يبدأ الحجز أولاً في عيادة المخ والاعصاب مع دكتور {doctor_name}"
+    )
+    result, stub = run_coe_node(transcript, {
+        "primary_complaint_category": "Headache",
+        "initial_doctors": [doctor_name],
+    })
+    assert result["validation_coe"] == "Headache"
+    assert result["primary_doctor_status"] == "pass"
+    assert doctor_name in result["matched_primary_doctors"]
+    assert result["is_violation"] is False
+
+
+def test_existing_proactive_and_customer_inquiry_routing_unchanged():
+    """Item 9 — the pre-existing proactive_recommendation and
+    customer_inquiry paths still work exactly as before: recommended_coe
+    is set directly from the agent's own explicit COE language, and
+    validation_coe/coe_match_status behave as a plain match/mismatch."""
+    proactive_transcript = (
+        "Patient: عندي صداع نصفي شديد جدا من فتره طويلة\n"
+        "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع مع Dr. Omar Ayoub"
+    )
+    result, stub = run_coe_node(proactive_transcript)
+    assert result["trigger_path"] == "proactive_recommendation"
+    assert result["campaign_coe"] is None
+    assert result["recommended_coe"] == "Headache"
+    assert result["validation_coe"] == "Headache"
+    assert result["coe_match_status"] == "pass"
+    assert result["primary_doctor_status"] == "pass"
+
+    inquiry_transcript = (
+        "Patient: في عندكم مركز متخصص للسكر؟\n"
+        "Patient: عندي مرض السكر وعايز اتابع حالتي\n"
+        "Agent: أيوه، سيتم حجز موعد لحضرتك بمركز التميز المتخصص في علاج امراض السكر والغدد الصماء مع Dr. Badri Bairuti"
+    )
+    result2, stub2 = run_coe_node(inquiry_transcript)
+    assert result2["trigger_path"] == "customer_inquiry"
+    assert result2["campaign_coe"] is None
+    assert result2["recommended_coe"] == "Diabetes"
+    assert result2["validation_coe"] == "Diabetes"
+    assert result2["coe_match_status"] == "pass"
+    assert result2["primary_doctor_status"] == "pass"
+
+
+def test_campaign_text_never_attributed_to_human_agent_in_regression():
+    """Item 10 — the campaign text is never attributed to the human agent:
+    resolve_recommended_coe (Agent-only) ignores it, and the final
+    recommended_coe never equals a value ONLY the campaign text supports
+    when no actual Agent turn corroborates it."""
+    c = call(MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT)
+    assert resolve_recommended_coe(c) is None
+    result, stub = run_coe_node(
+        MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT,
+        {"primary_complaint_category": "Headache", "recommended_coe": "IBD"},
+    )
+    assert result["recommended_coe"] is None
+    assert "BU-AHJ-COE" not in result["reason"]
+    assert "BU-AHJ-COE" not in (result.get("coe_match_status") or "")
 
 
 # ═════════════════════════════════════════════════════════════════════════

@@ -894,6 +894,7 @@ def build_coe_prompt(
     call: CallTranscript,
     coe_reference: str = "",
     trigger_reason: str = "",
+    trigger_path: str = "",
 ) -> str:
     """
     Parameters
@@ -907,6 +908,11 @@ def build_coe_prompt(
         Why COE validation was triggered (see classify_coe_trigger) —
         included so the model grounds its extraction in the same evidence
         that triggered this check, rather than re-deciding applicability.
+    trigger_path : str
+        Which of the three trigger paths applied — "proactive_recommendation",
+        "customer_inquiry", or "campaign_origin" (see classify_coe_trigger).
+        Determines how the model should read the transcript — see the
+        TRIGGER CONTEXT section below, especially for campaign_origin.
     """
     return f"""\
 You are extracting facts about a Center of Excellence (COE) discussion in a call-center
@@ -916,23 +922,71 @@ genuine COE/specialized-center discussion (reason below); do not re-decide that.
 ## SPEAKER ATTRIBUTION (critical)
 Only what the AGENT (human call-center employee) says counts as a recommendation,
 confirmation, offer, or booking action. Never treat something the CUSTOMER/PATIENT says as if
-the agent said or did it.
+the agent said or did it. This includes an automatically populated marketing/campaign message
+that happens to be persisted under the Patient speaker (see TRIGGER CONTEXT below) — it is
+system/marketing content, not something the patient personally wrote, and it is NEVER
+something the agent wrote either.
+
+## TRIGGER CONTEXT
+This call's trigger path is: {trigger_path or "(not available)"}
+- "proactive_recommendation": the agent proactively introduced/recommended the COE.
+- "customer_inquiry": the customer asked about a COE/specialized center and the agent
+  responded to or confirmed it.
+- "campaign_origin": the customer entered this conversation by clicking a COE marketing
+  post/ad (the transcript contains a structured campaign identifier, e.g. "BU-AHJ-COE-...").
+  This message is MARKETING/SYSTEM content, not something the human agent wrote — NEVER
+  attribute its wording to the agent, and NEVER treat it as evidence that the agent delivered
+  the approved COE script or recommendation. Instead:
+    - Use the campaign text ONLY to identify which COE is already established as the active
+      context, when it is explicit (e.g. "مركز تميز الصداع" -> Headache; neurology language
+      such as "مخ واعصاب"/"أعصاب" also supports Headache in this campaign context).
+    - This establishes a SEPARATE value, campaign_coe — it is context, NOT an agent
+      recommendation. Because the campaign message itself already establishes that context,
+      the AGENT does NOT need to repeat the COE name or script for this to remain a genuine
+      COE conversation — evaluate the agent's SUBSEQUENT handling (which doctor they offer,
+      how they proceed with booking) as happening WITHIN that already-established context.
+    - Only set recommended_coe when an actual AGENT turn itself recommends, names, or
+      confirms a COE — campaign_coe on its own is never sufficient to also claim
+      recommended_coe. It is entirely normal and CORRECT for recommended_coe to be null while
+      campaign_coe is set (the agent simply continued the campaign-established journey
+      without independently naming the COE again).
+    - If the agent recommends, offers, selects, confirms, or books a doctor for the initial
+      appointment, extract that doctor even though the agent never repeats the COE name.
+
+## REFERENCE DATA IS NOT TRANSCRIPT EVIDENCE (critical)
+The SUPPORTED COE REFERENCE section below lists the four categories this system CAN
+recognise and their approved scripts — it describes what is POSSIBLE, not what happened on
+this call. Do not select IBD, Asthma, Diabetes, or Headache for primary_complaint_category,
+campaign_coe, or recommended_coe merely because that COE's name or script text appears in the
+reference section. Every one of those three values must instead be justified by a VERBATIM
+excerpt that actually appears in the TRANSCRIPT section further below — if you cannot quote
+such an excerpt, return null for that value rather than guessing from the reference data.
 
 ## YOUR TASK
 1. Identify the patient's PRIMARY complaint — their main reason for calling / the complaint
    they request an appointment for / the complaint most clearly discussed or connected to the
    COE recommendation. If several unrelated complaints appear and none is clearly primary,
-   say so (primary_complaint_category = null) rather than guessing.
+   say so (primary_complaint_category = null) rather than guessing. Quote the verbatim
+   transcript excerpt that supports your chosen category in primary_complaint_evidence.
 2. Classify that primary complaint into exactly one of: IBD (gastrointestinal/digestive),
    Headache, Asthma (chest/pulmonary/respiratory), Diabetes (diabetes/endocrinology), or null
    if it does not clearly fit one of these four.
-3. Identify which of the four supported COEs (IBD | Headache | Asthma | Diabetes) the AGENT
-   actually recommended or confirmed — grounded in what the agent said, never inferred merely
-   because a doctor happens to be a COE member.
+3. Separately, identify THREE distinct COE values — do not conflate them:
+   a. campaign_coe — the COE explicitly established by a campaign/post message's own text
+      (only when trigger_path is "campaign_origin"; null otherwise).
+   b. recommended_coe — a COE actually recommended, named, or confirmed by an ACTUAL AGENT
+      turn — never inferred merely because a doctor happens to be a COE member, and never
+      copied from campaign_coe.
+   For BOTH, quote a verbatim excerpt (campaign_coe_evidence / coe_recommendation_evidence)
+   from the correct source, and set recommended_coe_source to exactly one of "campaign",
+   "patient", or "agent" describing WHO actually said the words your recommended_coe excerpt
+   is quoted from (use "agent" only when an actual Agent turn is being quoted).
 4. List every doctor name the AGENT offered, recommended, selected, confirmed, or booked for
    the patient's INITIAL COE appointment, separately from any doctor mentioned ONLY as a
    possible LATER referral (e.g. "an ENT doctor may get involved after the initial pulmonology
-   assessment" is a later-referral mention, not an initial doctor).
+   assessment" is a later-referral mention, not an initial doctor). Extract the doctor's
+   PERSONAL NAME only — never include a trailing clinic/department/specialty phrase such as
+   "بعيادة المخ والاعصاب"/"بقسم ..."/"بتخصص ..." as part of the name.
 5. Determine whether the transcript clearly establishes the customer as an EXISTING patient
    with an established treating doctor (continuing follow-up), as opposed to starting a new
    COE journey. Only mark this true when the evidence is explicit and clear.
@@ -943,6 +997,9 @@ the agent said or did it.
   already excluded by the deterministic trigger check — you do not need to re-verify that.
 - Do not decide whether an extracted doctor is an "approved" COE doctor — that is decided
   separately, deterministically, after your extraction.
+- A deterministic check, not this prompt, has final authority over campaign_coe and over
+  whether your recommended_coe is grounded in real agent evidence — your job here is only to
+  extract and cite evidence honestly, not to guess a value that "should" be true.
 
 ════════════════════════════════════════════════════════════
 WHY THIS CALL TRIGGERED COE VALIDATION
@@ -972,9 +1029,13 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 {{
   "primary_complaint": "<1 sentence, patient's own words/summary, or null>",
   "primary_complaint_category": "<IBD | Headache | Asthma | Diabetes | null>",
+  "primary_complaint_evidence": "<verbatim patient excerpt supporting the category above, or null>",
+  "campaign_coe": "<IBD | Headache | Asthma | Diabetes | null — only when trigger_path is campaign_origin>",
+  "campaign_coe_evidence": "<verbatim campaign/patient excerpt, or null>",
   "recommended_coe": "<IBD | Headache | Asthma | Diabetes | null>",
-  "coe_recommendation_evidence": "<verbatim agent excerpt, or null>",
-  "initial_doctors": ["<doctor name offered/selected/confirmed/booked for the INITIAL appointment>"],
+  "coe_recommendation_evidence": "<verbatim excerpt the recommended_coe value is based on, or null>",
+  "recommended_coe_source": "<campaign | patient | agent | null — who the coe_recommendation_evidence excerpt is actually quoted from>",
+  "initial_doctors": ["<doctor's personal name only, offered/selected/confirmed/booked for the INITIAL appointment>"],
   "referral_only_doctors": ["<doctor name mentioned ONLY as a possible later referral>"],
   "existing_patient_exception": <true | false>,
   "existing_patient_evidence": "<verbatim patient excerpt establishing an existing treating-doctor relationship, or null>",

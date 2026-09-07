@@ -10,8 +10,16 @@ location/doctor/COE-specific logic.
 
 Flow (mirrors the project's "keep trigger detection separate from actual
 validation" philosophy — see app.agent.nodes.infer_coe_validation):
-    scan the transcript, turn by turn, for a COE / specialized-center
-    mention
+    first, check for STRONG campaign/post-origin evidence (a structured
+    campaign identifier containing "COE", e.g. "BU-AHJ-COE-...") anywhere
+    in the Patient's own turns
+        -> found -> campaign origin (Path C), TRIGGERED regardless of
+           whether the Agent ever repeats COE language (see
+           campaign_origin_evidence) — a bare "مركز تميز" mention alone is
+           NEVER enough for this path; it requires the stronger, structured
+           campaign-identifier evidence
+    otherwise, scan the transcript, turn by turn, for a COE / specialized-
+    center mention
         -> was the FIRST such mention made (or immediately preceded) by the
            Agent -> proactive recommendation (Path A)
         -> was it first raised by the Patient and then answered by the
@@ -21,7 +29,11 @@ validation" philosophy — see app.agent.nodes.infer_coe_validation):
         -> only when triggered: classify the patient's primary complaint,
            map it to the expected COE, extract the COE the Agent actually
            recommended/confirmed, and validate the initial doctor against
-           the authoritative primary-doctor list for that COE.
+           the authoritative primary-doctor list for that COE. A campaign-
+           origin message is marketing/system context: it is NEVER treated
+           as something the human Agent said, wrote, or delivered (see
+           campaign_origin_evidence and app.prompts.qa_prompt.
+           build_coe_prompt's TRIGGER CONTEXT section).
 
 A qualifying medical complaint alone (see COMPLAINT_KEYWORDS) is
 deliberately NEVER sufficient to trigger this validator — only genuine
@@ -267,6 +279,38 @@ COE_NAME_MARKERS: dict[str, set[str]] = {
     "Diabetes": {"امراض السكر والغدد الصماء", "السكر والغدد الصماء", "diabetes"},
 }
 
+# Neurology-clinic synonyms that identify the Headache COE's FIRST CLINIC
+# (Neurology) contextually — e.g. "عيادة المخ والاعصاب". Deliberately kept
+# OUT of COE_NAME_MARKERS: mentioning the neurology clinic while booking a
+# doctor is not, by itself, the AGENT explicitly recommending/naming the
+# Headache COE (see resolve_recommended_coe's speaker-attribution
+# docstring) — it only ever contributes to the broader CAMPAIGN_COE_
+# CONTEXT_MARKERS below, used for campaign-text COE identification and for
+# grounding an LLM's own claimed recommended_coe against real transcript
+# evidence, never for deterministically SETTING recommended_coe itself.
+_HEADACHE_NEUROLOGY_CONTEXT_TERMS: set[str] = {
+    "مخ واعصاب", "المخ والاعصاب", "مخ وأعصاب", "مخ و اعصاب", "مخ اعصاب",
+    "اعصاب", "أعصاب", "neurology", "neurologist",
+}
+
+# Broader per-COE evidence vocabulary — union of the complaint keywords
+# (what the PATIENT would say), the narrow COE-name markers (what an AGENT
+# explicitly recommending the COE would say), and, for Headache, the
+# neurology-clinic synonyms above. Used ONLY for:
+#   1. resolve_campaign_coe — identifying which COE a campaign/post message
+#      establishes from its own text.
+#   2. ground_llm_coe_value / _agent_turn_supports_category — verifying
+#      that an LLM-claimed recommended_coe has REAL supporting transcript
+#      evidence in an Agent turn, never accepting a category merely because
+#      it's one of the four the LLM was told about in reference data.
+# Never used to deterministically SET recommended_coe (see
+# resolve_recommended_coe, which stays on the narrower COE_NAME_MARKERS).
+CAMPAIGN_COE_CONTEXT_MARKERS: dict[str, set[str]] = {
+    key: set(COMPLAINT_KEYWORDS[key]) | set(COE_NAME_MARKERS[key])
+    for key in COE_KEYS
+}
+CAMPAIGN_COE_CONTEXT_MARKERS["Headache"] |= _HEADACHE_NEUROLOGY_CONTEXT_TERMS
+
 # ── COE / specialized-center trigger phrases ────────────────────────────────
 # Deliberately compound phrases only — a bare "مركز" (center/branch) must
 # never trigger this validator on its own (see the module docstring / "do
@@ -286,6 +330,22 @@ _COE_MENTION_RE = re.compile(
     r"مركز\s*متعدد\s*التخصصات|"
     r"center\s*of\s*excellence|specialized\s*cent(?:er|re)|specialised\s*cent(?:er|re)|"
     r"multidisciplinary\s*cent(?:er|re)",
+    re.I,
+)
+
+# ── COE marketing-campaign/post origin marker ───────────────────────────────
+# A conversation may begin with an automatically populated Patient message
+# from clicking a COE ad/post (e.g. "BU-AHJ-COE- أضغطي علي أرسال..."). This
+# is STRONGER, more specific evidence than a bare "مركز تميز" mention (see
+# _COE_MENTION_RE above) — it is a structured campaign/ad identifier that
+# contains "COE" as its own hyphen-delimited segment, never a bare "COE"
+# floating in ordinary prose. Matched against the RAW (non-normalised) turn
+# text, since normalize_arabic_text() would replace the identifier's
+# hyphens with spaces and destroy its structure — a plain "مركز تميز"
+# mention must NEVER satisfy this pattern (see campaign_origin_evidence's
+# docstring and the module docstring's Path C).
+_CAMPAIGN_ORIGIN_RE = re.compile(
+    r"\b[A-Za-z0-9]{2,10}-[A-Za-z0-9]{2,10}-COE\b|\b[A-Za-z0-9]{2,10}-COE\b",
     re.I,
 )
 
@@ -375,11 +435,79 @@ def detect_coe_mention(text: str) -> bool:
     return bool(_COE_MENTION_RE.search(_norm(text)))
 
 
+def campaign_origin_evidence(call: CallTranscript) -> str | None:
+    """Deterministic evidence that this conversation began from a COE
+    marketing post/campaign click — a STRUCTURED campaign/ad identifier
+    containing "COE" (e.g. "BU-AHJ-COE-..."), never a bare "مركز تميز"
+    mention (see _CAMPAIGN_ORIGIN_RE's docstring — that phrase alone is
+    handled by the existing proactive_recommendation/customer_inquiry
+    paths, not this one).
+
+    Scanned on Patient turns only, on each turn's RAW (non-normalised)
+    text — an auto-populated campaign message is persisted as the
+    customer's own first message, but it is marketing/system content, not
+    something the customer (or the human Agent) personally wrote; it is
+    used only to ESTABLISH that the conversation is already in a COE
+    context (see classify_coe_trigger's Path C and app.prompts.qa_prompt.
+    build_coe_prompt's TRIGGER CONTEXT section, which is responsible for
+    never attributing this wording to the Agent).
+    """
+    for speaker, text in split_transcript_turns(call.transcript):
+        if speaker != "patient":
+            continue
+        if _CAMPAIGN_ORIGIN_RE.search(text):
+            return text.strip()[:300]
+    return None
+
+
+def resolve_campaign_coe(call: CallTranscript) -> str | None:
+    """Identify which supported COE a campaign/post-origin message
+    EXPLICITLY establishes, from that message's own text only — e.g.
+    "مركز تميز الصداع" -> Headache, or neurology-clinic language such as
+    "مخ واعصاب" -> Headache (see CAMPAIGN_COE_CONTEXT_MARKERS).
+
+    Scanned ONLY on the Patient turn(s) that actually carry the structured
+    campaign identifier (see campaign_origin_evidence) — never the whole
+    transcript, and never an Agent turn: a campaign message is marketing/
+    system content, not something the human agent wrote (see module
+    docstring). This is the AUTHORITATIVE source for campaign_coe — an
+    LLM's own opinion must never override it (see
+    app.agent.nodes.infer_coe_validation).
+
+    Returns None when no campaign marker is present, or when the campaign
+    text itself contains no recognisable COE-identifying language — never
+    guessed.
+    """
+    for speaker, text in split_transcript_turns(call.transcript):
+        if speaker != "patient":
+            continue
+        if not _CAMPAIGN_ORIGIN_RE.search(text):
+            continue
+        norm = _norm(text)
+        for key, markers in CAMPAIGN_COE_CONTEXT_MARKERS.items():
+            if any(_norm(m) in norm for m in markers):
+                return key
+    return None
+
+
 def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
     """Determine whether COE validation should run at all, and via which
     path — turn-order-aware and speaker-attributed, so a Patient statement
     is never misattributed as an Agent recommendation (see module
-    docstring). Walks the transcript turn by turn (in original order):
+    docstring).
+
+    Checks, in order:
+
+      0. Campaign/post origin (Path C, "campaign_origin") — a STRUCTURED
+         campaign identifier (see campaign_origin_evidence) found anywhere
+         in the Patient's own turns. TRIGGERED immediately, regardless of
+         whether the Agent ever mentions a COE at all — the campaign
+         message already establishes the COE context on its own (see
+         module docstring). Checked first because it does not depend on
+         turn order the way Paths A/B do.
+
+    Otherwise walks the transcript turn by turn (in original order) for an
+    ordinary "مركز تميز"/specialized-center mention:
 
       - The FIRST turn (Patient or Agent) that mentions a COE/specialized
         center is found.
@@ -392,6 +520,21 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
         enough (see module docstring's "do not trigger" rules).
       - If nobody mentions it at all -> NOT triggered.
     """
+    campaign_evidence = campaign_origin_evidence(call)
+    if campaign_evidence:
+        return {
+            "triggered": True,
+            "trigger_path": "campaign_origin",
+            "trigger_reason": (
+                "The customer's message contains a COE marketing-campaign/post identifier, "
+                "establishing that this conversation began from a Center of Excellence "
+                "campaign. This is a marketing/system message, not something the human agent "
+                "wrote — it is never treated as an agent recommendation or script delivery."
+            ),
+            "evidence": campaign_evidence,
+            "patient_evidence": campaign_evidence,
+        }
+
     turns = split_transcript_turns(call.transcript)
     patient_raised = False
     patient_evidence: str | None = None
@@ -543,6 +686,85 @@ def resolve_recommended_coe(call: CallTranscript, scripts: dict[str, str] | None
                 best_key, best_score = key, score
 
     return best_key if best_score >= SCRIPT_MATCH_THRESHOLD else None
+
+
+def _agent_turn_supports_category(call: CallTranscript, category: str | None) -> bool:
+    """True when SOME actual Agent turn contains real transcript evidence
+    connecting to *category* (see CAMPAIGN_COE_CONTEXT_MARKERS) — used to
+    ground an LLM-produced COE value (see ground_llm_coe_value), never to
+    deterministically set recommended_coe itself (that stays on the
+    narrower resolve_recommended_coe/COE_NAME_MARKERS)."""
+    if not category or category not in CAMPAIGN_COE_CONTEXT_MARKERS:
+        return False
+    markers = CAMPAIGN_COE_CONTEXT_MARKERS[category]
+    for speaker, text in split_transcript_turns(call.transcript):
+        if speaker != "agent":
+            continue
+        norm = _norm(text)
+        if any(_norm(m) in norm for m in markers):
+            return True
+    return False
+
+
+def ground_llm_coe_value(call: CallTranscript, value: str | None) -> str | None:
+    """Reject an LLM-produced COE category value (e.g. recommended_coe)
+    unless it is one of the four supported keys AND an actual Agent turn
+    contains real transcript evidence for it (see
+    _agent_turn_supports_category). An LLM must never be trusted to select
+    a category merely because all four COE records/scripts were shown to
+    it as reference data — that data describes what's POSSIBLE, not what
+    happened in this call (see app.prompts.qa_prompt.build_coe_prompt's
+    grounding rules). Returns None (discarded, never a fabricated
+    mismatch) when unsupported.
+    """
+    if not value or value not in COE_KEYS:
+        return None
+    return value if _agent_turn_supports_category(call, value) else None
+
+
+# ── Doctor-name extraction boundary cleanup ─────────────────────────────────
+# app.service_hub.doctor_validation.extract_doctor_turn_candidates's stop-
+# marker regex requires WHITESPACE immediately before "عياده"/"عيادة" (etc.)
+# to recognise it as a boundary — it does not catch these words FUSED with
+# a leading "ب" (e.g. "بعياده", one token, no space), so a candidate like
+# "محمود الحوراني بعياده المخ" can slip through with the clinic reference
+# still attached. Rather than touching that shared, heavily-tested
+# extraction engine (used by several unrelated validators), this narrow,
+# COE-local post-processing step trims the same class of clinic/
+# department/specialty connector — and everything after it — from an
+# already-extracted candidate. Only this small, closed set of
+# administrative connector words (never a genuine person-name token) is
+# ever treated as a stop point, so a real multi-token compound name is
+# never truncated.
+_DOCTOR_NAME_CLINIC_STOP_WORDS: set[str] = {
+    "عياده", "عيادة", "قسم", "تخصص",
+    "بعياده", "بعيادة", "بقسم", "بتخصص",
+    "في",  # covers "في عياده" / "في قسم" / "في تخصص" — "في" alone is
+           # never part of a person's name (mirrors doctor_validation.py's
+           # own _NAME_STOP_RE, which treats a bare "في" the same way).
+}
+
+
+def clean_extracted_doctor_name(name: str | None) -> str | None:
+    """Trim a trailing clinic/department/specialty connector — and
+    everything after it — from an already-extracted doctor-name candidate.
+
+    Example: "محمود الحوراني بعياده المخ والاعصاب" -> "محمود الحوراني".
+
+    Idempotent (safe to call on an already-clean name) and never truncates
+    a genuine multi-token personal name: only the small, closed connector
+    set in _DOCTOR_NAME_CLINIC_STOP_WORDS is ever treated as a stop point.
+    Returns the input unchanged (including falsy values) if no stop word
+    is found.
+    """
+    if not name:
+        return name
+    words = name.split()
+    for i, word in enumerate(words):
+        if normalize_arabic_text(word) in _DOCTOR_NAME_CLINIC_STOP_WORDS:
+            cleaned = " ".join(words[:i]).strip()
+            return cleaned or name
+    return name
 
 
 # ── Existing-patient exception ──────────────────────────────────────────────
