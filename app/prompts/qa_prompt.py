@@ -991,6 +991,44 @@ such an excerpt, return null for that value rather than guessing from the refere
    with an established treating doctor (continuing follow-up), as opposed to starting a new
    COE journey. Only mark this true when the evidence is explicit and clear.
 
+## THIS CALL MAY DISCUSS MORE THAN ONE COE (critical)
+A single call can legitimately raise more than one COE — e.g. a Headache campaign click
+followed by an unrelated Agent recommendation of the IBD COE later in the same call. A
+deterministic check builds one INDEPENDENT evaluation context per grounded COE and associates
+each doctor with the correct one using turn-level evidence; that is the system of record, not
+this prompt's single recommended_coe/initial_doctors fields — treat those as your best summary
+of the MOST SALIENT context, not as a merged answer, and never let a doctor approved for one
+COE make you think a doctor discussed under a DIFFERENT COE is also fine:
+- Associate each doctor with a COE only when the SAME turn (or the turns immediately
+  surrounding it) actually names that COE, its clinic, or its specialty — e.g. "لدكتور X
+  بعيادة المخ والأعصاب" grounds X to Headache. Never associate a doctor with a COE just
+  because that doctor happens to be a member of it in some external list.
+- Never use a doctor's membership in a COE to reverse-infer that the COE was discussed — the
+  COE must be evidenced in the transcript independently of who the doctor is, and belonging to
+  a COE's specialty list is NOT the same thing as being its approved primary doctor.
+- Determine each doctor's role (initial appointment vs. an initial SUPPORTING role vs. a later
+  referral vs. continuing an existing treating-doctor relationship vs. genuinely unclear)
+  SEPARATELY for each doctor — never assume every doctor mentioned in the call shares the same
+  role.
+- CRM reference records (below) list what's POSSIBLE, never evidence that a COE was actually
+  discussed in this call.
+- Some specialties are organizationally SHARED between two COEs (e.g. ENT/"أنف وأذن وحنجرة"
+  supports both Headache and Asthma) — mentioning a shared specialty alone does not tell you
+  which COE is meant. Disambiguate using, in priority order: (1) an explicit campaign-origin
+  COE already established for this call, (2) an actual agent/patient turn naming a COE or
+  script explicitly, (3) the patient's own stated complaint, (4) a specialty or doctor
+  discussion closely connected in the same or an adjacent turn, (5) an actively-in-progress
+  booking context, (6) sheer turn proximity as a last resort. If none of these resolves it,
+  do not guess — leave that mention out of both COEs' evidence rather than assigning it to
+  either.
+- A clear topic change mid-call (e.g. the patient saying "وبعده"/"كمان"/"وكمان" — "and after
+  that" / "also") can start a SEPARATE service context for a different complaint, specialty,
+  or COE — do not keep applying an earlier COE's doctor or specialty evidence to whatever is
+  said after such a shift.
+- Never return a generic procedural or referral phrase (e.g. "تحويل", "تحويل طبي", "استشارة",
+  "موعد", "التحويل بعد ذلك") as if it were a doctor's personal name — if no actual personal
+  name is present, omit that mention rather than inventing a name from the surrounding words.
+
 ## RULES
 - Never invent a complaint, COE, or doctor name that is not actually present in the transcript.
 - A qualifying medical complaint alone, without any COE/specialized-center discussion, is

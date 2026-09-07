@@ -52,6 +52,13 @@ from app.services.text_helpers import (
     split_transcript_turns,
     strip_html_tags,
 )
+# Reused for per-turn doctor-name candidate extraction ONLY (the exact same
+# regex-based name-extraction engine app.service_hub.doctor_validation's own
+# deterministic factual-information validator uses) — see
+# extract_doctor_context_associations. Deliberately NOT re-implemented here:
+# COE validation adds turn-index/COE-association bookkeeping on top of it,
+# never a second copy of the name-extraction logic itself.
+from app.service_hub.doctor_validation import _doctor_name_candidates_in_text
 
 # ── Supported COEs ───────────────────────────────────────────────────────────
 # Only these four COEs are ever validated — an unsupported COE/complaint must
@@ -96,6 +103,14 @@ PRIMARY_DOCTOR_ALIASES: dict[str, dict[str, list[str]]] = {
             "داليندة",
             "د. داليندة",
             "دكتورة داليندة",
+            # "عرفاوي" is a surname that appears attached to this SAME
+            # configured Dalinda identity in some transcripts — an alias
+            # of the existing canonical identity, never a second doctor
+            # (see the module docstring's Dalinda-identity note).
+            "داليندا عرفاوي",
+            "دكتورة داليندا عرفاوي",
+            "دكتور داليندا عرفاوي",
+            "د. داليندا عرفاوي",
         ],
     },
     "Headache": {
@@ -250,8 +265,9 @@ COMPLAINT_KEYWORDS: dict[str, set[str]] = {
         "الجهاز الهضمي", "جهاز هضمي", "القولون", "قولون", "الامعاء", "امعاء",
         "كرون", "التهاب القولون", "قرحة", "قرحه", "اسهال مزمن", "اسهال",
         "إسهال", "امساك مزمن", "امساك", "إمساك", "نزيف معوي", "الجهاز الهضمى",
+        "كبد", "الكبد", "أمراض الكبد", "امراض الكبد",
         "gastroenterology", "gastrointestinal", "ibd", "crohn", "colitis",
-        "digestive", "bowel", "stomach ulcer",
+        "digestive", "bowel", "stomach ulcer", "liver",
     },
     "Headache": {
         "صداع", "الصداع", "صداع نصفي", "صداع نصفى", "شقيقة", "شقيقه",
@@ -279,37 +295,221 @@ COE_NAME_MARKERS: dict[str, set[str]] = {
     "Diabetes": {"امراض السكر والغدد الصماء", "السكر والغدد الصماء", "diabetes"},
 }
 
-# Neurology-clinic synonyms that identify the Headache COE's FIRST CLINIC
-# (Neurology) contextually — e.g. "عيادة المخ والاعصاب". Deliberately kept
-# OUT of COE_NAME_MARKERS: mentioning the neurology clinic while booking a
-# doctor is not, by itself, the AGENT explicitly recommending/naming the
-# Headache COE (see resolve_recommended_coe's speaker-attribution
-# docstring) — it only ever contributes to the broader CAMPAIGN_COE_
-# CONTEXT_MARKERS below, used for campaign-text COE identification and for
-# grounding an LLM's own claimed recommended_coe against real transcript
-# evidence, never for deterministically SETTING recommended_coe itself.
-_HEADACHE_NEUROLOGY_CONTEXT_TERMS: set[str] = {
-    "مخ واعصاب", "المخ والاعصاب", "مخ وأعصاب", "مخ و اعصاب", "مخ اعصاب",
-    "اعصاب", "أعصاب", "neurology", "neurologist",
+# ═════════════════════════════════════════════════════════════════════════
+# Centralized specialty taxonomy — the SINGLE source of truth for every
+# specialty-aware decision in this module: specialty normalisation,
+# COE-context detection, complaint/service classification, doctor-to-
+# context association, prompt construction, deterministic safeguards, and
+# tests. This reflects the confirmed ORGANIZATIONAL COE taxonomy, which is
+# deliberately broader than narrow clinical definitions (e.g. Cardiology
+# and Dental count as Headache-supporting specialties here because that is
+# how this business groups referral/supporting specialties under each
+# COE — see the "CONTEXT ASSOCIATION IS NOT PRIMARY-DOCTOR APPROVAL"
+# section below: belonging to a COE's specialty list only means a
+# specialty CAN support that COE's context, never that every doctor in it
+# is an approved COE primary doctor).
+# ═════════════════════════════════════════════════════════════════════════
+
+# COE -> the canonical specialties organizationally grouped under it.
+# "ENT" deliberately appears under BOTH Headache and Asthma — a genuinely
+# SHARED specialty that must never be arbitrarily resolved to one COE on
+# its own (see resolve_specialty_coes / the disambiguation priority order
+# documented on detect_specialty_mentions).
+COE_SPECIALTIES: dict[str, list[str]] = {
+    "IBD": ["GIT", "Nutrition", "General Surgery"],
+    "Headache": ["Neurology", "Ophthalmology", "ENT", "Cardiology", "Psychiatry", "Dental"],
+    "Diabetes": ["Diabetes", "Diabetic Educator", "Orthopedics"],
+    "Asthma": ["Pulmonology", "ENT", "Allergy & Immunology"],
+}
+
+# Canonical specialty -> English/Arabic aliases (common spelling/spacing/
+# transliteration variants). Matched phrase-aware (see _contains_phrase),
+# never via naive substring containment — several of these aliases are
+# short enough (e.g. "قلب", "كبد", "سكر") that blind substring matching
+# could false-positive inside an unrelated longer word (e.g. "قلب" inside
+# "انقلاب").
+SPECIALTY_ALIASES: dict[str, list[str]] = {
+    "GIT": [
+        "GIT", "Gastroenterology", "Gastrointestinal", "Digestive system", "Digestive",
+        "الجهاز الهضمي", "جهاز هضمي", "أمراض الجهاز الهضمي", "امراض الجهاز الهضمي",
+        "كبد", "الكبد", "أمراض الكبد", "امراض الكبد", "قولون", "القولون",
+    ],
+    "Nutrition": ["Nutrition", "Clinical Nutrition", "تغذية", "التغذية", "تغذية علاجية"],
+    "General Surgery": ["General Surgery", "جراحة عامة", "الجراحة العامة"],
+    "Neurology": [
+        "Neurology", "Neurological", "مخ وأعصاب", "مخ واعصاب", "المخ والأعصاب", "المخ والاعصاب",
+        "مخ و اعصاب", "مخ و أعصاب", "اعصاب", "أعصاب", "الأعصاب", "الاعصاب",
+    ],
+    "Ophthalmology": ["Ophthalmology", "طب العيون", "عيون"],
+    "ENT": [
+        "ENT", "Ear, Nose and Throat", "Otolaryngology", "أنف وأذن وحنجرة", "انف واذن وحنجرة",
+    ],
+    "Cardiology": ["Cardiology", "قلب", "القلب", "طب القلب"],
+    "Psychiatry": ["Psychiatry", "طب نفسي", "نفسي", "الصحة النفسية"],
+    "Dental": ["Dental", "Dentistry", "أسنان", "اسنان", "طب الأسنان"],
+    "Diabetes": ["Diabetes", "Diabetology", "سكري", "السكري", "سكر", "مرض السكر"],
+    "Diabetic Educator": [
+        "Diabetic Educator", "Diabetes Educator", "مثقف سكري", "مثقفة سكري",
+        "تثقيف سكري", "التثقيف السكري",
+    ],
+    "Orthopedics": ["Orthopedics", "Orthopedic", "عظام", "العظام", "جراحة العظام"],
+    "Pulmonology": [
+        "Pulmonology", "Pulmonary", "Respiratory", "Chest",
+        "صدر", "صدرية", "أمراض الصدر", "امراض الصدر", "الجهاز التنفسي", "جهاز تنفسي",
+    ],
+    "Allergy & Immunology": [
+        "Allergy & Immunology", "Allergy and Immunology", "Allergy", "Immunology",
+        "حساسية ومناعة", "الحساسية والمناعة", "حساسية", "مناعة",
+    ],
+}
+
+# WEAK specialty evidence — a term that is only meaningfully connected to
+# a specialty when corroborated (either an existing context for that
+# specialty's COE is already active, or a STRONG alias for the same
+# specialty co-occurs) — never sufficient, by itself, to create a context
+# on its own (see detect_specialty_mentions / build_coe_contexts).
+# "مناظير"/"منظار" (endoscopy/scopes) is ambiguous on its own — it is only
+# GIT/IBD evidence when connected to actual gastroenterology or liver
+# context.
+WEAK_SPECIALTY_ALIASES: dict[str, list[str]] = {
+    "GIT": ["مناظير", "منظار"],
+}
+
+
+def _build_specialty_to_coes() -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    for coe, specialties in COE_SPECIALTIES.items():
+        for specialty in specialties:
+            mapping.setdefault(specialty, [])
+            if coe not in mapping[specialty]:
+                mapping[specialty].append(coe)
+    return mapping
+
+
+# Canonical specialty -> every COE it organizationally supports. Length 1
+# for an unambiguous specialty (e.g. "Neurology" -> ["Headache"]), length
+# 2+ for a genuinely SHARED specialty (e.g. "ENT" -> ["Headache",
+# "Asthma"]) that must be disambiguated, never guessed (see
+# detect_specialty_mentions).
+SPECIALTY_TO_COES: dict[str, list[str]] = _build_specialty_to_coes()
+
+
+def _tokens(text: str | None) -> list[str]:
+    return _norm(text).split()
+
+
+def _contains_phrase(haystack_tokens: list[str], needle: str) -> bool:
+    """True when *needle* (normalised and tokenised) appears as a
+    CONTIGUOUS run of whole tokens inside haystack_tokens — phrase-aware
+    matching that never lets a short alias (e.g. "قلب") false-positive
+    merely because it is a SUBSTRING of an unrelated longer word (e.g.
+    "انقلاب") the way naive `alias in text` containment would."""
+    needle_tokens = _tokens(needle)
+    if not needle_tokens:
+        return False
+    n = len(needle_tokens)
+    return any(
+        haystack_tokens[i:i + n] == needle_tokens
+        for i in range(len(haystack_tokens) - n + 1)
+    )
+
+
+def resolve_canonical_specialty(text: str) -> str | None:
+    """Deterministic, phrase-aware, longest-alias-wins resolution of the
+    canonical specialty named in *text* (e.g. "المخ والاعصاب" -> "Neurology",
+    "الكبد" -> "GIT"), or None when no specialty alias is present. See
+    detect_specialty_mentions for the full set of specialties mentioned
+    (this returns only the single best match)."""
+    tokens = _tokens(text)
+    if not tokens:
+        return None
+    best, best_len = None, 0
+    for canonical, aliases in SPECIALTY_ALIASES.items():
+        for alias in aliases:
+            alias_tokens = _tokens(alias)
+            if alias_tokens and _contains_phrase(tokens, alias) and len(alias_tokens) > best_len:
+                best, best_len = canonical, len(alias_tokens)
+    return best
+
+
+def detect_specialty_mentions(text: str) -> list[tuple[str, list[str]]]:
+    """Every canonical specialty with STRONG evidence in *text*, phrase-
+    aware, as (canonical_specialty, candidate_coes) pairs — candidate_coes
+    has length 1 for an unambiguous specialty, length 2+ for a SHARED one
+    (e.g. "ENT" -> ["Headache", "Asthma"]).
+
+    Deliberately excludes WEAK_SPECIALTY_ALIASES (e.g. "مناظير") — a weak
+    term is never, by itself, sufficient evidence that a specialty was
+    discussed; see detect_weak_specialty_mentions for the separate,
+    corroboration-gated path build_coe_contexts uses for those.
+    """
+    tokens = _tokens(text)
+    if not tokens:
+        return []
+    found: list[tuple[str, list[str]]] = []
+    for canonical, aliases in SPECIALTY_ALIASES.items():
+        if any(_contains_phrase(tokens, alias) for alias in aliases):
+            found.append((canonical, SPECIALTY_TO_COES.get(canonical, [])))
+    return found
+
+
+def detect_weak_specialty_mentions(text: str) -> list[tuple[str, list[str]]]:
+    """Every canonical specialty named ONLY via WEAK_SPECIALTY_ALIASES in
+    *text* (e.g. "مناظير"/"منظار" -> GIT) — returned separately from
+    detect_specialty_mentions because a weak term must NEVER create a
+    context by itself; the caller (build_coe_contexts) only accepts it as
+    corroborating evidence for a specialty/COE that is already otherwise
+    established (a strong alias for the SAME specialty elsewhere in the
+    conversation, or an already-active context for one of its candidate
+    COEs) — never standalone."""
+    tokens = _tokens(text)
+    if not tokens:
+        return []
+    return [
+        (canonical, SPECIALTY_TO_COES.get(canonical, []))
+        for canonical, aliases in WEAK_SPECIALTY_ALIASES.items()
+        if any(_contains_phrase(tokens, alias) for alias in aliases)
+    ]
+
+
+# Clinic/specialty synonyms that identify each COE's FIRST CLINIC
+# contextually (e.g. "عيادة المخ والاعصاب" for Headache's Neurology
+# clinic) — distinct from a disease-symptom complaint (COMPLAINT_KEYWORDS)
+# and from an explicit COE-name recommendation (COE_NAME_MARKERS).
+# Derived from the centralized SPECIALTY_ALIASES/COE_SPECIALTIES taxonomy
+# above (union of every specialty's aliases organizationally grouped under
+# each COE) — kept as its own name for the sibling functions below that
+# still reason per-COE rather than per-specialty (CAMPAIGN_COE_CONTEXT_
+# MARKERS, resolve_campaign_coe, ground_llm_coe_value). A SHARED specialty
+# like ENT contributes to BOTH COEs' sets here (this is a permissive
+# "is there SOME evidence" check, not an exclusive-attribution decision —
+# see build_coe_contexts / extract_doctor_context_associations for the
+# disambiguation-aware per-specialty logic that IS exclusive).
+SPECIALTY_MARKERS: dict[str, set[str]] = {
+    coe: {alias for specialty in specialties for alias in SPECIALTY_ALIASES.get(specialty, [])}
+    for coe, specialties in COE_SPECIALTIES.items()
 }
 
 # Broader per-COE evidence vocabulary — union of the complaint keywords
 # (what the PATIENT would say), the narrow COE-name markers (what an AGENT
-# explicitly recommending the COE would say), and, for Headache, the
-# neurology-clinic synonyms above. Used ONLY for:
+# explicitly recommending the COE would say), and the clinic/specialty
+# synonyms above. Used for:
 #   1. resolve_campaign_coe — identifying which COE a campaign/post message
 #      establishes from its own text.
 #   2. ground_llm_coe_value / _agent_turn_supports_category — verifying
 #      that an LLM-claimed recommended_coe has REAL supporting transcript
 #      evidence in an Agent turn, never accepting a category merely because
 #      it's one of the four the LLM was told about in reference data.
-# Never used to deterministically SET recommended_coe (see
-# resolve_recommended_coe, which stays on the narrower COE_NAME_MARKERS).
+#   3. The single-scalar legacy _coe_matches_in_text path (kept for
+#      backward compatibility only — see its docstring).
+# Never used to deterministically SET recommended_coe on its own (see
+# resolve_recommended_coe, which stays on the narrower COE_NAME_MARKERS),
+# and never used by the multi-context builder for EXCLUSIVE attribution of
+# a shared specialty (see detect_specialty_mentions / build_coe_contexts).
 CAMPAIGN_COE_CONTEXT_MARKERS: dict[str, set[str]] = {
-    key: set(COMPLAINT_KEYWORDS[key]) | set(COE_NAME_MARKERS[key])
+    key: set(COMPLAINT_KEYWORDS[key]) | set(COE_NAME_MARKERS[key]) | set(SPECIALTY_MARKERS[key])
     for key in COE_KEYS
 }
-CAMPAIGN_COE_CONTEXT_MARKERS["Headache"] |= _HEADACHE_NEUROLOGY_CONTEXT_TERMS
 
 # ── COE / specialized-center trigger phrases ────────────────────────────────
 # Deliberately compound phrases only — a bare "مركز" (center/branch) must
@@ -996,3 +1196,707 @@ def ground_doctor_names(names: list[str], transcript_candidates: list[str]) -> l
             seen.add(g)
             out.append(g)
     return out
+
+# ═════════════════════════════════════════════════════════════════════════
+# Multi-context COE evaluation
+#
+# A single conversation may legitimately discuss MORE than one COE (e.g. a
+# Headache campaign click followed by an unrelated Agent recommendation of
+# the IBD COE) — collapsing everything into one scalar expected_coe/
+# recommended_coe/validation_coe silently conflates them and lets one
+# approved doctor "cover for" a different, unapproved doctor offered under
+# a different COE. This section builds ONE INDEPENDENT evaluation context
+# per grounded COE (see build_coe_contexts) and associates every extracted
+# doctor with the correct context using TURN-LEVEL transcript evidence
+# (see extract_doctor_context_associations), never by cross-matching every
+# doctor against every COE.
+#
+# This is purely ADDITIVE: the pre-existing single-scalar fields
+# (expected_coe/campaign_coe/recommended_coe/validation_coe/
+# coe_match_status/primary_doctor_status/matched_primary_doctors/
+# recommended_or_selected_doctors) are computed exactly as before and kept
+# unchanged for single-context calls (see app.agent.nodes.
+# infer_coe_validation) — this section only adds the richer
+# coe_evaluations/overall_coe_status representation alongside them, per
+# the project's "keep existing scalar fields when exactly one context
+# exists, never silently pick one when several do" backward-compatibility
+# rule.
+# ═════════════════════════════════════════════════════════════════════════
+
+# Referral/later-involvement language — a doctor mentioned alongside this
+# (in the same or an adjacent turn) is a possible LATER referral, never the
+# INITIAL COE appointment doctor (mirrors the LLM-facing instruction in
+# app.prompts.qa_prompt.build_coe_prompt, but applied deterministically
+# here so multi-context role assignment never depends on an LLM call).
+_REFERRAL_LANGUAGE_RE = re.compile(
+    r"بعد\s*(?:ال)?تقييم|لاحقا|لو\s*احتجت|قد\s*يتابع|ربما\s*تحتاج|"
+    r"في\s*مرحل[ةه]\s*لاحق[ةه]|لاحق[ةه]\s*لو|"
+    r"might\s*(?:also\s*)?(?:get\s*)?involve|later\s*referral|after\s*the\s*initial",
+    re.I,
+)
+
+# ── Doctor-name-candidate rejection filter ──────────────────────────────────
+# Additive, COE-local defense against referral/service/administrative
+# phrases that can slip past the shared extraction engine's blocklists in
+# some phrasings (e.g. "تحويل طبي" / "وبيتم التحويل بعد ذلك" — a passive
+# future-tense construction not covered by doctor_validation.py's own,
+# independently-tested blocklist). Deliberately kept HERE rather than
+# added to that shared, heavily-tested engine (used by unrelated
+# validators) — see clean_extracted_doctor_name's docstring for the same
+# rationale.
+_NON_DOCTOR_CANDIDATE_PHRASES: set[str] = {
+    "تحويل طبي", "استشارة طبيب", "موعد مع الدكتور", "تحويل", "استشارة", "موعد",
+}
+_NON_DOCTOR_CANDIDATE_FIRST_WORDS: set[str] = {
+    "تحويل", "التحويل", "لتحويل", "استشارة", "الاستشارة", "موعد", "الموعد",
+    "وبيتم", "بيتم", "يتم", "سيتم", "هيتم", "تم", "وتم",
+}
+
+
+def _specialty_alias_token_tuples() -> set[tuple[str, ...]]:
+    """Every specialty/clinic alias (STRONG and WEAK) from the centralized
+    taxonomy, as a tuple of normalised tokens — reused as a deterministic
+    safeguard so a candidate that IS ENTIRELY a specialty/clinic phrase
+    (e.g. "جهاز هضمي" extracted from "لدكتور جهاز هضمي") is rejected as a
+    doctor name, never accepted as one (see
+    is_plausible_coe_doctor_candidate). This is exactly the centralized
+    mapping's "deterministic safeguards" consumer the module docstring
+    calls for."""
+    tuples: set[tuple[str, ...]] = set()
+    for aliases in SPECIALTY_ALIASES.values():
+        for alias in aliases:
+            tuples.add(tuple(_tokens(alias)))
+    for aliases in WEAK_SPECIALTY_ALIASES.values():
+        for alias in aliases:
+            tuples.add(tuple(_tokens(alias)))
+    return tuples
+
+
+_SPECIALTY_ALIAS_TOKEN_TUPLES: set[tuple[str, ...]] = _specialty_alias_token_tuples()
+
+
+def is_plausible_coe_doctor_candidate(name: str | None) -> bool:
+    """Reject a referral/service/administrative phrase, or a bare
+    specialty/clinic phrase, from ever being reported as a doctor name
+    (see _NON_DOCTOR_CANDIDATE_PHRASES / _NON_DOCTOR_CANDIDATE_FIRST_WORDS
+    / _SPECIALTY_ALIAS_TOKEN_TUPLES) — a deliberately narrow, closed
+    rejection list, same non-exhaustive philosophy as doctor_validation.
+    py's own blocklists: only well-defined negative cases are excluded,
+    never a positive name-vocabulary guess."""
+    if not name:
+        return False
+    norm = normalize_arabic_text(name)
+    if not norm:
+        return False
+    if norm in {normalize_arabic_text(p) for p in _NON_DOCTOR_CANDIDATE_PHRASES}:
+        return False
+    words = norm.split()
+    if not words or words[0] in _NON_DOCTOR_CANDIDATE_FIRST_WORDS:
+        return False
+    if tuple(words) in _SPECIALTY_ALIAS_TOKEN_TUPLES:
+        return False
+    return True
+
+
+_ALIAS_TITLE_PREFIX_RE = re.compile(r"^(?:dr\.?|doctor|د(?:[./\\-])?|دكتور[ةه]?)\s+", re.I)
+
+
+def _known_doctor_alias_candidates(text: str) -> list[str]:
+    """Doctor names/aliases from the authoritative PRIMARY_DOCTOR_ALIASES
+    table found as an exact multi-word phrase anywhere in *text* — a
+    SUPPLEMENTARY extraction path alongside the shared title-anchored
+    engine (_doctor_name_candidates_in_text), needed for phrasing where a
+    degree/title word FOLLOWS the name rather than preceding it (e.g.
+    "داليندا عرفاوي استشاري امراض الجهاز الهضمي" — the shared engine only
+    anchors on a title BEFORE the name, so it finds nothing here at all).
+
+    Only considers aliases with NO leading Dr/Dr./Doctor/دكتور/د title —
+    _tokens() (via normalize_arabic_text) silently STRIPS a leading title
+    from its own normalised output, so a title-prefixed alias like
+    "دكتورة داليندا عرفاوي" would otherwise phrase-match on its
+    title-STRIPPED form alone, yet still be returned with the raw,
+    untouched title still attached — every doctor already has a bare
+    (title-free) alias covering the same name, so title-prefixed aliases
+    are redundant here, not a coverage gap.
+
+    Restricted to multi-word aliases (>= 2 tokens) to avoid a bare
+    single-token alias over-matching without any title/context anchor —
+    single-token mentions stay the shared engine's job."""
+    tokens = _tokens(text)
+    if not tokens:
+        return []
+    found: list[str] = []
+    for doctors in PRIMARY_DOCTOR_ALIASES.values():
+        for aliases in doctors.values():
+            for alias in aliases:
+                if _ALIAS_TITLE_PREFIX_RE.match(alias.strip()):
+                    continue
+                if len(_tokens(alias)) >= 2 and alias not in found and _contains_phrase(tokens, alias):
+                    found.append(alias)
+    return found
+
+
+def _coe_matches_in_text(text: str) -> list[str]:
+    """Every supported COE whose CAMPAIGN_COE_CONTEXT_MARKERS vocabulary
+    appears in *text* (a single turn) — order follows COE_KEYS. Kept for
+    the pre-existing single-scalar backward-compatibility call sites
+    (resolve_campaign_coe's per-turn scan) — this is a permissive "is
+    there SOME evidence for COE X" check and, unlike the multi-context
+    builder below, does not attempt to EXCLUSIVELY resolve a SHARED
+    specialty (e.g. ENT) to one specific COE."""
+    norm = _norm(text)
+    return [key for key in COE_KEYS if any(_norm(m) in norm for m in CAMPAIGN_COE_CONTEXT_MARKERS[key])]
+
+
+def _unambiguous_coe_matches(text: str) -> list[str]:
+    """COE matches that never require disambiguation: explicit COE-name
+    markers, complaint keywords, and specialties that map to exactly ONE
+    COE (see detect_specialty_mentions)."""
+    norm = _norm(text)
+    matched: list[str] = [key for key in COE_KEYS if any(_norm(m) in norm for m in COE_NAME_MARKERS[key])]
+    for key in COE_KEYS:
+        if key not in matched and any(_norm(kw) in norm for kw in COMPLAINT_KEYWORDS[key]):
+            matched.append(key)
+    for _specialty, candidate_coes in detect_specialty_mentions(text):
+        if len(candidate_coes) == 1 and candidate_coes[0] not in matched:
+            matched.append(candidate_coes[0])
+    return matched
+
+
+def resolve_specialty_coes(text: str, active_coes: Any = ()) -> list[str]:
+    """Every COE resolvable from *text*'s specialty mentions — an
+    unambiguous specialty (maps to exactly one COE) always resolves; a
+    SHARED specialty (e.g. "ENT" -> Headache or Asthma) resolves ONLY when
+    EXACTLY ONE of its candidate COEs is already active (this text's own
+    unambiguous evidence, plus whatever the caller passes as
+    *active_coes* — see the module docstring's disambiguation priority
+    order: explicit campaign/COE name > patient complaint > specialty/
+    doctor proximity > active booking context > turn order). A shared
+    specialty that cannot be disambiguated this way contributes NOTHING
+    here — never guessed (see ambiguous_specialty_mentions for surfacing
+    it instead)."""
+    matched = _unambiguous_coe_matches(text)
+    local_active = set(active_coes) | set(matched)
+    for _specialty, candidate_coes in detect_specialty_mentions(text):
+        if len(candidate_coes) <= 1:
+            continue
+        overlap = [c for c in candidate_coes if c in local_active]
+        if len(overlap) == 1 and overlap[0] not in matched:
+            matched.append(overlap[0])
+    for _specialty, candidate_coes in detect_weak_specialty_mentions(text):
+        for coe in candidate_coes:
+            if coe in local_active and coe not in matched:
+                matched.append(coe)
+    return matched
+
+
+def ambiguous_specialty_mentions(text: str, active_coes: Any = ()) -> list[tuple[str, list[str]]]:
+    """Every SHARED specialty mentioned in *text* whose ambiguity could
+    NOT be resolved by *active_coes* (see resolve_specialty_coes) —
+    surfaced so an unresolved shared-specialty mention (e.g. a bare "ENT"
+    referral with no established Headache/Asthma context yet) reports as
+    uncertain rather than being silently dropped or guessed into one."""
+    matched = _unambiguous_coe_matches(text)
+    local_active = set(active_coes) | set(matched)
+    unresolved: list[tuple[str, list[str]]] = []
+    for specialty, candidate_coes in detect_specialty_mentions(text):
+        if len(candidate_coes) <= 1:
+            continue
+        overlap = [c for c in candidate_coes if c in local_active]
+        if len(overlap) != 1:
+            unresolved.append((specialty, candidate_coes))
+    return unresolved
+
+
+def build_coe_contexts(
+    call: CallTranscript, scripts: dict[str, str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Build one independent evaluation context per COE with REAL grounded
+    evidence anywhere in the transcript — never for a COE that merely
+    appears in CRM reference data or an LLM prompt (see module docstring).
+
+    A context is created for a COE the moment ANY of the following is
+    found (turn-by-turn, in transcript order):
+      - "campaign"            — a Patient turn carries the structured
+                                 campaign identifier (see
+                                 campaign_origin_evidence) AND its own text
+                                 identifies this COE.
+      - "agent_recommendation" — an Agent turn explicitly names this COE
+                                 (COE_NAME_MARKERS) or closely paraphrases
+                                 its approved script (script_similarity).
+      - "patient_complaint"   — a Patient turn describes a symptom mapping
+                                 to this COE (COMMPLAINT_KEYWORDS).
+      - "agent_specialty" / "patient_specialty" — a turn mentions a
+                                 canonical specialty organizationally
+                                 grouped under this COE (see
+                                 COE_SPECIALTIES/SPECIALTY_ALIASES),
+                                 tagged by speaker. A SHARED specialty
+                                 (e.g. "ENT" -> Headache or Asthma) is
+                                 resolved via detect_specialty_mentions's
+                                 disambiguation — it is NEVER credited to
+                                 every COE it could organizationally
+                                 belong to, and never guessed when
+                                 unresolved.
+
+    Each "specialties" entry is a structured
+    {"canonical_specialty", "original_text", "speaker", "evidence"} dict —
+    both the canonical specialty AND the original transcript wording are
+    preserved (see the module docstring's specialty-normalisation
+    requirement).
+
+    Returns {coe_key: {"coe", "context_sources", "complaints",
+    "specialties", "campaign_evidence", "agent_coe_evidence"}} — a COE with
+    zero evidence never appears as a key at all.
+    """
+    scripts = scripts or DEFAULT_SCRIPTS_AR
+    turns = split_transcript_turns(call.transcript)
+    contexts: dict[str, dict[str, Any]] = {}
+
+    def _ctx(coe: str) -> dict[str, Any]:
+        return contexts.setdefault(coe, {
+            "coe": coe,
+            "context_sources": [],
+            "complaints": [],
+            "specialties": [],
+            "campaign_evidence": None,
+            "agent_coe_evidence": None,
+        })
+
+    def _add_source(coe: str, source: str) -> None:
+        c = _ctx(coe)
+        if source not in c["context_sources"]:
+            c["context_sources"].append(source)
+
+    running_active: list[str] = []
+
+    def _add_specialty(coe: str, canonical_specialty: str, original_text: str, speaker: str, excerpt: str) -> None:
+        c = _ctx(coe)
+        entry = {
+            "canonical_specialty": canonical_specialty,
+            "original_text": original_text,
+            "speaker": speaker,
+            "evidence": excerpt,
+        }
+        if entry not in c["specialties"]:
+            c["specialties"].append(entry)
+
+    for speaker, text in turns:
+        norm = _norm(text)
+        excerpt = text.strip()[:300]
+        this_turn_coes: list[str] = []
+
+        if speaker == "patient" and _CAMPAIGN_ORIGIN_RE.search(text):
+            for coe in _unambiguous_coe_matches(text):
+                _add_source(coe, "campaign")
+                this_turn_coes.append(coe)
+                c = _ctx(coe)
+                if c["campaign_evidence"] is None:
+                    c["campaign_evidence"] = excerpt
+
+        if speaker == "agent":
+            for coe, markers in COE_NAME_MARKERS.items():
+                if any(_norm(m) in norm for m in markers):
+                    _add_source(coe, "agent_recommendation")
+                    this_turn_coes.append(coe)
+                    c = _ctx(coe)
+                    if c["agent_coe_evidence"] is None:
+                        c["agent_coe_evidence"] = excerpt
+            # Script similarity is a fuzzy, "which ONE approved script does
+            # this turn most resemble" signal — the four approved scripts
+            # share substantial boilerplate wording ("لضمان تحقيق أقصى
+            # استفادة...سيتم حجز موعد لحضرتك بمركز التميز المتخصص في..."),
+            # so checking each COE's script INDEPENDENTLY against the same
+            # threshold would credit ALL four from one turn's shared
+            # boilerplate alone. Only the single BEST-scoring COE for THIS
+            # turn is ever credited (mirrors resolve_recommended_coe's own
+            # "best match wins" semantics) — never more than one per turn,
+            # though separate turns may still independently recommend
+            # separate COEs.
+            best_script_key, best_script_score = None, 0.0
+            for coe, script in scripts.items():
+                score = script_similarity(text, script)
+                if score > best_script_score:
+                    best_script_key, best_script_score = coe, score
+            if best_script_key and best_script_score >= SCRIPT_MATCH_THRESHOLD:
+                _add_source(best_script_key, "agent_recommendation")
+                this_turn_coes.append(best_script_key)
+                c = _ctx(best_script_key)
+                if c["agent_coe_evidence"] is None:
+                    c["agent_coe_evidence"] = excerpt
+
+        if speaker == "patient":
+            for coe, kws in COMPLAINT_KEYWORDS.items():
+                if any(_norm(kw) in norm for kw in kws):
+                    _add_source(coe, "patient_complaint")
+                    this_turn_coes.append(coe)
+                    c = _ctx(coe)
+                    if excerpt[:200] not in c["complaints"]:
+                        c["complaints"].append(excerpt[:200])
+
+        # Specialty evidence — resolved with disambiguation, never
+        # cross-attributing a SHARED specialty (e.g. ENT) to every COE it
+        # could organizationally belong to. active_coes here is every COE
+        # established so far (prior turns) PLUS this turn's own
+        # unambiguous evidence (so e.g. a Headache complaint and an ENT
+        # referral in the SAME turn/conversation still correctly resolve
+        # ENT -> Headache — see the module's disambiguation priority
+        # order: explicit COE/campaign and patient complaint both outrank
+        # bare specialty/turn proximity).
+        active_for_specialty = set(running_active) | set(this_turn_coes)
+        for specialty, candidate_coes in detect_specialty_mentions(text):
+            resolved_coes = (
+                candidate_coes if len(candidate_coes) == 1
+                else [c for c in candidate_coes if c in active_for_specialty]
+            )
+            if len(resolved_coes) != 1:
+                continue  # ambiguous/unresolved — never guessed into a context
+            coe = resolved_coes[0]
+            _add_source(coe, "agent_specialty" if speaker == "agent" else "patient_specialty")
+            this_turn_coes.append(coe)
+            _add_specialty(coe, specialty, specialty, speaker, excerpt[:200])
+
+        for specialty, candidate_coes in detect_weak_specialty_mentions(text):
+            for coe in candidate_coes:
+                if coe not in active_for_specialty:
+                    continue  # weak evidence alone never creates/extends a context
+                _add_source(coe, "agent_specialty" if speaker == "agent" else "patient_specialty")
+                _add_specialty(coe, specialty, specialty, speaker, excerpt[:200])
+
+        for coe in this_turn_coes:
+            if coe not in running_active:
+                running_active.append(coe)
+
+    return contexts
+
+
+# Deliberately does NOT include "." — an English title abbreviation
+# ("Dr.") relies on that exact period immediately before the name, and
+# splitting there would sever the title from the name it introduces
+# (see _doctor_name_candidates_in_text, which needs both together).
+# Arabic commas/semicolons and newlines are the primary clause boundary
+# in these transcripts regardless.
+_CLAUSE_SPLIT_RE = re.compile(r"[،؛\n]+")
+
+
+def _split_clauses(text: str) -> list[str]:
+    """Split one turn's text into rough clauses on sentence-level
+    punctuation — used ONLY so a doctor's role and COE association are
+    read from the specific clause naming them, not bled in from an
+    unrelated LATER clause in the same Agent turn (e.g. an initial-doctor
+    offer immediately followed, in the same turn, by a sentence about a
+    possible later referral — see extract_doctor_context_associations)."""
+    return [p.strip() for p in _CLAUSE_SPLIT_RE.split(text) if p.strip()]
+
+
+def _global_unambiguous_coes(turns: list[tuple[str, str]]) -> list[str]:
+    """Every COE unambiguously grounded ANYWHERE in the call — order-
+    independent (explicit campaign/COE-name/complaint evidence, priority
+    levels 1-3 of the module's disambiguation order, are position-
+    independent global signals) — used as the baseline pool for resolving
+    a SHARED specialty (e.g. ENT) mentioned anywhere in the same call."""
+    found: list[str] = []
+    for _speaker, text in turns:
+        for coe in _unambiguous_coe_matches(text):
+            if coe not in found:
+                found.append(coe)
+    return found
+
+
+def extract_doctor_context_associations(call: CallTranscript) -> list[dict[str, Any]]:
+    """Extract every AGENT-turn doctor-name mention together with the
+    COE(s) it is grounded to via turn/clause-level evidence — never a flat
+    list cross-matched against every COE (see module docstring).
+
+    Association order (first match wins, never guessed further):
+      1. The SAME CLAUSE the doctor was named in (tightest scope) — COE
+         evidence in that exact clause, e.g. "دكتور محمود الحوراني بعيادة
+         المخ والاعصاب" -> Headache. A SHARED specialty in this clause is
+         resolved against the call's global unambiguous COEs (see
+         resolve_specialty_coes / _global_unambiguous_coes) — priority
+         levels 1-3 (explicit campaign/COE name, patient complaint) always
+         outrank bare turn proximity.
+      2. Elsewhere in the SAME Agent turn (other clauses of it).
+      3. An IMMEDIATELY SURROUNDING turn (one turn before or after).
+      4. The single COE established so far elsewhere in the call, ONLY
+         when EXACTLY ONE is active (unambiguous) — never guessed when
+         zero or several are active (see evaluate_context_doctors's
+         "uncertain" handling for that case).
+
+    Every extracted candidate is passed through
+    is_plausible_coe_doctor_candidate — a referral/service/administrative
+    phrase (e.g. "تحويل طبي", "وبيتم التحويل بعد ذلك") that slips past the
+    shared extraction engine in some phrasings is rejected here rather
+    than ever being reported as a doctor.
+
+    Role ("initial_primary" / "referral_only" / "existing_treating_doctor")
+    is likewise read from the doctor's OWN clause first (falling back to
+    the immediately preceding Patient turn only for the existing-treating-
+    doctor check) — so a later-referral sentence appended after the
+    initial doctor's offer, in the SAME turn, never demotes that initial
+    doctor to referral_only.
+
+    Each entry's "associated_coes" is the ordered list of COEs the doctor
+    resolved to at that step (possibly more than one) — empty when
+    genuinely unresolvable.
+    """
+    turns = split_transcript_turns(call.transcript)
+    global_active = _global_unambiguous_coes(turns)
+    per_turn_coes = [resolve_specialty_coes(text, active_coes=global_active) for _speaker, text in turns]
+    associations: list[dict[str, Any]] = []
+    running_active: list[str] = []
+
+    for idx, (speaker, text) in enumerate(turns):
+        for coe in per_turn_coes[idx]:
+            if coe not in running_active:
+                running_active.append(coe)
+
+        if speaker != "agent":
+            continue
+        clauses = _split_clauses(text) or [text]
+
+        nearby_coes: list[str] = []
+        for neighbour in (idx - 1, idx + 1):
+            if 0 <= neighbour < len(turns):
+                for coe in per_turn_coes[neighbour]:
+                    if coe not in nearby_coes:
+                        nearby_coes.append(coe)
+
+        preceding_patient_text = ""
+        if idx > 0 and turns[idx - 1][0] == "patient":
+            preceding_patient_text = turns[idx - 1][1]
+        preceding_patient_is_existing = bool(
+            preceding_patient_text and _EXISTING_PATIENT_RE.search(_norm(preceding_patient_text))
+        )
+
+        clause_coes = [resolve_specialty_coes(clause, active_coes=global_active) for clause in clauses]
+
+        for clause_idx, clause in enumerate(clauses):
+            candidates = [
+                cleaned for cleaned in (
+                    clean_extracted_doctor_name(raw) for raw in _doctor_name_candidates_in_text(clause)
+                )
+                if is_plausible_coe_doctor_candidate(cleaned)
+            ]
+            for alias_name in _known_doctor_alias_candidates(clause):
+                if alias_name not in candidates:
+                    candidates.append(alias_name)
+            if not candidates:
+                continue
+
+            norm_clause = _norm(clause)
+            same_clause_coes = clause_coes[clause_idx]
+            other_clause_coes: list[str] = []
+            for other_idx, other_coes in enumerate(clause_coes):
+                if other_idx == clause_idx:
+                    continue
+                for coe in other_coes:
+                    if coe not in other_clause_coes:
+                        other_clause_coes.append(coe)
+
+            if same_clause_coes:
+                associated_coes, certainty = same_clause_coes, "same_clause"
+            elif other_clause_coes:
+                associated_coes, certainty = other_clause_coes, "same_turn"
+            elif nearby_coes:
+                associated_coes, certainty = nearby_coes, "nearby_turn"
+            elif len(running_active) == 1:
+                associated_coes, certainty = list(running_active), "most_recent_active"
+            else:
+                associated_coes, certainty = [], "unclear"
+
+            role = "referral_only" if _REFERRAL_LANGUAGE_RE.search(norm_clause) else "initial_primary"
+            if _EXISTING_PATIENT_RE.search(norm_clause) or preceding_patient_is_existing:
+                role = "existing_treating_doctor"
+
+            association_evidence = clause.strip()[:300]
+            for cleaned in candidates:
+                associations.append({
+                    "extracted_name": cleaned,
+                    "turn_index": idx,
+                    "associated_coes": list(associated_coes),
+                    "association_certainty": certainty,
+                    "role": role,
+                    "association_evidence": association_evidence,
+                })
+
+    return associations
+
+
+def _dedupe_doctor_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse repeated mentions of the SAME doctor within one context
+    (e.g. the full name offered by the agent, then a later shortened
+    confirmation like "اسامه" for "اسامه عبدالسلام") into ONE entry —
+    never reporting the same doctor twice within a context. The FULLEST
+    extracted name is kept as the primary evidence (see the module
+    docstring's deduplication requirement); role/evidence are taken from
+    whichever mention is kept.
+
+    Two mentions are treated as the same doctor when their normalised
+    forms are equal, or one is a normalised prefix/substring of the other
+    (a later shortened reference is, by definition, shorter) — this is a
+    looser check than resolve_primary_doctor_identity's own ambiguous-
+    partial-name guard, because here the question is only "was this
+    person already mentioned", not "does this confidently identify an
+    APPROVED doctor".
+    """
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        norm_name = normalize_doctor_name_for_match(entry.get("extracted_name"))
+        merged = False
+        if norm_name:
+            for existing in kept:
+                existing_norm = normalize_doctor_name_for_match(existing.get("extracted_name"))
+                if not existing_norm:
+                    continue
+                if norm_name == existing_norm or norm_name in existing_norm or existing_norm in norm_name:
+                    if len(entry.get("extracted_name") or "") > len(existing.get("extracted_name") or ""):
+                        existing["extracted_name"] = entry["extracted_name"]
+                        existing["association_evidence"] = entry.get("association_evidence")
+                    merged = True
+                    break
+        if not merged:
+            kept.append(dict(entry))
+    return kept
+
+
+def evaluate_context_doctors(
+    coe_key: str, doctor_entries: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], str]:
+    """Validate every doctor already associated with *coe_key* INDEPENDENTLY
+    against that COE's own authoritative primary-doctor list — never
+    letting one approved doctor stand in for another unapproved one (see
+    module docstring's core requirement). Repeated mentions of the SAME
+    doctor within this context are first collapsed into one entry (see
+    _dedupe_doctor_entries) — a shortened later confirmation must never
+    create a second doctor candidate.
+
+    Only entries with role == "initial_primary" are checked for primary-
+    doctor approval and count toward the aggregate status — a
+    referral_only, initial_supporting, or existing_treating_doctor entry
+    is reported (role preserved) but never penalises or passes the
+    context on its own (see the aggregation rules below, matching
+    app.agent.nodes.infer_coe_validation's single-context precedent).
+
+    Aggregate status:
+      - "fail"           at least one initial_primary doctor is unapproved.
+      - "pass"           at least one initial_primary doctor exists and
+                          every initial_primary doctor is approved.
+      - "uncertain"       an initial_primary doctor's identity could not be
+                          resolved either way (name too ambiguous/partial —
+                          see resolve_primary_doctor_identity).
+      - "not_applicable"  no initial_primary doctor was discussed for this
+                          COE (only referral/follow-up/supporting doctors,
+                          or none).
+    """
+    per_doctor: list[dict[str, Any]] = []
+    for entry in _dedupe_doctor_entries(doctor_entries):
+        name = entry.get("extracted_name")
+        role = entry.get("role", "initial_primary")
+        base = {
+            "extracted_name": name,
+            "role": role,
+            "association_evidence": entry.get("association_evidence"),
+        }
+        if role != "initial_primary":
+            per_doctor.append({
+                **base,
+                "canonical_name": None,
+                "primary_doctor_status": "not_applicable",
+                "reason": f"Mentioned only as a {role.replace('_', ' ')}, not the initial COE appointment doctor.",
+            })
+            continue
+
+        canonical = resolve_primary_doctor_identity(name, coe_key)
+        if canonical:
+            per_doctor.append({
+                **base,
+                "canonical_name": canonical,
+                "primary_doctor_status": "pass",
+                "reason": f"{canonical} ({name}) is an approved primary doctor for the {coe_key} COE." if canonical != name else f"{canonical} is an approved primary doctor for the {coe_key} COE.",
+            })
+        elif name:
+            per_doctor.append({
+                **base,
+                "canonical_name": None,
+                "primary_doctor_status": "fail",
+                "reason": f"{name} is not on the approved primary-doctor list for the {coe_key} COE.",
+            })
+        else:
+            per_doctor.append({
+                **base,
+                "canonical_name": None,
+                "primary_doctor_status": "uncertain",
+                "reason": "The initial doctor's identity could not be resolved.",
+            })
+
+    initial_statuses = [d["primary_doctor_status"] for d in per_doctor if d["role"] == "initial_primary"]
+    if not initial_statuses:
+        status = "not_applicable"
+    elif "fail" in initial_statuses:
+        status = "fail"
+    elif "uncertain" in initial_statuses:
+        status = "uncertain"
+    else:
+        status = "pass"
+    return per_doctor, status
+
+
+def build_coe_evaluations(
+    call: CallTranscript, scripts: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
+    """Top-level orchestrator: one independent, fully-evaluated context per
+    grounded COE (see build_coe_contexts / extract_doctor_context_
+    associations / evaluate_context_doctors above) — the authoritative
+    multi-context representation app.agent.nodes.infer_coe_validation
+    exposes as coe_validation["coe_evaluations"], alongside (never instead
+    of) the pre-existing single-scalar fields.
+
+    A doctor whose association is genuinely "unclear" (see
+    extract_doctor_context_associations) is never attached to any context
+    — attaching it to a guessed COE would be exactly the kind of
+    cross-matching this design forbids. It is still recoverable in the
+    returned entries' own list for callers that want to surface an
+    "uncertain association" note (see infer_coe_validation).
+    """
+    contexts = build_coe_contexts(call, scripts)
+    associations = extract_doctor_context_associations(call)
+
+    evaluations: list[dict[str, Any]] = []
+    for coe_key in COE_KEYS:
+        ctx = contexts.get(coe_key)
+        if ctx is None:
+            continue
+        doctors_here = [a for a in associations if coe_key in a["associated_coes"]]
+        per_doctor, primary_status = evaluate_context_doctors(coe_key, doctors_here)
+
+        has_recommendation_side = any(
+            s in ctx["context_sources"] for s in ("campaign", "agent_recommendation", "agent_specialty")
+        )
+        coe_match_status = "pass" if has_recommendation_side else "uncertain"
+
+        evaluations.append({
+            "coe": coe_key,
+            "context_sources": ctx["context_sources"],
+            "complaints": ctx["complaints"],
+            "specialties": ctx["specialties"],
+            "campaign_evidence": ctx["campaign_evidence"],
+            "agent_coe_evidence": ctx["agent_coe_evidence"],
+            "doctors": per_doctor,
+            "coe_match_status": coe_match_status,
+            "primary_doctor_status": primary_status,
+            "is_violation": primary_status == "fail",
+        })
+
+    return evaluations
+
+
+def unassociated_initial_doctors(call: CallTranscript) -> list[dict[str, Any]]:
+    """Doctor mentions whose COE association is genuinely ambiguous (see
+    extract_doctor_context_associations's "unclear" certainty) — never
+    attached to a guessed context. Surfaced separately so an ambiguous
+    association reports as uncertain rather than silently disappearing or
+    being force-matched (see module docstring's core requirement)."""
+    return [
+        a for a in extract_doctor_context_associations(call)
+        if a["role"] == "initial_primary" and not a["associated_coes"]
+    ]

@@ -78,18 +78,21 @@ from app.service_hub.doctor_validation import (
 )
 from app.service_hub.coe_validation import (
     AUTHORITATIVE_PRIMARY_DOCTORS,
+    build_coe_evaluations,
     build_coe_reference,
     classify_coe_trigger,
     clean_extracted_doctor_name,
     existing_patient_exception_evidence,
     ground_doctor_names,
     ground_llm_coe_value,
+    is_plausible_coe_doctor_candidate,
     normalize_doctor_name_for_match,
     resolve_campaign_coe,
     resolve_primary_complaint,
     resolve_primary_doctor_identity,
     resolve_recommended_coe,
     scripts_from_reference,
+    unassociated_initial_doctors,
 )
 from app.services.text_helpers import (
     _normalize_arabic,
@@ -2335,6 +2338,12 @@ def _not_applicable_coe_result(reason: str) -> dict:
         "reason": reason,
         "confidence": 1.0,
         "is_violation": False,
+        # Multi-context representation (see app.service_hub.coe_validation.
+        # build_coe_evaluations) — empty/neutral when the node never ran.
+        "trigger_paths": [],
+        "coe_evaluations": [],
+        "overall_coe_status": "not_applicable",
+        "unassociated_initial_doctors": [],
     }
 
 
@@ -2374,6 +2383,12 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     # name's docstring. COE-local cleanup only; the shared extraction
     # engine itself (used by other, unrelated validators) is untouched.
     agent_doctors = [clean_extracted_doctor_name(d) for d in agent_doctors]
+    # Reject candidates that are actually a specialty/clinic/connector phrase
+    # (e.g. "جهاز هضمي" out of "لدكتور جهاز هضمي") or a generic referral
+    # phrase (e.g. "تحويل طبي") rather than an actual doctor name — additive,
+    # COE-local safeguard; the shared extraction engine itself is untouched
+    # (see is_plausible_coe_doctor_candidate's docstring).
+    agent_doctors = [d for d in agent_doctors if is_plausible_coe_doctor_candidate(d)]
     booking_discussed = bool(agent_doctors)
     existing_evidence_det = existing_patient_exception_evidence(call)
     # campaign_coe is the AUTHORITATIVE COE established by a campaign/post
@@ -2392,6 +2407,17 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     reference = build_coe_reference(coe_rows)
     scripts = scripts_from_reference(reference)
     det_recommended = resolve_recommended_coe(call, scripts)
+
+    # ── Multi-context evaluation (deterministic, additive) ──────────────────
+    # One INDEPENDENT context per grounded COE discussed in the call — never
+    # collapsed into a single scalar, and never cross-matching one doctor
+    # against an unrelated COE (see app.service_hub.coe_validation.
+    # build_coe_evaluations). This runs alongside, not instead of, the
+    # single-scalar computation below, which stays byte-for-byte the same
+    # for a genuinely single-COE call (see the backward-compatibility note
+    # further down where the two are reconciled).
+    coe_evaluations = build_coe_evaluations(call, scripts)
+    unassociated_doctors = unassociated_initial_doctors(call)
 
     # ── Semantic extraction (LLM) — only for what regex genuinely can't do
     # reliably: disambiguating a primary complaint among several, faithful-
@@ -2596,6 +2622,59 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     if existing_evidence:
         evidence.append(existing_evidence)
 
+    # ── Backward-compatible reconciliation with the multi-context result ──
+    # The single-scalar fields above (expected_coe/campaign_coe/
+    # recommended_coe/validation_coe/coe_match_status) are computed EXACTLY
+    # as before and are NEVER changed here — for a genuinely single-COE
+    # call they already match coe_evaluations' own single entry (see
+    # coe_validation.py's module docstring). primary_doctor_status (and,
+    # through it, is_violation below) is the one field ESCALATED — never
+    # downgraded — when the multi-context evaluation surfaces a genuine
+    # violation the single-track computation above could not see on its
+    # own (e.g. a SECOND, independently-grounded COE context with its own
+    # unapproved doctor — see the module docstring's core requirement:
+    # one approved doctor must never make every other offered doctor pass).
+    _old_primary_doctor_status = primary_doctor_status
+    _context_statuses = [c["primary_doctor_status"] for c in coe_evaluations]
+    if "fail" in _context_statuses:
+        primary_doctor_status = "fail"
+    elif primary_doctor_status == "not_applicable" and "uncertain" in _context_statuses:
+        primary_doctor_status = "uncertain"
+    elif primary_doctor_status == "not_applicable" and unassociated_doctors:
+        # A doctor was offered but its COE association is genuinely
+        # ambiguous — reported as uncertain, never guessed (see
+        # coe_validation.unassociated_initial_doctors's docstring).
+        primary_doctor_status = "uncertain"
+
+    doctor_reason_text = doctor_reason
+    if primary_doctor_status != _old_primary_doctor_status:
+        # Explain the escalation explicitly so the reason text never
+        # contradicts the (now escalated) status.
+        failing = [
+            f"{c['coe']}: {d['reason']}"
+            for c in coe_evaluations
+            for d in c["doctors"]
+            if d["primary_doctor_status"] == primary_doctor_status
+        ]
+        doctor_reason_text = (
+            f"{doctor_reason} A separately-grounded COE context in this same call also applies: "
+            f"{' '.join(failing) if failing else 'a doctor mention could not be confidently associated with a specific COE context.'}"
+        ).strip()
+
+    overall_coe_status = (
+        "fail" if any(c["is_violation"] for c in coe_evaluations)
+        else "uncertain" if (any(c["primary_doctor_status"] == "uncertain" for c in coe_evaluations) or unassociated_doctors)
+        else "pass" if coe_evaluations
+        else "uncertain"
+    )
+
+    trigger_paths: list[str] = [trigger_ctx["trigger_path"]]
+    for _c in coe_evaluations:
+        if "campaign" in _c["context_sources"] and "campaign_origin" not in trigger_paths:
+            trigger_paths.append("campaign_origin")
+        if "agent_recommendation" in _c["context_sources"] and "agent_recommendation" not in trigger_paths:
+            trigger_paths.append("agent_recommendation")
+
     result = {
         "applicable": True,
         "triggered": True,
@@ -2614,20 +2693,47 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         "primary_doctor_status": primary_doctor_status,
         "existing_patient_exception": existing_exception,
         "evidence": evidence,
-        "reason": f"{coe_reason} {doctor_reason}".strip(),
+        "reason": f"{coe_reason} {doctor_reason_text}".strip(),
         "confidence": 0.9 if coe_match_status in ("pass", "fail") and primary_doctor_status != "uncertain" else 0.5,
         "is_violation": coe_match_status == "fail" or primary_doctor_status == "fail",
+        # Multi-context representation — one independent, fully-evaluated
+        # entry per grounded COE (see app.service_hub.coe_validation.
+        # build_coe_evaluations). The scalar fields above are kept unchanged
+        # for backward compatibility and already match this list's single
+        # entry when exactly one COE was discussed; consumers that need to
+        # see EVERY context (never just the first) should read this list.
+        "trigger_paths": trigger_paths,
+        "coe_evaluations": coe_evaluations,
+        "overall_coe_status": overall_coe_status,
+        "unassociated_initial_doctors": unassociated_doctors,
     }
     logger.info(
         "coe validation | call_id=%s coe_match=%s primary_doctor=%s expected=%s campaign=%s "
-        "recommended=%s validation=%s",
+        "recommended=%s validation=%s contexts=%d overall=%s",
         call.call_id, coe_match_status, primary_doctor_status, expected_coe, campaign_coe,
-        recommended_coe, validation_coe,
+        recommended_coe, validation_coe, len(coe_evaluations), overall_coe_status,
     )
     print(
         f"[coe] outcome | coe_match={coe_match_status} primary_doctor={primary_doctor_status} "
         f"expected={expected_coe} campaign={campaign_coe} recommended={recommended_coe} "
         f"validation={validation_coe} doctors={initial_grounded}",
+        flush=True,
+    )
+    for _c in coe_evaluations:
+        _specialties = []
+        for _s in _c.get("specialties", []):
+            _name = _s.get("canonical_specialty")
+            if _name and _name not in _specialties:
+                _specialties.append(_name)
+        print(
+            f"[coe] context | coe={_c['coe']} specialties={_specialties} "
+            f"doctors={[d['extracted_name'] for d in _c['doctors']]} primary_doctor={_c['primary_doctor_status']}",
+            flush=True,
+        )
+    print(
+        f"[coe] aggregate | coes={[_c['coe'] for _c in coe_evaluations]} "
+        f"contexts={len(coe_evaluations)} overall={overall_coe_status} "
+        f"violation={result['is_violation']}",
         flush=True,
     )
     return {
