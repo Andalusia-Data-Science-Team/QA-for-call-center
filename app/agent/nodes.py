@@ -31,7 +31,7 @@ import unicodedata
 import urllib.parse
 from datetime import date as DateType
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text as sa_text
@@ -87,7 +87,6 @@ from app.service_hub.coe_validation import (
     ground_llm_coe_value,
     is_plausible_coe_doctor_candidate,
     normalize_doctor_name_for_match,
-    resolve_campaign_coe,
     resolve_primary_complaint,
     resolve_primary_doctor_identity,
     resolve_recommended_coe,
@@ -2316,7 +2315,13 @@ def _doctor_offering_evidence(call: CallTranscript, initial_grounded: list[str])
     return None
 
 
-def _not_applicable_coe_result(reason: str) -> dict:
+def _not_applicable_coe_result(reason: str, campaign_info: dict[str, Any] | None = None) -> dict:
+    """*campaign_info* (see classify_campaign_relevance) is threaded
+    through even for a call whose COE validation was entirely SKIPPED —
+    a detected-but-diverted/pending/uncertain campaign is still useful QA
+    context, even though it never triggered validation or created a
+    context (see CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT)."""
+    campaign_info = campaign_info or {}
     return {
         "applicable": False,
         "triggered": False,
@@ -2331,6 +2336,11 @@ def _not_applicable_coe_result(reason: str) -> dict:
         "approved_primary_doctors": [],
         "matched_primary_doctors": [],
         "campaign_coe": None,
+        "campaign_detected": campaign_info.get("campaign_detected", False),
+        "campaign_candidate_coe": campaign_info.get("campaign_candidate_coe"),
+        "campaign_relevance": campaign_info.get("campaign_relevance"),
+        "active_campaign_coe": None,
+        "campaign_relevance_evidence": campaign_info.get("campaign_relevance_evidence"),
         "validation_coe": None,
         "primary_doctor_status": "not_applicable",
         "existing_patient_exception": False,
@@ -2351,6 +2361,24 @@ def _not_applicable_coe_result(reason: str) -> dict:
     }
 
 
+def _print_campaign_detection(campaign_info: dict[str, Any]) -> None:
+    """[coe] campaign | detected=... candidate=... relevance=... active=...
+    — logs ONLY the classification fields, NEVER the raw patient inquiry
+    text (see "avoid logging raw patient names/IDs/full complaints" — a
+    turn index or reason code belongs in the routing/skip lines instead,
+    never a verbatim excerpt here). No-op when no campaign was detected at
+    all, so an ordinary (non-campaign) call never prints a noise line."""
+    if not campaign_info.get("campaign_detected"):
+        return
+    print(
+        f"[coe] campaign | detected={campaign_info.get('campaign_detected')} "
+        f"candidate={campaign_info.get('campaign_candidate_coe')} "
+        f"relevance={campaign_info.get('campaign_relevance')} "
+        f"active={campaign_info.get('active_campaign_coe')}",
+        flush=True,
+    )
+
+
 def skip_coe_validation(state: AgentState) -> dict:
     """Graph-level skip path, taken by app.agent.graph's COE-intent router
     (_coe_intent_router) when classify_coe_trigger found no COE/specialized-
@@ -2362,18 +2390,20 @@ def skip_coe_validation(state: AgentState) -> dict:
     """
     call = state["call"]
     trigger_ctx = classify_coe_trigger(call)
-    logger.info("coe validation skipped | call_id=%s reason=%s", call.call_id, trigger_ctx["trigger_reason"])
+    campaign_info = trigger_ctx.get("campaign_info") or {}
     reason_code = (
         "completed_diagnostic_results_inquiry"
         if trigger_ctx["trigger_reason"].startswith("completed_diagnostic_results_inquiry")
         else trigger_ctx["trigger_reason"]
     )
+    logger.info("coe validation skipped | call_id=%s reason=%s", call.call_id, reason_code)
+    _print_campaign_detection(campaign_info)
     print(
         f"[coe] routing | triggered=False reason={reason_code} eligible_specialties=[] coes=[]",
         flush=True,
     )
-    print(f"[coe] skipped | call_id={call.call_id} reason={trigger_ctx['trigger_reason']}", flush=True)
-    return {"coe_validation": _not_applicable_coe_result(trigger_ctx["trigger_reason"])}
+    print(f"[coe] validation skipped | reason={reason_code}", flush=True)
+    return {"coe_validation": _not_applicable_coe_result(trigger_ctx["trigger_reason"], campaign_info)}
 
 
 async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict:
@@ -2389,19 +2419,22 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         # (it routes to skip_coe_validation instead, before any CRM/LLM
         # call); this branch exists for direct/test invocation of this
         # node. Logs the same routing/skip lines skip_coe_validation
-        # prints, so a completed-results-inquiry call reads identically
-        # regardless of which path reached this conclusion.
+        # prints, so a completed-results-inquiry or diverted-campaign call
+        # reads identically regardless of which path reached this
+        # conclusion.
+        campaign_info = trigger_ctx.get("campaign_info") or {}
         reason_code = (
             "completed_diagnostic_results_inquiry"
             if trigger_ctx["trigger_reason"].startswith("completed_diagnostic_results_inquiry")
             else trigger_ctx["trigger_reason"]
         )
+        _print_campaign_detection(campaign_info)
         print(
             f"[coe] routing | triggered=False reason={reason_code} eligible_specialties=[] coes=[]",
             flush=True,
         )
-        print(f"[coe] skipped | call_id={call.call_id} reason={trigger_ctx['trigger_reason']}", flush=True)
-        result = _not_applicable_coe_result(trigger_ctx["trigger_reason"])
+        print(f"[coe] validation skipped | reason={reason_code}", flush=True)
+        result = _not_applicable_coe_result(trigger_ctx["trigger_reason"], campaign_info)
         return {"coe_validation": result, "node_trace": _trace(state, "infer_coe_validation")}
 
     # ── Deterministic extraction (never depends on the LLM) ────────────────
@@ -2421,11 +2454,23 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     agent_doctors = [d for d in agent_doctors if is_plausible_coe_doctor_candidate(d)]
     booking_discussed = bool(agent_doctors)
     existing_evidence_det = existing_patient_exception_evidence(call)
-    # campaign_coe is the AUTHORITATIVE COE established by a campaign/post
-    # message's own text (e.g. "مركز تميز الصداع" -> Headache) — never
-    # something an LLM is trusted to override (see resolve_campaign_coe).
-    # None for every non-campaign_origin trigger path.
-    campaign_coe = resolve_campaign_coe(call)
+    # A structured campaign identifier proves only WHERE the conversation
+    # originated — never that the patient's substantive inquiry is
+    # actually about that campaign's COE (see CAMPAIGN DETECTION IS NOT
+    # CAMPAIGN ENGAGEMENT). campaign_coe (the legacy scalar AND the
+    # authoritative value primary-doctor eligibility is checked against
+    # below) is therefore the ENGAGED campaign only — active_campaign_coe
+    # — never the bare candidate a diverted/pending/uncertain campaign
+    # still names (that candidate remains separately available as
+    # campaign_candidate_coe, metadata only, never an evaluation context
+    # or a recommendation requirement).
+    # Reuses trigger_ctx's OWN campaign_info (computed once, inside
+    # classify_coe_trigger) — never a second, independently-computed
+    # classify_campaign_relevance call, so the two can never diverge (see
+    # classify_coe_routing's docstring).
+    campaign_info = trigger_ctx.get("campaign_info") or {}
+    campaign_coe = campaign_info.get("active_campaign_coe")
+    _print_campaign_detection(campaign_info)
 
     # ── COE reference (CRM, non-fatal on failure) ───────────────────────────
     try:
@@ -2436,6 +2481,10 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         coe_rows = []
     reference = build_coe_reference(coe_rows)
     scripts = scripts_from_reference(reference)
+    # resolve_recommended_coe never trusts ungated fuzzy script similarity
+    # (see SCRIPT SIMILARITY GATING) — a generic agent wrap-up built
+    # entirely from shared script boilerplate can no longer be reported as
+    # an explicit recommendation for any COE.
     det_recommended = resolve_recommended_coe(call, scripts)
 
     # ── Multi-context evaluation (deterministic, additive) ──────────────────
@@ -2446,7 +2495,15 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     # single-scalar computation below, which stays byte-for-byte the same
     # for a genuinely single-COE call (see the backward-compatibility note
     # further down where the two are reconciled).
-    coe_evaluations = build_coe_evaluations(call, scripts)
+    coe_evaluations, _coe_rejected = build_coe_evaluations(call, scripts, return_rejected=True)
+    for _rejected_rec in _coe_rejected["recommendations"]:
+        print(
+            f"[coe] recommendation rejected | candidate={_rejected_rec['candidate']} "
+            f"method={_rejected_rec['method']} reason={_rejected_rec['reason']}",
+            flush=True,
+        )
+    for _rejected_ctx in _coe_rejected["contexts"]:
+        print(f"[coe] context rejected | coe={_rejected_ctx['coe']} reason={_rejected_ctx['reason']}", flush=True)
     unassociated_doctors = unassociated_initial_doctors(call)
 
     # ── Semantic extraction (LLM) — only for what regex genuinely can't do
@@ -2520,7 +2577,28 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     else:
         validation_coe = expected_coe
 
-    if expected_coe is None:
+    if not coe_evaluations:
+        # No independently-grounded, active COE context exists for this
+        # call at all (see LEGACY SCALAR FIELDS) — a detected campaign
+        # candidate or an ungrounded/rejected agent recommendation must
+        # never be compared against each other or reported as a mismatch
+        # (see the reported false Headache/IBD regression, where a
+        # diverted campaign candidate and a since-rejected fuzzy
+        # "recommendation" produced a false coe_match=fail). Campaign
+        # metadata (campaign_candidate_coe/campaign_relevance) remains
+        # separately available on the result even when every legacy
+        # scalar below goes None.
+        expected_coe = None
+        campaign_coe = None
+        recommended_coe = None
+        validation_coe = None
+        coe_match_status = "not_applicable"
+        coe_reason = (
+            "No independently-grounded, active COE context exists for this call — a detected "
+            "campaign or mention did not develop into a genuine active patient need or a "
+            "grounded agent recommendation."
+        )
+    elif expected_coe is None:
         coe_match_status = "uncertain"
         coe_reason = (
             "No primary complaint mapping to a supported COE (IBD/Headache/Asthma/Diabetes) "
@@ -2740,22 +2818,28 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     # (a passed service/doctor check never hides this).
     missed_recommendation_coes = [c["coe"] for c in coe_evaluations if c["missed_recommendation"]]
 
-    # "Multi-context" here means more than one context the AGENT actually
-    # engaged with (agent_recommendation/agent_specialty evidence) — two
-    # separately-serviced journeys, each closed out on its own. A context
-    # built from patient_complaint alone, with NO agent follow-through at
-    # all, is not a second independent journey; it is the patient's own
-    # (possibly sole) stated need going unaddressed while the agent
-    # recommended something else entirely, which the classic expected-vs-
-    # recommended comparison below must still be free to flag as a real
-    # mismatch (e.g. a patient's only complaint is Diabetes but the agent
-    # proactively recommends Headache instead — see
-    # test_diabetes_complaint_but_agent_recommends_headache_coe_fails).
-    _agent_engaged_contexts = [
+    # MULTI-CONTEXT ADMISSION — depends on the number of INDEPENDENT ACTIVE
+    # PATIENT CONTEXTS, never on how many campaign labels, agent-
+    # recommendation labels, fuzzy script matches, supporting specialties,
+    # or bare COE-name mentions happen to appear anywhere in the
+    # transcript. An "active" context is one with its OWN patient-side
+    # basis (patient_eligible — an approved complaint/diagnosis, or an
+    # ENGAGED campaign for that exact COE) OR a genuinely retained
+    # explicit agent recommendation (build_coe_evaluations has already
+    # dropped any agent recommendation that was merely an unsupported
+    # substitution conflicting with another eligible need — see AGENT
+    # RECOMMENDATION IS NOT AUTOMATICALLY A PATIENT CONTEXT — so a
+    # surviving explicit_agent_recommended context here is either a
+    # genuinely proactive, non-conflicting recommendation or one already
+    # justified by its own patient-side need). A campaign candidate the
+    # patient never engaged with, or an agent-only recommendation that WAS
+    # dropped as unsupported, never reaches coe_evaluations at all, so it
+    # can never inflate this count.
+    _active_patient_contexts = [
         c for c in coe_evaluations
-        if any(s in c["context_sources"] for s in ("agent_recommendation", "agent_specialty"))
+        if c.get("patient_eligible") or c["explicit_agent_recommended"]
     ]
-    is_multi_context = len(_agent_engaged_contexts) > 1
+    is_multi_context = len(_active_patient_contexts) > 1
     if is_multi_context:
         expected_coe = None
         campaign_coe = None
@@ -2804,6 +2888,16 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         "primary_complaint": primary_complaint,
         "expected_coe": expected_coe,
         "campaign_coe": campaign_coe,
+        # CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT — see
+        # classify_campaign_relevance. campaign_coe above is already the
+        # ENGAGED value (== active_campaign_coe); these separately expose
+        # the raw candidate/relevance verdict even when diverted/pending/
+        # uncertain, so a diverted campaign is never silently invisible.
+        "campaign_detected": campaign_info["campaign_detected"],
+        "campaign_candidate_coe": campaign_info["campaign_candidate_coe"],
+        "campaign_relevance": campaign_info["campaign_relevance"],
+        "active_campaign_coe": campaign_info["active_campaign_coe"],
+        "campaign_relevance_evidence": campaign_info["campaign_relevance_evidence"],
         "recommended_coe": recommended_coe,
         "validation_coe": validation_coe,
         "coe_match_status": coe_match_status,

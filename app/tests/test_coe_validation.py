@@ -42,6 +42,7 @@ from app.service_hub.coe_validation import (
     build_coe_evaluations,
     build_coe_reference,
     campaign_origin_evidence,
+    classify_campaign_relevance,
     classify_coe_trigger,
     clean_extracted_doctor_name,
     coe_validation_needed,
@@ -60,6 +61,7 @@ from app.service_hub.coe_validation import (
     resolve_primary_doctor_identity,
     resolve_recommended_coe,
     resolve_specialty_coes,
+    script_similarity,
     specialty_evidence_is_grounded,
     unassociated_initial_doctors,
 )
@@ -2586,19 +2588,27 @@ def test_diabetes_need_plus_ordinary_appointment_is_diabetes_missed():
 
 
 def test_campaign_text_alone_does_not_satisfy_human_agent_requirement():
-    """Required test 8 — campaign COE text alone does not satisfy the
-    human-agent recommendation requirement, even though it establishes
-    the patient's COE context."""
+    """SUPERSEDED (campaign-relevance work) — a bare campaign click with no
+    substantive patient inquiry at all afterward (only an ordinary agent
+    routing response, no patient turn) is a "pending" campaign (see
+    classify_campaign_relevance): campaign_relevance="pending" never
+    creates patient eligibility or a recommendation requirement — this
+    supersedes the earlier rule that a mere campaign click, on its own,
+    already obligated the agent to have recommended the COE."""
     transcript = (
         "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
         "Agent: تمام، هحولك لعيادة المخ والاعصاب"
     )
-    evaluations = build_coe_evaluations(call(transcript))
+    c = call(transcript)
+    campaign_info = classify_campaign_relevance(c)
+    assert campaign_info["campaign_relevance"] == "pending"
+    assert campaign_info["active_campaign_coe"] is None
+    evaluations = build_coe_evaluations(c)
     by_coe = {e["coe"]: e for e in evaluations}
-    assert by_coe["Headache"]["campaign_coe"] is True
-    assert by_coe["Headache"]["human_agent_recommended_coe"] is False
-    assert by_coe["Headache"]["recommendation_status"] == "missed"
-    assert by_coe["Headache"]["is_violation"] is True
+    if "Headache" in by_coe:
+        assert by_coe["Headache"]["human_agent_recommended_coe"] is False
+        assert by_coe["Headache"]["recommendation_status"] != "missed"
+        assert by_coe["Headache"]["is_violation"] is False
 
 
 def test_bot_coe_text_does_not_satisfy_human_agent_requirement():
@@ -3876,3 +3886,399 @@ def test_no_rejected_context_generates_a_missed_recommendation_note():
     for e in evaluations:
         if e["recommendation_status"] not in ("missed", "wrong_coe"):
             assert e["note"] is None
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 19 — campaign relevance (detection is not engagement), script-
+# similarity gating (fuzzy similarity must never invent a category from
+# shared boilerplate alone), and multi-context admission based on
+# independent active patient needs rather than campaign/recommendation/
+# specialty label counts. See classify_campaign_relevance,
+# _agent_turn_grounded_coe_recommendations, and build_coe_evaluations'
+# context-admission filter.
+# ═════════════════════════════════════════════════════════════════════════
+
+_HEADACHE_CAMPAIGN_CLICK = "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+
+# The exact reported false-positive Agent turn — built ENTIRELY from
+# shared script boilerplate, no category-specific wording of its own.
+_GENERIC_BOILERPLATE_AGENT_TURN = (
+    "تمام هنحجزلك موعد لضمان تحقيق اقصى استفادة مع افضل الاستشاريين والاخصائيين في هذا المجال"
+)
+
+
+def test_campaign_followed_by_unrelated_dental_request_is_diverted():
+    """Required test 1 — Headache campaign followed by an unrelated Dental
+    request: campaign relevance is diverted, no Headache context, no
+    missed Headache recommendation."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: أريد حجز أسنان\nAgent: تمام هحجزلك\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_relevance"] == "diverted"
+    assert info["active_campaign_coe"] is None
+    evaluations = build_coe_evaluations(c)
+    by_coe = {e["coe"]: e for e in evaluations}
+    if "Headache" in by_coe:
+        assert by_coe["Headache"]["recommendation_status"] != "missed"
+        assert by_coe["Headache"]["is_violation"] is False
+    result, stub = run_coe_node(transcript)
+    assert "Headache" not in result["missed_recommendation_coes"]
+
+
+def test_campaign_followed_by_unrelated_administrative_request_no_active_context():
+    """Required test 2 — Headache campaign followed by an unrelated
+    administrative request (branch hours / pricing): no active Headache
+    context."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: الفرع بيفتح الساعة كام؟\nAgent: من 9 الصبح لحد 9 بالليل\n"
+    c = call(transcript)
+    result, stub = run_coe_node(transcript)
+    assert result["active_campaign_coe"] is None
+    assert not any(e["coe"] == "Headache" and e["patient_eligible"] for e in result["coe_evaluations"])
+
+
+def test_campaign_followed_by_completed_results_inquiry_no_active_context():
+    """Required test 3 — Headache campaign followed by a completed lab/
+    radiology-result inquiry: no active Headache context."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: أريد نتيجة تحليل سابق\nAgent: تقدر تشوفها من التطبيق\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_relevance"] == "diverted"
+    assert info["active_campaign_coe"] is None
+    result, stub = run_coe_node(transcript)
+    assert not any(e["coe"] == "Headache" and e["patient_eligible"] for e in result["coe_evaluations"])
+
+
+def test_campaign_followed_by_approved_diabetes_complaint_only_diabetes_context():
+    """Required test 4 — Headache campaign followed by an approved
+    Diabetes complaint: only the Diabetes context exists, and the
+    Headache campaign remains metadata only."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: عندي مرض السكري وعايز اتابع حالتي\nAgent: تمام هحجزلك\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_candidate_coe"] == "Headache"
+    assert info["campaign_relevance"] == "diverted"
+    assert info["active_campaign_coe"] is None
+    evaluations = build_coe_evaluations(c)
+    assert {e["coe"] for e in evaluations if e["patient_eligible"]} == {"Diabetes"}
+    result, stub = run_coe_node(transcript)
+    assert result["campaign_candidate_coe"] == "Headache"
+    assert result["active_campaign_coe"] is None
+    assert result["campaign_coe"] is None
+
+
+def test_campaign_followed_by_chronic_headache_is_engaged():
+    """Required test 5 — Headache campaign followed by a chronic-headache
+    complaint: the campaign is engaged, and a Headache context exists."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: عندي صداع مزمن\nAgent: تمام هحجزلك\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_relevance"] == "engaged"
+    assert info["active_campaign_coe"] == "Headache"
+    evaluations = build_coe_evaluations(c)
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert "Headache" in by_coe
+    assert by_coe["Headache"]["patient_eligible"] is True
+
+
+def test_campaign_followed_by_explicit_package_request_is_engaged():
+    """Required test 6 — Headache campaign followed by an explicit request
+    for the Headache package: the campaign is engaged."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: ابغى تفاصيل باقة الصداع\nAgent: تمام هحجزلك\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_relevance"] == "engaged"
+    assert info["active_campaign_coe"] == "Headache"
+
+
+def test_campaign_click_with_no_substantive_inquiry_is_pending_and_non_punitive():
+    """Required test 7 — a campaign click with no substantive patient
+    inquiry at all is pending, never punitive, and never produces a
+    missed recommendation."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Agent: أهلاً بيك\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_relevance"] == "pending"
+    assert info["active_campaign_coe"] is None
+    result, stub = run_coe_node(transcript)
+    assert result["missed_recommendation_coes"] == []
+    assert result["is_violation"] is False
+
+
+def test_generic_boilerplate_agent_wording_never_creates_ibd_context():
+    """Required test 8 — generic agent wording built entirely from shared
+    script boilerplate, even though IBD scores highest among the four
+    approved scripts, must never create an IBD context (the reported
+    false-positive regression)."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: أريد الاستفسار عن فرع آخر\n" + f"Agent: {_GENERIC_BOILERPLATE_AGENT_TURN}\n"
+    scores = {coe: script_similarity(_GENERIC_BOILERPLATE_AGENT_TURN, script) for coe, script in DEFAULT_SCRIPTS_AR.items()}
+    assert scores["IBD"] >= 65  # confirms the raw fuzzy match really is strong
+    evaluations = build_coe_evaluations(call(transcript))
+    assert "IBD" not in {e["coe"] for e in evaluations}
+
+
+def test_fuzzy_similarity_without_explicit_marker_is_rejected():
+    """Required test 9 — fuzzy similarity without an explicit COE/program
+    marker in the same turn is rejected, never grounds a recommendation."""
+    c = call(f"Patient: مرحبا\nAgent: {_GENERIC_BOILERPLATE_AGENT_TURN}")
+    evaluations, rejected = build_coe_evaluations(c, return_rejected=True)
+    assert evaluations == []
+    assert len(rejected["recommendations"]) == 1
+    assert rejected["recommendations"][0]["method"] == "fuzzy_similarity"
+    assert rejected["recommendations"][0]["reason"] == "no_explicit_coe_or_category_evidence"
+    assert resolve_recommended_coe(c) is None
+
+
+def test_explicit_ibd_recommendation_with_category_evidence_is_retained():
+    """Required test 10 — an explicit IBD COE recommendation with real
+    category-specific evidence in the same turn is retained (never
+    over-corrected into rejecting every script paraphrase)."""
+    transcript = (
+        "Patient: عندي مشاكل في الجهاز الهضمي\n"
+        "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في علاج أمراض الجهاز الهضمي مع دكتور داليندا عرفاوي\n"
+    )
+    c = call(transcript)
+    evaluations = build_coe_evaluations(c)
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["explicit_agent_recommended"] is True
+    assert by_coe["IBD"]["recommendation_status"] == "pass"
+    grounding = by_coe["IBD"]["explicit_recommendation_grounding"]
+    assert grounding is not None
+    assert grounding["coe"] == "IBD"
+    assert grounding["grounding_method"] in ("explicit_name", "explicit_coe_gated_script_paraphrase")
+    assert resolve_recommended_coe(c) == "IBD"
+
+
+def test_agent_only_wrong_coe_recommendation_recorded_not_a_second_context():
+    """Required test 11 — an agent-only wrong-COE recommendation (no
+    patient-side basis, and the patient's own need received NO agent
+    engagement at all) is recorded as an agent action and used to justify
+    the active context's wrong_coe verdict, but never created as a second,
+    falsely-passing patient context."""
+    transcript = (
+        "Patient: عندي مرض السكر وعايز اتابع حالتي\n"
+        "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع"
+    )
+    c = call(transcript)
+    evaluations, rejected = build_coe_evaluations(c, return_rejected=True)
+    coes = {e["coe"] for e in evaluations}
+    assert coes == {"Diabetes"}
+    assert "Headache" not in coes
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Diabetes"]["recommendation_status"] == "wrong_coe"
+    assert any(r["coe"] == "Headache" and r["reason"] == "ungrounded_agent_recommendation" for r in rejected["contexts"])
+
+
+def test_multi_context_requires_two_independent_active_patient_needs():
+    """Required test 12 — multi-context validation requires two
+    independent active patient needs, both surviving into coe_evaluations
+    with their own patient-side basis."""
+    transcript = (
+        "Patient: عندي صداع مزمن\n"
+        "Agent: هيبدأ الحجز بعيادة المخ والاعصاب مع دكتور اسامة عبدالسلام\n"
+        "Patient: وبعده عندي مشاكل الجهاز الهضمي\n"
+        "Agent: تمام هوصلك لدكتور جهاز هضمي\n"
+    )
+    result, stub = run_coe_node(transcript)
+    active = [e for e in result["coe_evaluations"] if e["patient_eligible"] or e["explicit_agent_recommended"]]
+    assert {e["coe"] for e in active} == {"Headache", "IBD"}
+    assert len(active) == 2
+
+
+def test_campaign_candidate_alone_does_not_count_toward_multi_context():
+    """Required test 13 — a campaign candidate the patient never engaged
+    with does not count toward the multi-context total, even when the
+    patient separately raises one genuinely eligible need elsewhere."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: عندي مرض السكري وعايز اتابع حالتي\nAgent: تمام هحجزلك\n"
+    result, stub = run_coe_node(transcript)
+    active = [e for e in result["coe_evaluations"] if e["patient_eligible"] or e["explicit_agent_recommended"]]
+    assert {e["coe"] for e in active} == {"Diabetes"}
+    assert len(active) == 1
+
+
+def test_legacy_scalars_never_compare_diverted_campaign_against_ungrounded_recommendation():
+    """Required test 14 — SUPERSEDED (campaign-diversion routing): legacy
+    scalar fields never compare a diverted campaign's candidate against an
+    ungrounded/rejected recommendation. Previously this call still entered
+    infer_coe_validation (an empty-but-triggered result); now the diverted
+    campaign with no other eligible COE need is rejected at the ROUTING
+    level itself — the call is never triggered at all, so every legacy
+    scalar goes None and coe_match_status is not_applicable via the
+    ordinary not-applicable/skip result, never a false "fail"."""
+    transcript = (
+        _HEADACHE_CAMPAIGN_CLICK
+        + "Patient: أريد الاستفسار عن فرع آخر\n"
+        + f"Agent: {_GENERIC_BOILERPLATE_AGENT_TURN}\n"
+    )
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is False
+    assert stub.called is False
+    assert result["expected_coe"] is None
+    assert result["campaign_coe"] is None
+    assert result["recommended_coe"] is None
+    assert result["validation_coe"] is None
+    assert result["coe_match_status"] == "not_applicable"
+    assert result["campaign_candidate_coe"] == "Headache"
+    assert result["campaign_relevance"] == "diverted"
+
+
+def test_reported_regression_call_produces_no_false_headache_ibd_aggregate():
+    """Required test 15 — SUPERSEDED (campaign-diversion routing): the
+    exact reported regression conversation now correctly never triggers
+    COE validation at all (routing rejects the diverted campaign and finds
+    no other eligible COE need) — zero contexts, overall not_applicable,
+    no violation, and no LLM call."""
+    transcript = (
+        _HEADACHE_CAMPAIGN_CLICK
+        + "Patient: أريد الاستفسار عن فرع آخر\n"
+        + f"Agent: {_GENERIC_BOILERPLATE_AGENT_TURN}\n"
+    )
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is False
+    assert stub.called is False
+    assert result["coe_evaluations"] == []
+    assert result["validated_coes"] == []
+    assert result["overall_coe_status"] == "not_applicable"
+    assert result["is_violation"] is False
+    assert result["campaign_detected"] is True
+    assert result["campaign_candidate_coe"] == "Headache"
+    assert result["campaign_relevance"] == "diverted"
+    assert result["active_campaign_coe"] is None
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 20 — a COE campaign marker creates only a candidate; it must not
+# trigger COE validation (and therefore must not fetch CRM data or call
+# the COE LLM) unless campaign relevance is genuinely "engaged". See
+# classify_coe_trigger's campaign-relevance gate and classify_coe_routing.
+# ═════════════════════════════════════════════════════════════════════════
+
+def _assert_crm_not_called(monkeypatch):
+    """Patches crm_coe.fetch_coe_reference to fail the test if it is ever
+    invoked — used to prove a diverted/pending/uncertain campaign with no
+    other eligible COE need never enters infer_coe_validation at all."""
+    import app.service_hub.crm_coe as crm_coe
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("fetch_coe_reference must not be called for this call")
+
+    monkeypatch.setattr(crm_coe, "fetch_coe_reference", _must_not_be_called)
+
+
+def test_headache_campaign_then_urology_prostate_inquiry_skips_validation(monkeypatch):
+    """Regression test 1 (the reported conversation) — a Headache campaign
+    followed by an unrelated urology/prostate/erectile-dysfunction inquiry
+    skips COE validation entirely: not triggered, CRM never fetched, and
+    the COE LLM mock is never called."""
+    _assert_crm_not_called(monkeypatch)
+    transcript = (
+        _HEADACHE_CAMPAIGN_CLICK
+        + "Patient: عندي مشكلة في البروستاتا وضعف انتصاب وحابب استفسر عن دكتور مسالك بولية\n"
+        + "Agent: تمام هحولك للقسم المختص\n"
+    )
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_candidate_coe"] == "Headache"
+    assert info["campaign_relevance"] == "diverted"
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is False
+    assert ctx["trigger_path"] is None
+    assert ctx["trigger_reason"] == "campaign_diverted_no_eligible_coe_need"
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is False
+    assert result["applicable"] is False
+    assert stub.called is False
+    assert result["coe_evaluations"] == []
+    assert result["missed_recommendation_coes"] == []
+    assert result["is_violation"] is False
+
+
+def test_headache_campaign_then_explicit_package_inquiry_validates_headache(monkeypatch):
+    """Regression test 2 — a Headache campaign followed by an explicit
+    headache/package inquiry validates Headache (CRM/LLM DO run here,
+    since the campaign is genuinely engaged)."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: ابغى تفاصيل باقة الصداع\nAgent: تمام هحجزلك\n"
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is True
+    assert result["trigger_path"] == "campaign_origin"
+    assert result["active_campaign_coe"] == "Headache"
+    assert {e["coe"] for e in result["coe_evaluations"]} == {"Headache"}
+
+
+def test_diverted_headache_campaign_then_qualifying_ibd_complaint_validates_only_ibd():
+    """Regression test 3 — a diverted Headache campaign followed by a
+    qualifying IBD complaint validates ONLY IBD; Headache never appears in
+    coe_evaluations and never generates a missed-recommendation note."""
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Patient: عندي مشاكل الجهاز الهضمي وبدي احجز\nAgent: تمام هحجزلك\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_relevance"] == "diverted"
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True
+    assert ctx["trigger_path"] == "patient_approved_complaint"
+    result, stub = run_coe_node(transcript)
+    assert {e["coe"] for e in result["coe_evaluations"]} == {"IBD"}
+    assert "Headache" not in result["missed_recommendation_coes"]
+    assert result["active_campaign_coe"] is None
+
+
+def test_campaign_with_no_meaningful_followup_no_violation_no_crm_or_llm(monkeypatch):
+    """Regression test 4 — a campaign click with no meaningful patient
+    follow-up (pending) produces no violation and never fetches CRM or
+    calls the COE LLM."""
+    _assert_crm_not_called(monkeypatch)
+    transcript = _HEADACHE_CAMPAIGN_CLICK + "Agent: أهلاً بيك، في اي حاجة تانية؟\n"
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is False
+    assert stub.called is False
+    assert result["is_violation"] is False
+    assert result["missed_recommendation_coes"] == []
+
+
+def test_ambiguous_campaign_relevance_is_non_punitive_and_creates_no_context(monkeypatch):
+    """Regression test 5 — an ambiguous campaign (its own text names no
+    single unambiguous COE) is non-punitive: no violation, no
+    campaign-created context, and no CRM/LLM call."""
+    _assert_crm_not_called(monkeypatch)
+    transcript = "Patient: BU-Clinics-COE-برجاء الضغط على ارسال للتواصل معنا\nAgent: تمام\n"
+    c = call(transcript)
+    info = classify_campaign_relevance(c)
+    assert info["campaign_relevance"] == "uncertain"
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is False
+    assert stub.called is False
+    assert result["is_violation"] is False
+    assert result["coe_evaluations"] == []
+
+
+def test_fuzzy_agent_message_still_cannot_create_ibd_context_after_routing_fix():
+    """Regression test 6 — a fuzzy agent-message match (generic script
+    boilerplate) still cannot create an IBD context, now that the diverted
+    campaign is rejected at the routing level rather than merely at the
+    evaluation level."""
+    transcript = (
+        _HEADACHE_CAMPAIGN_CLICK
+        + "Patient: أريد الاستفسار عن فرع آخر\n"
+        + f"Agent: {_GENERIC_BOILERPLATE_AGENT_TURN}\n"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    assert "IBD" not in {e["coe"] for e in evaluations}
+    result, stub = run_coe_node(transcript)
+    assert "IBD" not in result["validated_coes"]
+
+
+def test_routing_logs_never_contain_the_raw_sensitive_patient_complaint(monkeypatch, capsys):
+    """Regression test 7 — routing/campaign/skip logs never contain the
+    raw, sensitive patient complaint text (e.g. urology/prostate detail) —
+    only classification fields, turn indices, or reason codes."""
+    _assert_crm_not_called(monkeypatch)
+    sensitive_phrase = "ضعف انتصاب"
+    transcript = (
+        _HEADACHE_CAMPAIGN_CLICK
+        + f"Patient: عندي مشكلة في البروستاتا و{sensitive_phrase}\n"
+        + "Agent: تمام هحولك للقسم المختص\n"
+    )
+    result, stub = run_coe_node(transcript)
+    assert result["triggered"] is False
+    captured = capsys.readouterr()
+    assert sensitive_phrase not in captured.out
+    assert sensitive_phrase not in captured.err

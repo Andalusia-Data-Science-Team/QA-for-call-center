@@ -875,6 +875,32 @@ def _contains_phrase_arabic_prefix_tolerant(haystack_tokens: list[str], needle: 
     return any(_ARABIC_PREFIX_STRIP_RE.sub("", t, count=1) == needle_token for t in haystack_tokens)
 
 
+def _contains_multiword_phrase_prefix_tolerant(haystack_tokens: list[str], needle: str) -> bool:
+    """Like _contains_phrase_arabic_prefix_tolerant, but ALSO tolerant for
+    a MULTI-token *needle* whose FIRST word carries an attached Arabic
+    preposition/article prefix in the haystack — e.g. needle "مركز
+    التميز" matches the haystack token sequence ["بمركز", "التميز"] once
+    the leading "ب" is stripped from "بمركز" ("بمركز التميز" — "by/in the
+    center of excellence" — is exactly how this phrase is normally
+    attached in a sentence, e.g. "سيتم حجز موعد لحضرتك بمركز التميز..."). Only
+    the phrase's OWN first token is ever prefix-stripped, and the
+    remaining tokens must still match EXACTLY — never a substring/naive
+    match (see _contains_phrase_arabic_prefix_tolerant's docstring for the
+    same "قلب" vs "انقلاب" safety rationale)."""
+    if _contains_phrase(haystack_tokens, needle):
+        return True
+    needle_tokens = _tokens(needle)
+    if not needle_tokens:
+        return False
+    n = len(needle_tokens)
+    for i in range(len(haystack_tokens) - n + 1):
+        window = haystack_tokens[i:i + n]
+        stripped_first = _ARABIC_PREFIX_STRIP_RE.sub("", window[0], count=1)
+        if [stripped_first, *window[1:]] == needle_tokens:
+            return True
+    return False
+
+
 def resolve_canonical_specialty(text: str) -> str | None:
     """Deterministic, phrase-aware, longest-alias-wins resolution of the
     canonical specialty named in *text* (e.g. "المخ والاعصاب" -> "Neurology",
@@ -1187,6 +1213,173 @@ def resolve_campaign_coe(call: CallTranscript) -> str | None:
     return None
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT — a structured campaign
+# identifier (see campaign_origin_evidence) proves only WHERE the
+# conversation originated; it never proves that the patient's substantive
+# inquiry is actually about that campaign's COE. classify_campaign_relevance
+# separates the two: campaign_detected/campaign_candidate_coe describe the
+# campaign message itself, while campaign_relevance/active_campaign_coe
+# describe whether the REST of the call actually continues that topic.
+# Only an "engaged" campaign may ever create patient eligibility or a
+# campaign COE evaluation context (see build_coe_evaluations' patient_
+# eligible computation and build_coe_contexts' context-admission filter).
+# ═════════════════════════════════════════════════════════════════════════
+
+# Greetings, acknowledgements, and other non-substantive turns — never
+# counted as the patient's substantive inquiry when determining campaign
+# engagement (see "DETERMINE THE SUBSTANTIVE PATIENT INTENT": ignore bot
+# language selection, menus, handoff messages, greetings, names,
+# insurance, IDs, and other administrative turns).
+_ADMINISTRATIVE_TURN_MARKERS: set[str] = {
+    "السلام عليكم", "وعليكم السلام", "مرحبا", "اهلا", "أهلا", "هاي", "شكرا", "شكراً",
+    "تمام", "طيب", "اوك", "ok", "okay", "نعم", "ايوه", "أيوه", "لا", "yes", "no",
+    "hello", "hi", "thanks", "thank you",
+}
+
+
+def _turn_is_administrative(text: str) -> bool:
+    """True for a greeting, plain acknowledgement, bot menu selection, or
+    other non-substantive turn with no clinical/booking content of its
+    own — never treated as the patient's substantive inquiry for campaign-
+    relevance purposes. A short reply (<=2 tokens) is administrative
+    unless it independently carries booking-intent, approved-complaint, or
+    specialty content (e.g. "ابغى دكتور" is short but substantive)."""
+    tokens = _tokens(text)
+    if not tokens:
+        return True
+    if _norm(text) in {_norm(m) for m in _ADMINISTRATIVE_TURN_MARKERS}:
+        return True
+    if len(tokens) <= 2 and not (
+        _patient_turn_has_booking_intent(text)
+        or detect_approved_complaints(text)
+        or detect_specialty_mentions(text)
+    ):
+        return True
+    return False
+
+
+def _turn_shows_campaign_engagement(text: str, candidate_coe: str) -> bool:
+    """True when *text* (a Patient or Agent turn found AFTER the campaign
+    click) shows the campaign's candidate COE remains the ACTIVE topic —
+    an approved complaint category mapped to it (see COE_RECOMMENDATION_
+    TRIGGERS), or explicit COE-name/package language naming it (see
+    COE_NAME_MARKERS, which already covers phrasing like "باقة الصداع"/
+    "تفاصيل باقة الصداع" via its bare category-word markers). Deliberately
+    narrower than a bare mapped-specialty mention (e.g. Dental under
+    Headache) — per the confirmed business rule, a shared/supporting
+    specialty alone is never evidence that the campaign's OWN topic is
+    still active (see COE_RECOMMENDATION_TRIGGERS' docstring)."""
+    for coe, _category, _alias in detect_approved_complaints(text):
+        if coe == candidate_coe:
+            return True
+    tokens = _tokens(text)
+    return any(
+        _contains_phrase_arabic_prefix_tolerant(tokens, m)
+        for m in COE_NAME_MARKERS.get(candidate_coe, ())
+    )
+
+
+def classify_campaign_relevance(call: CallTranscript) -> dict[str, Any]:
+    """Determine whether a detected COE marketing campaign is actually the
+    ACTIVE topic of this call, never merely assumed from its presence.
+
+    Returns a dict with:
+      - campaign_detected: whether a structured campaign identifier (see
+        campaign_origin_evidence) was found at all.
+      - campaign_candidate_coe: the COE that campaign message's OWN text
+        identifies (see resolve_campaign_coe) — set even when the
+        campaign turns out to be diverted; None when the campaign text
+        itself names no single unambiguous COE.
+      - campaign_relevance: one of "engaged" (the later conversation
+        substantively continues the campaign's COE topic — see
+        _turn_shows_campaign_engagement), "diverted" (the patient makes a
+        clear, unrelated substantive request and never returns to the
+        campaign topic), "pending" (only the campaign click and/or
+        administrative turns exist — no substantive patient inquiry at
+        all), or "uncertain" (the campaign text itself names no single
+        COE, so relevance cannot be safely classified); None when no
+        campaign was detected at all.
+      - active_campaign_coe: campaign_candidate_coe when campaign_relevance
+        is "engaged", else None — this is the ONLY campaign value ever
+        allowed to create patient eligibility or an evaluation context.
+      - campaign_relevance_evidence: the verbatim turn excerpt that
+        justifies the relevance verdict (the engaging turn, or the first
+        diverting turn) — None for "pending" (nothing substantive exists)
+        and "uncertain".
+
+    A later return to the campaign topic (after an earlier diverting turn)
+    still activates it — every turn after the campaign click is scanned in
+    order, and engagement evidence found ANYWHERE wins over any earlier
+    diverting turns (see "If the patient later returns to the Headache
+    campaign topic, activate it from that later evidence").
+    """
+    turns = split_transcript_turns(call.transcript)
+    campaign_turn_idx: int | None = None
+    campaign_candidate_coe: str | None = None
+    campaign_evidence: str | None = None
+    for idx, (speaker, text) in enumerate(turns):
+        if speaker == "patient" and _CAMPAIGN_ORIGIN_RE.search(text):
+            campaign_turn_idx = idx
+            campaign_evidence = text.strip()[:300]
+            matches = _unambiguous_coe_matches(text)
+            campaign_candidate_coe = matches[0] if len(matches) == 1 else None
+            break
+
+    if campaign_turn_idx is None:
+        return {
+            "campaign_detected": False,
+            "campaign_candidate_coe": None,
+            "campaign_relevance": None,
+            "active_campaign_coe": None,
+            "campaign_relevance_evidence": None,
+        }
+
+    if campaign_candidate_coe is None:
+        # The campaign's OWN text names no single unambiguous COE (rare —
+        # e.g. an ambiguous/multi-COE campaign identifier) — evidence is
+        # insufficient to classify relevance safely either way.
+        return {
+            "campaign_detected": True,
+            "campaign_candidate_coe": None,
+            "campaign_relevance": "uncertain",
+            "active_campaign_coe": None,
+            "campaign_relevance_evidence": campaign_evidence,
+        }
+
+    substantive_found = False
+    diverted_evidence: str | None = None
+    engaged_evidence: str | None = None
+    for idx in range(campaign_turn_idx + 1, len(turns)):
+        speaker, text = turns[idx]
+        if _turn_is_administrative(text):
+            continue
+        if speaker == "patient" and _clause_is_third_party_or_negated(text):
+            continue
+        if _turn_shows_campaign_engagement(text, campaign_candidate_coe):
+            engaged_evidence = text.strip()[:300]
+            break
+        if speaker == "patient":
+            substantive_found = True
+            if diverted_evidence is None:
+                diverted_evidence = text.strip()[:300]
+
+    if engaged_evidence:
+        relevance = "engaged"
+    elif substantive_found:
+        relevance = "diverted"
+    else:
+        relevance = "pending"
+
+    return {
+        "campaign_detected": True,
+        "campaign_candidate_coe": campaign_candidate_coe,
+        "campaign_relevance": relevance,
+        "active_campaign_coe": campaign_candidate_coe if relevance == "engaged" else None,
+        "campaign_relevance_evidence": engaged_evidence if relevance == "engaged" else diverted_evidence,
+    }
+
+
 # ── Patient booking-intent detection ──────────────────────────────────────
 # Used by _turn_is_bare_continuation (to tell a genuinely new, actively-
 # stated need apart from a bare follow-up naming another completed-results
@@ -1263,6 +1456,37 @@ def _clause_is_bare_new_test_request(text: str) -> bool:
     return has_test_object and not has_clinic_or_doctor
 
 
+def _first_approved_complaint_match(
+    turns: list[tuple[str, str]], results_flags: list[bool],
+) -> tuple[str, str, str] | None:
+    """Path E's own scan, factored out so it can be reused both for an
+    ordinary (no-campaign) call and for a campaign call whose candidate
+    was rejected as diverted/pending/uncertain (see CAMPAIGN DETECTION IS
+    NOT CAMPAIGN ENGAGEMENT — "continue checking for another
+    independently eligible COE need using the strict complaint/diagnosis
+    rules"). Returns the first (coe, category, clause) match, or None —
+    never a broader inferred category (see resolve_approved_complaint)."""
+    for idx, (speaker, text) in enumerate(turns):
+        if speaker != "patient":
+            continue
+        if results_flags[idx]:
+            continue  # retrieving an already-completed lab/radiology result, not a complaint
+        for clause in (_split_clauses(text) or [text]):
+            if _clause_is_third_party_or_negated(clause):
+                continue
+            if detect_coe_mention(clause):
+                # An explicit "مركز تميز"/COE-name mention (e.g. reciting
+                # the official program description back), not ordinary
+                # clinical complaint language — governed by Paths A-C's
+                # own rules, never by Path E.
+                continue
+            match = resolve_approved_complaint(clause)
+            if match:
+                coe, category, _alias = match
+                return coe, category, clause
+    return None
+
+
 def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
     """Determine whether COE validation should run at all, and via which
     path — turn-order-aware and speaker-attributed, so a Patient statement
@@ -1273,13 +1497,22 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
 
       0. Campaign/post origin (Path C, "campaign_origin") — a STRUCTURED
          campaign identifier (see campaign_origin_evidence) found anywhere
-         in the Patient's own turns. TRIGGERED immediately, regardless of
-         whether the Agent ever mentions a COE at all — the campaign
-         message already establishes the COE context on its own (see
-         module docstring). Checked first because it does not depend on
-         turn order the way Paths A/B do.
+         in the Patient's own turns. This identifies only a CANDIDATE COE
+         (see classify_campaign_relevance) — it never, by itself,
+         establishes that this conversation IS a COE conversation. Path C
+         TRIGGERS only when campaign_relevance is "engaged" (the later
+         conversation actually continues the campaign's own topic). When
+         the campaign is "diverted", "pending", or "uncertain", the
+         candidate alone is REJECTED — this function then falls through to
+         Path E only (see below) to check for another, independently
+         eligible COE need using the strict complaint/diagnosis rules;
+         Path A/B's bare "مركز تميز" mention scan is skipped in this case,
+         since the campaign turn's own text would otherwise always satisfy
+         it regardless of relevance. Checked first because it does not
+         depend on turn order the way Paths A/B do.
 
-    Otherwise walks the transcript turn by turn (in original order) for an
+    Otherwise (no campaign detected at all) walks the transcript turn by
+    turn (in original order) for an
     ordinary "مركز تميز"/specialized-center mention:
 
       - The FIRST turn (Patient or Agent) that mentions a COE/specialized
@@ -1309,19 +1542,66 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
       business rule superseding the earlier, broader specialty-based
       trigger.
     """
-    campaign_evidence = campaign_origin_evidence(call)
-    if campaign_evidence:
+    # CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT — computed ONCE here,
+    # the single authoritative source every downstream caller (nodes.py's
+    # infer_coe_validation/skip_coe_validation, app.agent.graph's
+    # _coe_intent_router) reuses via this function's own "campaign_info"
+    # key, rather than each independently recomputing campaign relevance
+    # (which could otherwise drift out of sync — see classify_coe_routing).
+    campaign_info = classify_campaign_relevance(call)
+    if campaign_info["campaign_detected"]:
+        if campaign_info["campaign_relevance"] == "engaged":
+            _campaign_click_evidence = campaign_origin_evidence(call)
+            return {
+                "triggered": True,
+                "trigger_path": "campaign_origin",
+                "trigger_reason": (
+                    "The customer's message contains a COE marketing-campaign/post identifier, "
+                    "and the patient's later inquiry confirms the advertised Center of Excellence "
+                    "remains the active topic. This campaign message is marketing/system content, "
+                    "not something the human agent wrote — it is never treated as an agent "
+                    "recommendation or script delivery."
+                ),
+                "evidence": _campaign_click_evidence,
+                "patient_evidence": _campaign_click_evidence,
+                "campaign_info": campaign_info,
+            }
+        # Campaign detected but NOT engaged — the candidate alone is
+        # REJECTED as a trigger (see CAMPAIGN CONTEXT ADMISSION). Continue
+        # checking ONLY the strict complaint/diagnosis rules (Path E) for
+        # another, independently eligible COE need — never Path A/B's bare
+        # mention scan, which the campaign turn's own text would otherwise
+        # always satisfy regardless of relevance.
+        _turns_for_fallback = split_transcript_turns(call.transcript)
+        _results_flags_for_fallback = _completed_results_turn_flags(_turns_for_fallback)
+        fallback_match = _first_approved_complaint_match(_turns_for_fallback, _results_flags_for_fallback)
+        if fallback_match:
+            coe, category, clause = fallback_match
+            return {
+                "triggered": True,
+                "trigger_path": "patient_approved_complaint",
+                "trigger_reason": (
+                    f"The campaign candidate ({campaign_info['campaign_candidate_coe']}) was "
+                    f"{campaign_info['campaign_relevance']}, but the customer separately described "
+                    f"an approved {category.replace('_', ' ')} complaint mapped to the {coe} Center "
+                    "of Excellence — the human agent was still required to recommend/explain that "
+                    "COE service."
+                ),
+                "evidence": clause.strip()[:300],
+                "patient_evidence": clause.strip()[:300],
+                "campaign_info": campaign_info,
+            }
         return {
-            "triggered": True,
-            "trigger_path": "campaign_origin",
-            "trigger_reason": (
-                "The customer's message contains a COE marketing-campaign/post identifier, "
-                "establishing that this conversation began from a Center of Excellence "
-                "campaign. This is a marketing/system message, not something the human agent "
-                "wrote — it is never treated as an agent recommendation or script delivery."
-            ),
-            "evidence": campaign_evidence,
-            "patient_evidence": campaign_evidence,
+            "triggered": False,
+            "trigger_path": None,
+            # A short reason CODE (not a sentence) — mirrors the existing
+            # "completed_diagnostic_results_inquiry" precedent — so a log
+            # line never needs to embed the patient's actual complaint
+            # text (see "avoid logging raw...complaints" requirement).
+            "trigger_reason": f"campaign_{campaign_info['campaign_relevance']}_no_eligible_coe_need",
+            "evidence": None,
+            "patient_evidence": None,
+            "campaign_info": campaign_info,
         }
 
     turns = split_transcript_turns(call.transcript)
@@ -1353,6 +1633,7 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
                 ),
                 "evidence": text.strip()[:300],
                 "patient_evidence": patient_evidence,
+                "campaign_info": campaign_info,
             }
         return {
             "triggered": True,
@@ -1363,6 +1644,7 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
             ),
             "evidence": text.strip()[:300],
             "patient_evidence": None,
+            "campaign_info": campaign_info,
         }
 
     # Path D ("patient_specialty_booking_intent" — a request for ANY
@@ -1390,37 +1672,22 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
     # approved category — never reaches this far (see
     # resolve_approved_complaint, which only ever recognises the literal
     # approved alias lists, never a broader inferred category).
-    for idx, (speaker, text) in enumerate(turns):
-        if speaker != "patient":
-            continue
-        if results_flags[idx]:
-            continue  # retrieving an already-completed lab/radiology result, not a complaint
-        for clause in (_split_clauses(text) or [text]):
-            if _clause_is_third_party_or_negated(clause):
-                continue
-            if detect_coe_mention(clause):
-                # This clause is itself an explicit "مركز تميز"/COE-name
-                # mention (e.g. reciting the official program description
-                # back), not ordinary clinical complaint language — that
-                # is governed by Paths A-C's own, more specific "a bare
-                # customer mention with no agent engagement is never
-                # enough" rule, never by Path E.
-                continue
-            match = resolve_approved_complaint(clause)
-            if match:
-                coe, category, _alias = match
-                return {
-                    "triggered": True,
-                    "trigger_path": "patient_approved_complaint",
-                    "trigger_reason": (
-                        f"The customer actively described an approved {category.replace('_', ' ')} "
-                        f"complaint mapped to the {coe} Center of Excellence, without ever using COE "
-                        "terminology or requesting a specific specialty — the human agent was still "
-                        "required to recommend/explain that COE service."
-                    ),
-                    "evidence": clause.strip()[:300],
-                    "patient_evidence": clause.strip()[:300],
-                }
+    no_campaign_match = _first_approved_complaint_match(turns, results_flags)
+    if no_campaign_match:
+        coe, category, clause = no_campaign_match
+        return {
+            "triggered": True,
+            "trigger_path": "patient_approved_complaint",
+            "trigger_reason": (
+                f"The customer actively described an approved {category.replace('_', ' ')} "
+                f"complaint mapped to the {coe} Center of Excellence, without ever using COE "
+                "terminology or requesting a specific specialty — the human agent was still "
+                "required to recommend/explain that COE service."
+            ),
+            "evidence": clause.strip()[:300],
+            "patient_evidence": clause.strip()[:300],
+            "campaign_info": campaign_info,
+        }
 
     if patient_raised:
         return {
@@ -1432,6 +1699,7 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
             ),
             "evidence": None,
             "patient_evidence": patient_evidence,
+            "campaign_info": campaign_info,
         }
     if any(results_flags):
         # A completed-diagnostic-results inquiry is not, on its own,
@@ -1450,6 +1718,7 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
             ),
             "evidence": None,
             "patient_evidence": None,
+            "campaign_info": campaign_info,
         }
     return {
         "triggered": False,
@@ -1457,6 +1726,7 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
         "trigger_reason": "No Center of Excellence or specialized-center discussion was found.",
         "evidence": None,
         "patient_evidence": None,
+        "campaign_info": campaign_info,
     }
 
 
@@ -1464,6 +1734,54 @@ def coe_validation_needed(call: CallTranscript, trigger_ctx: dict[str, Any] | No
     """Graph-router-friendly boolean wrapper around classify_coe_trigger."""
     ctx = trigger_ctx if trigger_ctx is not None else classify_coe_trigger(call)
     return bool(ctx.get("triggered"))
+
+
+def classify_coe_routing(call: CallTranscript, trigger_ctx: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The single, flat deterministic preflight result every caller that
+    needs BOTH the campaign-relevance fields AND the trigger decision
+    should use — wraps classify_coe_trigger (never a second,
+    independently-computed campaign-relevance check, so the two can never
+    diverge — see classify_coe_trigger's own "campaign_info" key, which
+    this simply re-shapes). Pass an already-computed trigger_ctx (from a
+    prior classify_coe_trigger call on this exact same call) to avoid
+    recomputing it a second time.
+
+    Returns:
+      - campaign_detected, campaign_candidate, campaign_relevance,
+        active_campaign_coe: see classify_campaign_relevance
+        (campaign_candidate_coe renamed to campaign_candidate here).
+      - eligible_patient_coes: every COE this preflight itself found an
+        independently grounded active patient need for — the engaged
+        campaign's own COE, plus the COE a Path E complaint match
+        resolved, when applicable. Diagnostic/best-effort: the
+        authoritative, complete multi-COE picture is still
+        build_coe_evaluations' own coe_evaluations list.
+      - triggered, trigger_path, reason: the routing decision itself
+        (reason mirrors trigger_reason exactly — a short code for a
+        campaign-rejected/completed-results case, a descriptive sentence
+        otherwise).
+    """
+    ctx = trigger_ctx if trigger_ctx is not None else classify_coe_trigger(call)
+    campaign_info = ctx.get("campaign_info") or classify_campaign_relevance(call)
+
+    eligible_patient_coes: list[str] = []
+    if campaign_info.get("active_campaign_coe"):
+        eligible_patient_coes.append(campaign_info["active_campaign_coe"])
+    if ctx["triggered"] and ctx["trigger_path"] == "patient_approved_complaint":
+        match = resolve_approved_complaint(ctx.get("evidence") or "")
+        if match and match[0] not in eligible_patient_coes:
+            eligible_patient_coes.append(match[0])
+
+    return {
+        "campaign_detected": campaign_info["campaign_detected"],
+        "campaign_candidate": campaign_info["campaign_candidate_coe"],
+        "campaign_relevance": campaign_info["campaign_relevance"],
+        "active_campaign_coe": campaign_info["active_campaign_coe"],
+        "eligible_patient_coes": eligible_patient_coes,
+        "triggered": ctx["triggered"],
+        "trigger_path": ctx["trigger_path"],
+        "reason": ctx["trigger_reason"],
+    }
 
 
 # ── Primary-complaint -> expected-COE mapping ───────────────────────────────
@@ -1530,32 +1848,125 @@ def script_similarity(agent_text: str, script_ar: str) -> float:
     return _rfuzz.token_set_ratio(s, a)
 
 
-def resolve_recommended_coe(call: CallTranscript, scripts: dict[str, str] | None = None) -> str | None:
-    """Identify which supported COE the AGENT actually recommended or
-    confirmed — Patient turns are never consulted here (see module
-    docstring's speaker-attribution rule). Checks every Agent turn (not
-    just the first) for an explicit COE-name marker; falls back to
-    approved-script similarity (paraphrase-tolerant) across all Agent turns
-    when no explicit marker is found.
-    """
-    scripts = scripts or DEFAULT_SCRIPTS_AR
-    turns = split_transcript_turns(call.transcript)
+# ═════════════════════════════════════════════════════════════════════════
+# SCRIPT SIMILARITY GATING — fuzzy script similarity must NEVER
+# independently create or choose a COE category by itself. The four
+# approved scripts share substantial boilerplate ("لضمان تحقيق أقصى
+# استفادة...سيتم حجز موعد لحضرتك بمركز التميز المتخصص في...والذي يضم نخبة
+# من أفضل الاستشاريين والأخصائيين"), so an agent's generic closing/wrap-up
+# wording built ENTIRELY from that shared boilerplate scores extremely
+# high (often 90-99) against EVERY script at once, with no category-
+# specific content at all — comparing each COE's script independently
+# against the same threshold would then credit whichever COE happens to
+# win an arbitrary tie (see the reported false-IBD-match regression).
+# Fuzzy similarity may therefore only ever CONFIRM a paraphrase of a
+# category that is ALREADY independently, deterministically evidenced in
+# the SAME turn: an explicit COE/service-program marker (e.g. "مركز
+# التميز"/"برنامج مركز التميز"/"باقة مركز التميز"/"Center of Excellence")
+# AND category-specific evidence for that specific candidate COE (a
+# specialty or approved-complaint alias belonging to it). It can never
+# invent a category from generic shared wording alone.
+# ═════════════════════════════════════════════════════════════════════════
+
+_EXPLICIT_COE_PROGRAM_MARKERS: tuple[str, ...] = (
+    "مركز التميز", "مركز تميز", "برنامج مركز التميز", "باقة مركز التميز",
+    "برنامج التميز", "باقة التميز", "center of excellence", "coe program", "coe package",
+)
+
+
+def _turn_has_explicit_coe_program_marker(text: str) -> bool:
+    """True when *text* contains an explicit COE/service-program marker
+    (see _EXPLICIT_COE_PROGRAM_MARKERS) — the deterministic PREREQUISITE
+    that must hold before script similarity is ever consulted at all (see
+    SCRIPT SIMILARITY GATING). Prefix-tolerant on the marker's own first
+    word (see _contains_multiword_phrase_prefix_tolerant) so the normal
+    attached preposition in "...لحضرتك بمركز التميز المتخصص..." still
+    matches the bare marker "مركز التميز"."""
+    tokens = _tokens(text)
+    return any(_contains_multiword_phrase_prefix_tolerant(tokens, m) for m in _EXPLICIT_COE_PROGRAM_MARKERS)
+
+
+def _turn_has_category_specific_evidence(text: str, coe: str) -> bool:
+    """True when *text* independently names a specialty or approved-
+    complaint category belonging to *coe* — the second half of the SCRIPT
+    SIMILARITY GATING prerequisite. An ordinary phrase like "عيادة الجهاز
+    الهضمي" alone (with no explicit COE/program marker present) never
+    reaches this check at all; this only disambiguates WHICH COE a
+    genuinely COE/program-flavoured turn is actually paraphrasing."""
+    for _canonical, candidate_coes in detect_specialty_mentions(text):
+        if coe in candidate_coes:
+            return True
+    for matched_coe, _category, _alias in detect_approved_complaints(text):
+        if matched_coe == coe:
+            return True
+    return False
+
+
+def _explicit_name_matches(text: str) -> list[str]:
+    """Every COE this Agent turn explicitly names via COE_NAME_MARKERS, in
+    COE_KEYS order."""
+    tokens = _tokens(text)
+    return [
+        coe for coe in COE_KEYS
+        if any(_contains_phrase_arabic_prefix_tolerant(tokens, m) for m in COE_NAME_MARKERS[coe])
+    ]
+
+
+def _agent_turn_grounded_coe_recommendations(
+    text: str, scripts: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Every (coe, grounding_method) this ONE Agent turn safely, explicitly
+    recommends — grounding_method is one of "explicit_name" (a direct
+    COE_NAME_MARKERS match) or "explicit_coe_gated_script_paraphrase" (a
+    close approved-script paraphrase, considered ONLY when this exact turn
+    also independently satisfies BOTH SCRIPT SIMILARITY GATING
+    prerequisites — see _turn_has_explicit_coe_program_marker /
+    _turn_has_category_specific_evidence). Never "ungated_fuzzy_
+    similarity", "reference_only", "llm_only", "specialty_only", or
+    "generic_agent_text" — those grounding methods are explicitly
+    disallowed and must never set explicit_agent_recommended=True.
+
+    An explicit-name match always wins outright for this turn (no fuzzy
+    paraphrase is layered on top of it) — mirrors the pre-existing
+    "explicit name short-circuits" precedent."""
+    explicit = _explicit_name_matches(text)
+    if explicit:
+        return [(coe, "explicit_name") for coe in explicit]
+    if not _turn_has_explicit_coe_program_marker(text):
+        return []
     best_key: str | None = None
     best_score = 0.0
+    for coe, script in scripts.items():
+        if not _turn_has_category_specific_evidence(text, coe):
+            continue
+        score = script_similarity(text, script)
+        if score > best_score:
+            best_key, best_score = coe, score
+    if best_key and best_score >= SCRIPT_MATCH_THRESHOLD:
+        return [(best_key, "explicit_coe_gated_script_paraphrase")]
+    return []
 
-    for speaker, text in turns:
+
+def resolve_recommended_coe(call: CallTranscript, scripts: dict[str, str] | None = None) -> str | None:
+    """Identify which supported COE the AGENT actually, safely recommended
+    or confirmed — Patient turns are never consulted here (see module
+    docstring's speaker-attribution rule). Checks every Agent turn (not
+    just the first) for an explicit COE-name marker; falls back to a
+    GATED approved-script paraphrase (see SCRIPT SIMILARITY GATING) only
+    when no explicit marker is found anywhere. The first Agent turn with
+    ANY grounded match wins — ungated fuzzy similarity against generic,
+    boilerplate-only wording can never set this value (see the reported
+    false-IBD-match regression, where shared script boilerplate alone
+    used to score >=90 against every COE at once).
+    """
+    scripts = scripts or DEFAULT_SCRIPTS_AR
+    for speaker, text in split_transcript_turns(call.transcript):
         if speaker != "agent":
             continue
-        tokens = _tokens(text)
-        for key, markers in COE_NAME_MARKERS.items():
-            if any(_contains_phrase_arabic_prefix_tolerant(tokens, m) for m in markers):
-                return key
-        for key, script in scripts.items():
-            score = script_similarity(text, script)
-            if score > best_score:
-                best_key, best_score = key, score
-
-    return best_key if best_score >= SCRIPT_MATCH_THRESHOLD else None
+        matches = _agent_turn_grounded_coe_recommendations(text, scripts)
+        if matches:
+            return matches[0][0]
+    return None
 
 
 def _agent_turn_supports_category(call: CallTranscript, category: str | None) -> bool:
@@ -2154,8 +2565,11 @@ def _turn_suggests_actionable_service(text: str) -> bool:
 
 
 def build_coe_contexts(
-    call: CallTranscript, scripts: dict[str, str] | None = None
-) -> dict[str, dict[str, Any]]:
+    call: CallTranscript,
+    scripts: dict[str, str] | None = None,
+    *,
+    return_rejected: bool = False,
+) -> dict[str, dict[str, Any]] | tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Build one independent evaluation context per COE with REAL grounded
     evidence anywhere in the transcript — never for a COE that merely
     appears in CRM reference data or an LLM prompt (see module docstring).
@@ -2202,6 +2616,11 @@ def build_coe_contexts(
     # patient_complaint/patient_specialty source.
     results_flags = _completed_results_turn_flags(turns)
     contexts: dict[str, dict[str, Any]] = {}
+    # Rejected fuzzy-similarity near-misses — never create a context, kept
+    # only so the caller (build_coe_evaluations/nodes.py logging) can
+    # report WHY a decent-looking script match was discarded (see SCRIPT
+    # SIMILARITY GATING). Populated only when return_rejected=True.
+    rejected_recommendations: list[dict[str, Any]] = []
 
     def _ctx(coe: str) -> dict[str, Any]:
         return contexts.setdefault(coe, {
@@ -2212,6 +2631,12 @@ def build_coe_contexts(
             "specialties": [],
             "campaign_evidence": None,
             "agent_coe_evidence": None,
+            # One entry per grounded explicit agent recommendation for this
+            # COE — {"coe", "agent_evidence", "turn_index",
+            # "explicit_coe_indicator", "category_specific_evidence",
+            # "grounding_method"} (see GROUND EXPLICIT AGENT
+            # RECOMMENDATIONS). Never populated by an ungated fuzzy match.
+            "recommendation_grounding": [],
             # Index (in split_transcript_turns's order) of the FIRST turn
             # that grounded this COE at all — every context-creating branch
             # below calls _add_source before any other _ctx() access, so
@@ -2272,36 +2697,50 @@ def build_coe_contexts(
                     c["campaign_evidence"] = excerpt
 
         if speaker == "agent":
-            agent_tokens = _tokens(text)
-            for coe, markers in COE_NAME_MARKERS.items():
-                if any(_contains_phrase_arabic_prefix_tolerant(agent_tokens, m) for m in markers):
-                    _add_source(coe, "agent_recommendation", turn_idx)
-                    this_turn_coes.append(coe)
-                    c = _ctx(coe)
-                    if c["agent_coe_evidence"] is None:
-                        c["agent_coe_evidence"] = excerpt
-            # Script similarity is a fuzzy, "which ONE approved script does
-            # this turn most resemble" signal — the four approved scripts
-            # share substantial boilerplate wording ("لضمان تحقيق أقصى
-            # استفادة...سيتم حجز موعد لحضرتك بمركز التميز المتخصص في..."),
-            # so checking each COE's script INDEPENDENTLY against the same
-            # threshold would credit ALL four from one turn's shared
-            # boilerplate alone. Only the single BEST-scoring COE for THIS
-            # turn is ever credited (mirrors resolve_recommended_coe's own
-            # "best match wins" semantics) — never more than one per turn,
-            # though separate turns may still independently recommend
-            # separate COEs.
-            best_script_key, best_script_score = None, 0.0
-            for coe, script in scripts.items():
-                score = script_similarity(text, script)
-                if score > best_script_score:
-                    best_script_key, best_script_score = coe, score
-            if best_script_key and best_script_score >= SCRIPT_MATCH_THRESHOLD:
-                _add_source(best_script_key, "agent_recommendation", turn_idx)
-                this_turn_coes.append(best_script_key)
-                c = _ctx(best_script_key)
+            # Every grounded (never ungated-fuzzy) explicit recommendation
+            # this turn makes — see SCRIPT SIMILARITY GATING /
+            # _agent_turn_grounded_coe_recommendations. Fuzzy script
+            # similarity can never, by itself, create a NEW COE category
+            # from generic shared boilerplate; it may only confirm a
+            # paraphrase of a category the SAME turn already, independently
+            # evidences via an explicit COE/program marker plus category-
+            # specific content.
+            grounded = _agent_turn_grounded_coe_recommendations(text, scripts)
+            for coe, method in grounded:
+                _add_source(coe, "agent_recommendation", turn_idx)
+                this_turn_coes.append(coe)
+                c = _ctx(coe)
                 if c["agent_coe_evidence"] is None:
                     c["agent_coe_evidence"] = excerpt
+                c["recommendation_grounding"].append({
+                    "coe": coe,
+                    "agent_evidence": excerpt,
+                    "turn_index": turn_idx,
+                    "explicit_coe_indicator": True,
+                    "category_specific_evidence": (
+                        method == "explicit_name" or _turn_has_category_specific_evidence(text, coe)
+                    ),
+                    "grounding_method": method,
+                })
+            if return_rejected and not grounded:
+                # Transparency only — a decent-looking raw fuzzy score that
+                # never satisfied the gating prerequisites (see
+                # SCRIPT SIMILARITY GATING) is logged as a rejected
+                # recommendation, never turned into a context.
+                raw_best_key, raw_best_score = None, 0.0
+                for coe, script in scripts.items():
+                    score = script_similarity(text, script)
+                    if score > raw_best_score:
+                        raw_best_key, raw_best_score = coe, score
+                if raw_best_key and raw_best_score >= SCRIPT_MATCH_THRESHOLD:
+                    rejected_recommendations.append({
+                        "turn_index": turn_idx,
+                        "candidate": raw_best_key,
+                        "score": raw_best_score,
+                        "method": "fuzzy_similarity",
+                        "reason": "no_explicit_coe_or_category_evidence",
+                        "evidence": excerpt,
+                    })
 
         if speaker == "patient":
             # Clause-scoped (never whole-turn) so an approved complaint
@@ -2392,6 +2831,8 @@ def build_coe_contexts(
             if coe not in running_active:
                 running_active.append(coe)
 
+    if return_rejected:
+        return contexts, rejected_recommendations
     return contexts
 
 
@@ -2839,8 +3280,11 @@ def _build_missed_recommendation_note(
 
 
 def build_coe_evaluations(
-    call: CallTranscript, scripts: dict[str, str] | None = None
-) -> list[dict[str, Any]]:
+    call: CallTranscript,
+    scripts: dict[str, str] | None = None,
+    *,
+    return_rejected: bool = False,
+) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     """Top-level orchestrator: one independent, fully-evaluated context per
     grounded COE (see build_coe_contexts / extract_doctor_context_
     associations / evaluate_context_doctors above) — the authoritative
@@ -2854,9 +3298,22 @@ def build_coe_evaluations(
     cross-matching this design forbids. It is still recoverable in the
     returned entries' own list for callers that want to surface an
     "uncertain association" note (see infer_coe_validation).
+
+    When return_rejected=True, returns (evaluations, rejected) instead,
+    where rejected == {"recommendations": [...], "contexts": [...]} — see
+    CAMPAIGN CONTEXT ADMISSION / AGENT RECOMMENDATION IS NOT AUTOMATICALLY
+    A PATIENT CONTEXT. Never affects the default (plain-list) return shape
+    every pre-existing caller relies on.
     """
-    contexts = build_coe_contexts(call, scripts)
+    contexts, rejected_recommendations = build_coe_contexts(call, scripts, return_rejected=True)
     associations = extract_doctor_context_associations(call)
+    # A structured campaign identifier proves only where the conversation
+    # ORIGINATED — never that the patient's substantive inquiry is
+    # actually about that campaign's COE (see CAMPAIGN DETECTION IS NOT
+    # CAMPAIGN ENGAGEMENT). Only an "engaged" campaign may ever set
+    # patient_eligible for its candidate COE.
+    campaign_info = classify_campaign_relevance(call)
+    active_campaign_coe = campaign_info["active_campaign_coe"]
 
     # Chronological order — by each context's OWN first grounded transcript
     # evidence (see build_coe_contexts' first_turn_index), never COE_KEYS'
@@ -2906,21 +3363,25 @@ def build_coe_evaluations(
             explicit_agent_recommended or "agent_actionable_service" in ctx["context_sources"]
         )
         # Patient-originated eligibility evidence — an approved diagnosis/
-        # active complaint (see COE_RECOMMENDATION_TRIGGERS) or the
-        # campaign entry point itself (the campaign establishes the
-        # patient's COE context even though it can never itself satisfy
-        # the human-agent recommendation requirement — see PATIENT
-        # ELIGIBILITY / CAMPAIGN ATTRIBUTION). Never derived from an
-        # agent-only mention, and — per the confirmed business rule
-        # superseding the earlier one — never derived from a bare
-        # "patient_specialty" mention either: a patient requesting Dental,
-        # Ophthalmology, ENT, Cardiology, Neurology, etc. on its own is
-        # NOT, by itself, evidence that a COE recommendation was owed. A
-        # specialty mention may still be reported for supporting/referral
-        # context (see canonical_specialty/specialty_evidence below), but
-        # it never sets patient_eligible.
-        patient_eligible = any(
-            s in ctx["context_sources"] for s in ("campaign", "patient_complaint")
+        # active complaint (see COE_RECOMMENDATION_TRIGGERS) or an ENGAGED
+        # campaign for THIS SPECIFIC coe (the campaign establishes the
+        # patient's COE context ONLY when the rest of the call actually
+        # continues that topic — see CAMPAIGN DETECTION IS NOT CAMPAIGN
+        # ENGAGEMENT / classify_campaign_relevance; a diverted, pending, or
+        # uncertain campaign can never satisfy this, even though the
+        # campaign message itself is still recorded in context_sources for
+        # metadata/reporting purposes). Never derived from an agent-only
+        # mention, and — per the confirmed business rule superseding the
+        # earlier one — never derived from a bare "patient_specialty"
+        # mention either: a patient requesting Dental, Ophthalmology, ENT,
+        # Cardiology, Neurology, etc. on its own is NOT, by itself,
+        # evidence that a COE recommendation was owed. A specialty mention
+        # may still be reported for supporting/referral context (see
+        # canonical_specialty/specialty_evidence below), but it never sets
+        # patient_eligible.
+        patient_eligible = (
+            "patient_complaint" in ctx["context_sources"]
+            or (campaign_coe and coe_key == active_campaign_coe)
         )
         if has_actionable_mapped_service:
             service_alignment_status = "pass"
@@ -3009,6 +3470,7 @@ def build_coe_evaluations(
             "validated_coe": coe_key,
             "primary_doctor_status": primary_status,
             "_patient_eligible": patient_eligible,
+            "recommendation_grounding": ctx["recommendation_grounding"],
         })
 
     # ── Pass 2: recommendation_status — the NEW authoritative "was the
@@ -3150,9 +3612,79 @@ def build_coe_evaluations(
             "primary_doctor_status": primary_status,
             "context_status": context_status,
             "is_violation": is_violation,
+            # Whether this context has its OWN independent patient-side
+            # basis (an approved complaint, or an ENGAGED campaign for this
+            # exact COE) — see PATIENT ELIGIBILITY / CAMPAIGN ATTRIBUTION
+            # and MULTI-CONTEXT ADMISSION. False for a purely agent-side
+            # (proactive) recommendation or a diverted/pending/uncertain
+            # campaign candidate.
+            "patient_eligible": entry["_patient_eligible"],
+            # The first grounded explicit-recommendation record for this
+            # COE (see GROUND EXPLICIT AGENT RECOMMENDATIONS) — coe,
+            # agent_evidence, turn_index, explicit_coe_indicator,
+            # category_specific_evidence, grounding_method. None when this
+            # context was never explicitly recommended by the agent at all.
+            "explicit_recommendation_grounding": (
+                entry["recommendation_grounding"][0] if entry["recommendation_grounding"] else None
+            ),
         })
 
-    return evaluations
+    # ── Context admission — a context whose ONLY basis is unsupported
+    # (never a real patient/agent journey of its own) must never survive
+    # as a false "context", even though pass 1/2 above still computed its
+    # facts (needed to justify ANOTHER context's wrong_coe verdict). See
+    # CAMPAIGN CONTEXT ADMISSION and AGENT RECOMMENDATION IS NOT
+    # AUTOMATICALLY A PATIENT CONTEXT. ─────────────────────────────────────
+    rejected_contexts: list[dict[str, Any]] = []
+    admitted_evaluations: list[dict[str, Any]] = []
+    for pending_entry, evaluation in zip(_pending, evaluations):
+        sources = set(pending_entry["context_sources"])
+        is_pure_campaign_candidate = sources == {"campaign"}
+        is_unsupported_recommendation = (
+            pending_entry["explicit_agent_recommended"] and not pending_entry["_patient_eligible"]
+        )
+        # A context built from NOTHING but a campaign mention is only ever
+        # admitted when that campaign is genuinely ENGAGED for this exact
+        # COE (see CAMPAIGN CONTEXT ADMISSION) — a diverted/pending/
+        # uncertain campaign candidate must not appear in coe_evaluations
+        # at all, and must never generate a recommendation_required/
+        # missed_recommendation finding.
+        if is_pure_campaign_candidate and pending_entry["coe"] == campaign_info.get("campaign_candidate_coe") and not pending_entry["_patient_eligible"]:
+            rejected_contexts.append({
+                "coe": pending_entry["coe"],
+                "reason": f"campaign_{campaign_info.get('campaign_relevance') or 'diverted'}",
+            })
+            continue
+        # An agent recommendation with NO patient-side basis of its own is
+        # recorded as an agent action and used (mirrors pass 2's own
+        # "conflicting" check) to justify ANOTHER active context's
+        # wrong_coe — but it never becomes a separate, falsely-passing
+        # patient context in its own right. Dropped ONLY when it is
+        # actually consumed as a wrong_coe substitution for some OTHER
+        # eligible context whose OWN need received NO agent engagement at
+        # all (service_alignment_status != "pass") — never merely because
+        # some OTHER unrelated eligible context also happens to exist: an
+        # agent who both handles the patient's own need AND additionally,
+        # genuinely recommends/books a completely separate COE service
+        # (see test_headache_and_ibd_both_discussed_one_doctor_each) has
+        # created a real second journey, not an unsupported substitution.
+        is_consumed_as_wrong_coe_substitution = any(
+            other is not pending_entry
+            and other["_patient_eligible"]
+            and other["service_alignment_status"] != "pass"
+            for other in _pending
+        )
+        if is_unsupported_recommendation and is_consumed_as_wrong_coe_substitution:
+            rejected_contexts.append({"coe": pending_entry["coe"], "reason": "ungrounded_agent_recommendation"})
+            continue
+        admitted_evaluations.append(evaluation)
+
+    if return_rejected:
+        return admitted_evaluations, {
+            "recommendations": rejected_recommendations,
+            "contexts": rejected_contexts,
+        }
+    return admitted_evaluations
 
 
 def unassociated_initial_doctors(call: CallTranscript) -> list[dict[str, Any]]:

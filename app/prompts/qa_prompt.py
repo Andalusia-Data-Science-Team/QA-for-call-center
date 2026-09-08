@@ -993,22 +993,57 @@ This call's trigger path is: {trigger_path or "(not available)"}
   post/ad (the transcript contains a structured campaign identifier, e.g. "BU-AHJ-COE-...").
   This message is MARKETING/SYSTEM content, not something the human agent wrote — NEVER
   attribute its wording to the agent, and NEVER treat it as evidence that the agent delivered
-  the approved COE script or recommendation. Instead:
-    - Use the campaign text ONLY to identify which COE is already established as the active
-      context, when it is explicit (e.g. "مركز تميز الصداع" -> Headache; neurology language
-      such as "مخ واعصاب"/"أعصاب" also supports Headache in this campaign context).
-    - This establishes a SEPARATE value, campaign_coe — it is context, NOT an agent
-      recommendation. Because the campaign message itself already establishes that context,
-      the AGENT does NOT need to repeat the COE name or script for this to remain a genuine
-      COE conversation — evaluate the agent's SUBSEQUENT handling (which doctor they offer,
-      how they proceed with booking) as happening WITHIN that already-established context.
-    - Only set recommended_coe when an actual AGENT turn itself recommends, names, or
-      confirms a COE — campaign_coe on its own is never sufficient to also claim
-      recommended_coe. It is entirely normal and CORRECT for recommended_coe to be null while
-      campaign_coe is set (the agent simply continued the campaign-established journey
-      without independently naming the COE again).
-    - If the agent recommends, offers, selects, confirms, or books a doctor for the initial
-      appointment, extract that doctor even though the agent never repeats the COE name.
+  the approved COE script or recommendation.
+
+  ### CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT (critical)
+  A campaign message establishes only a CANDIDATE marketing context — the COE its own text
+  names (e.g. "مركز تميز الصداع" -> Headache). It does NOT prove that the patient's
+  substantive inquiry is actually about that campaign's service. Do not assume the patient
+  wants that campaign service just because the call started there.
+
+  Inspect the patient's LATER substantive inquiry (ignore the campaign payload itself, bot
+  menu selections, handoff messages, greetings, names, insurance, IDs, and other
+  administrative turns when doing this):
+  - If it continues the SAME COE topic (an approved complaint mapped to the candidate COE, an
+    explicit request for that COE's package/program, or an explicit COE explanation the agent
+    gives that the patient accepts/continues discussing), set campaign_relevance="engaged".
+  - If the patient clearly requests an unrelated service (a different specialty alone, a
+    completed-results inquiry, an administrative request, another branch, etc.) and never
+    returns to the campaign topic, set campaign_relevance="diverted".
+  - If no substantive patient inquiry exists at all (only the campaign click and/or
+    administrative turns), set campaign_relevance="pending".
+  - If the evidence is genuinely ambiguous, set campaign_relevance="uncertain".
+  - If the patient LATER returns to the campaign topic after an earlier unrelated turn,
+    campaign_relevance is "engaged" from that later evidence — a diversion is not permanent.
+
+  Only an ENGAGED campaign may become an active COE evaluation context or create a
+  recommendation requirement. Report all four values explicitly:
+  ```json
+  {{
+    "campaign_detected": true,
+    "campaign_candidate_coe": "Headache",
+    "campaign_relevance": "diverted",
+    "campaign_relevance_evidence": "<the patient's actual, later substantive inquiry>",
+    "active_campaign_coe": null
+  }}
+  ```
+  campaign_coe (the legacy field) must equal active_campaign_coe — set ONLY when
+  campaign_relevance is "engaged", never merely because a campaign identifier was present.
+  Only set recommended_coe when an actual AGENT turn itself recommends, names, or confirms a
+  COE — campaign_coe on its own (even when engaged) is never sufficient to also claim
+  recommended_coe. It is entirely normal and CORRECT for recommended_coe to be null while
+  campaign_coe is set (the agent simply continued the campaign-established journey without
+  independently naming the COE again). If the agent recommends, offers, selects, confirms, or
+  books a doctor for the initial appointment, extract that doctor even though the agent never
+  repeats the COE name — but only within an ENGAGED campaign's context, never a diverted one.
+
+  Never create a second COE context solely because an agent turn is vaguely similar to one of
+  the reference scripts below — the four approved scripts share substantial boilerplate
+  wording, so a generic agent closing/wrap-up sentence can score highly against ALL of them at
+  once with no category-specific content at all. Reference scripts are validation data, used
+  only to check ADHERENCE once a COE is already independently, explicitly grounded in the same
+  turn (an explicit COE/program marker plus category-specific evidence) — never transcript
+  evidence that a category was discussed, and never the reason a category is chosen.
 
 ## REFERENCE DATA IS NOT TRANSCRIPT EVIDENCE (critical)
 The SUPPORTING/REFERRAL REFERENCE section below lists the four categories this system CAN
@@ -1049,9 +1084,15 @@ such an excerpt, return null for that value rather than guessing from the refere
    COE journey. Only mark this true when the evidence is explicit and clear.
 
 ## THIS CALL MAY DISCUSS MORE THAN ONE COE (critical)
-A single call can legitimately raise more than one COE — e.g. a Headache campaign click
-followed by an unrelated Agent recommendation of the IBD COE later in the same call. A
-deterministic check builds one INDEPENDENT evaluation context per grounded COE and associates
+A single call can legitimately raise more than one COE — e.g. the patient actively raises an
+approved Headache complaint AND, separately, an approved IBD complaint later in the same call.
+This requires at least two INDEPENDENT, patient-side eligible needs — NOT merely a campaign
+click plus an unrelated agent recommendation: a Headache campaign the patient never actually
+engaged with (see CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT), paired with an unrelated
+agent recommendation elsewhere in the call, is NOT two legitimate COE contexts — it is, at
+most, ONE active context (whichever one the patient's own evidence actually supports), plus an
+unsupported agent action that a deterministic check may compare against it. A deterministic
+check builds one INDEPENDENT evaluation context per grounded, ADMITTED COE and associates
 each doctor with the correct one using turn-level evidence; that is the system of record, not
 this prompt's single recommended_coe/initial_doctors fields — treat those as your best summary
 of the MOST SALIENT context, not as a merged answer, and never let a doctor approved for one
@@ -1195,7 +1236,12 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "primary_complaint": "<1 sentence, patient's own words/summary, or null>",
   "primary_complaint_category": "<IBD | Headache | Asthma | Diabetes | null>",
   "primary_complaint_evidence": "<verbatim patient excerpt supporting the category above, or null>",
-  "campaign_coe": "<IBD | Headache | Asthma | Diabetes | null — only when trigger_path is campaign_origin>",
+  "campaign_detected": <true | false>,
+  "campaign_candidate_coe": "<IBD | Headache | Asthma | Diabetes | null — the COE the campaign message's OWN text names, regardless of relevance>",
+  "campaign_relevance": "<engaged | diverted | pending | uncertain | null — see CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT>",
+  "campaign_relevance_evidence": "<verbatim excerpt justifying the relevance verdict above, or null>",
+  "active_campaign_coe": "<campaign_candidate_coe when campaign_relevance is engaged, else null>",
+  "campaign_coe": "<same as active_campaign_coe — only set when trigger_path is campaign_origin AND campaign_relevance is engaged>",
   "campaign_coe_evidence": "<verbatim campaign/patient excerpt, or null>",
   "recommended_coe": "<IBD | Headache | Asthma | Diabetes | null>",
   "coe_recommendation_evidence": "<verbatim excerpt the recommended_coe value is based on, or null>",
