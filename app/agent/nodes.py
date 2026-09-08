@@ -2363,6 +2363,15 @@ def skip_coe_validation(state: AgentState) -> dict:
     call = state["call"]
     trigger_ctx = classify_coe_trigger(call)
     logger.info("coe validation skipped | call_id=%s reason=%s", call.call_id, trigger_ctx["trigger_reason"])
+    reason_code = (
+        "completed_diagnostic_results_inquiry"
+        if trigger_ctx["trigger_reason"].startswith("completed_diagnostic_results_inquiry")
+        else trigger_ctx["trigger_reason"]
+    )
+    print(
+        f"[coe] routing | triggered=False reason={reason_code} eligible_specialties=[] coes=[]",
+        flush=True,
+    )
     print(f"[coe] skipped | call_id={call.call_id} reason={trigger_ctx['trigger_reason']}", flush=True)
     return {"coe_validation": _not_applicable_coe_result(trigger_ctx["trigger_reason"])}
 
@@ -2375,6 +2384,23 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
     call = state["call"]
     trigger_ctx = classify_coe_trigger(call)
     if not trigger_ctx["triggered"]:
+        # Defensive fallback only — the graph router (_coe_intent_router)
+        # never routes here when classify_coe_trigger says untriggered
+        # (it routes to skip_coe_validation instead, before any CRM/LLM
+        # call); this branch exists for direct/test invocation of this
+        # node. Logs the same routing/skip lines skip_coe_validation
+        # prints, so a completed-results-inquiry call reads identically
+        # regardless of which path reached this conclusion.
+        reason_code = (
+            "completed_diagnostic_results_inquiry"
+            if trigger_ctx["trigger_reason"].startswith("completed_diagnostic_results_inquiry")
+            else trigger_ctx["trigger_reason"]
+        )
+        print(
+            f"[coe] routing | triggered=False reason={reason_code} eligible_specialties=[] coes=[]",
+            flush=True,
+        )
+        print(f"[coe] skipped | call_id={call.call_id} reason={trigger_ctx['trigger_reason']}", flush=True)
         result = _not_applicable_coe_result(trigger_ctx["trigger_reason"])
         return {"coe_validation": result, "node_trace": _trace(state, "infer_coe_validation")}
 

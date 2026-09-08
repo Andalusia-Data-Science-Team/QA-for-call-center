@@ -374,6 +374,28 @@ COE_COMPLAINTS: dict[str, dict[str, list[str]]] = {
     },
 }
 
+# The AUTHORITATIVE registry for deciding whether a human-agent COE
+# recommendation is REQUIRED — literally the SAME data as COE_COMPLAINTS
+# above (never a second, independently-authored copy), exposed under this
+# name because "does this patient need require a COE recommendation" is a
+# conceptually distinct question from "what counts as an approved
+# diagnosis/complaint category", even though today they share one list.
+# recommendation_required / missed_recommendation / the "patient's own
+# active need" trigger path (see classify_coe_trigger's Path E) are
+# decided from THIS registry only — never from the broad COE_SPECIALTIES/
+# SPECIALTY_REGISTRY taxonomy, which remains available ONLY for
+# supporting-specialty/referral/doctor-association classification (see
+# the module's "SEPARATE TWO DIFFERENT CONCEPTS" requirement). A
+# specialty's presence in COE_SPECIALTIES (e.g. Dental under Headache)
+# never implies it belongs here — Dental, Ophthalmology, ENT, Cardiology,
+# Psychiatry, Neurology (on its own), Nutrition, General Surgery,
+# Orthopedics, Diabetic Educator, and generic Allergy/Pulmonology
+# mentions are all DELIBERATELY absent from this registry: they may still
+# appear as supporting specialties inside an ALREADY-established context,
+# but they must never independently create the recommendation
+# requirement (see build_coe_evaluations' patient_eligible computation).
+COE_RECOMMENDATION_TRIGGERS: dict[str, dict[str, list[str]]] = COE_COMPLAINTS
+
 
 def resolve_approved_complaint(text: str) -> tuple[str, str, str] | None:
     """Deterministic, phrase-aware, longest-alias-wins resolution of the
@@ -453,6 +475,86 @@ _HYPOTHETICAL_MARKERS: set[str] = {
     "لو كان", "لو كنت", "لو عندي", "افرض", "بفرض", "لو حصل", "ايه لو",
     "if i had", "what if", "hypothetically",
 }
+
+# ── Completed diagnostic results inquiry ─────────────────────────────────
+# A patient asking to retrieve/view/download an ALREADY-COMPLETED lab or
+# radiology result is never a COE-eligible need on its own — a test NAME
+# ("سكر تراكمي"/"كوليسترول"/HbA1c/CBC/...) is an investigation, never a
+# diagnosis, complaint, or specialty request by itself (see "TEST NAMES
+# ARE NOT DIAGNOSES OR SPECIALTIES"). These are deliberately CONTEXTUAL
+# PHRASES (an actual completed-result marker), never a bare "تحليل"/
+# "أشعة" — those alone are ambiguous (could equally be a NEW test
+# request, itself still not COE-eligible on its own, see the module's
+# "DISTINGUISH RESULTS FROM NEW CARE" rules, but distinct from ASKING FOR
+# an existing one).
+_COMPLETED_RESULTS_MARKERS: set[str] = {
+    "اخر تحليل", "آخر تحليل", "نتيجة التحليل", "نتيجة تحليل", "نتائج التحاليل",
+    "نتيجة الأشعة", "نتيجة الاشعة", "تقرير الأشعة", "تقرير الاشعة",
+    "آخر أشعة", "اخر اشعة", "التحاليل السابقة", "الأشعة السابقة", "الاشعة القديمة",
+    "التحليل اللي عملته", "الأشعة اللي عملتها", "الاشعة اللي سويتها",
+    "طلعت النتيجة", "ظهرت النتيجة", "أريد نسخة من التحليل", "اريد نسخة من الاشعة",
+    "نسخة من التحاليل", "تحميل التحاليل", "تنزيل التقرير", "أرسل لي النتيجة",
+    "أشوف النتيجة", "وين النتيجة", "فين النتيجة", "فين نتائج التحاليل",
+    # Generalized "نتيجة/تقرير + [organ/test noun]" forms — "نتيجة" ("the
+    # result of") on its OWN is unambiguous enough combined with any of
+    # these common follow-on nouns (unlike bare "تحليل"/"أشعة" alone,
+    # which stay excluded per "Do not classify based on تحليل or أشعة
+    # alone").
+    "نتيجة وظائف", "نتيجة فحص", "نتيجة فحوصات", "نتيجة الفحص", "نتيجة فحوصاتي",
+    "تقرير وظائف", "تقرير الفحص",
+    "latest result", "previous result", "test result", "lab result",
+    "radiology result", "scan result", "download my report", "view my report",
+    "send me my result", "previous analysis", "completed test",
+}
+
+
+def _clause_is_completed_results_inquiry(clause: str) -> bool:
+    """True when *clause* is asking to retrieve/view/download an already-
+    completed lab or radiology result — a CONTEXTUAL phrase match only
+    (see _COMPLETED_RESULTS_MARKERS' docstring), never triggered by a bare
+    "تحليل"/"أشعة" alone."""
+    tokens = _tokens(clause)
+    return any(_contains_phrase(tokens, m) for m in _COMPLETED_RESULTS_MARKERS)
+
+
+def _turn_is_bare_continuation(text: str) -> bool:
+    """True when *text* is a SHORT continuation with no desire-verb/
+    booking-intent language of its own (e.g. "وكوليسترول" following "اريد
+    اخر تحليل سكر تراكمي") — used ONLY to extend an ALREADY-established
+    completed-results-inquiry topic from the immediately preceding patient
+    turn to a bare follow-up naming another test, never to exclude a
+    genuinely new, independently-stated need (see
+    _completed_results_turn_flags)."""
+    tokens = _tokens(text)
+    if _patient_turn_has_booking_intent(text):
+        return False
+    # Strip a single leading conjunction token ("و"/"وبعدها"-style is
+    # already a separate word after tokenising) before counting length.
+    if tokens and tokens[0] in {"و", "وكمان", "كمان"}:
+        tokens = tokens[1:]
+    return 0 < len(tokens) <= 3
+
+
+def _completed_results_turn_flags(turns: list[tuple[str, str]]) -> list[bool]:
+    """One flag per turn (False for non-Patient turns): True when that
+    Patient turn is part of a completed-diagnostic-results inquiry —
+    either directly (a completed-results marker) or as a bare, verb-less
+    continuation of the IMMEDIATELY PRECEDING Patient turn's own
+    results-inquiry (e.g. "وكوليسترول" after "اريد اخر تحليل سكر
+    تراكمي") — never propagated across a turn that introduces its own
+    genuine booking-intent/complaint (a real topic change, see "Mixed
+    intent" in ACTIVE PATIENT NEED)."""
+    flags: list[bool] = [False] * len(turns)
+    last_patient_was_results = False
+    for i, (speaker, text) in enumerate(turns):
+        if speaker != "patient":
+            continue
+        if _clause_is_completed_results_inquiry(text):
+            flags[i] = True
+        elif last_patient_was_results and _turn_is_bare_continuation(text):
+            flags[i] = True
+        last_patient_was_results = flags[i]
+    return flags
 
 
 def _clause_is_third_party_or_negated(clause: str) -> bool:
@@ -1085,25 +1187,19 @@ def resolve_campaign_coe(call: CallTranscript) -> str | None:
     return None
 
 
-# ── Path D: patient specialty-booking-intent ─────────────────────────────
-# The validator exists to catch a MISSED COE recommendation — requiring an
-# existing "مركز التميز"/COE mention before even checking eligibility would
-# make it structurally unable to ever find the exact failure it targets
-# (the agent never says those words). A patient ACTIVELY asking for an
-# appointment/doctor/availability in a specialty that deterministically
-# maps to a supported COE is, on its own, enough to require the human
-# agent to have recommended that COE — see classify_coe_trigger's Path D.
-# A standalone "I want/need" desire-verb TOKEN, anywhere in the turn, is
-# enough on its own — the patient may follow it with a booking noun
-# ("ابغى موعد"), a doctor/availability question ("ابغى دكتور"), or the
-# SPECIALTY NAME directly ("ابغى جهاز هضمي", "ابغى حساسية ومناعة",
-# "احتاج مثقف سكري") — enumerating every possible following noun/specialty
-# combination would never be complete (this registry-consistency audit's
-# whole point), so the verb alone is the trigger; whether it is actually
-# about a mapped specialty is decided separately, by resolve_specialty_
-# coes on the SAME turn (see classify_coe_trigger's Path D). Still gated
-# by _clause_is_third_party_or_negated, so "مش عايز موعد"/"امي عايزة ..."
-# are correctly excluded despite containing a desire verb.
+# ── Patient booking-intent detection ──────────────────────────────────────
+# Used by _turn_is_bare_continuation (to tell a genuinely new, actively-
+# stated need apart from a bare follow-up naming another completed-results
+# test — see _completed_results_turn_flags) and, historically, by the now-
+# REMOVED specialty-only trigger path ("Path D" in earlier revisions of
+# this module — a bare specialty/doctor request no longer independently
+# triggers COE validation on its own; see COE_RECOMMENDATION_TRIGGERS'
+# docstring). A standalone "I want/need" desire-verb TOKEN, anywhere in
+# the turn, is enough on its own to count as booking intent — the patient
+# may follow it with a booking noun ("ابغى موعد"), a doctor/availability
+# question ("ابغى دكتور"), or a specialty name directly. Still gated by
+# _clause_is_third_party_or_negated, so "مش عايز موعد"/"امي عايزة ..." are
+# correctly excluded despite containing a desire verb.
 _PATIENT_DESIRE_VERB_TOKENS: set[str] = {
     "ابغى", "ابي", "أبغى", "عايز", "عاوز", "عايزة", "عاوزة",
     "محتاج", "محتاجة", "احتاج", "أحتاج", "بدي", "اريد", "أريد",
@@ -1127,11 +1223,44 @@ def _patient_turn_has_booking_intent(text: str) -> bool:
     """True when *text* (one Patient turn) actively asks for a doctor,
     appointment, availability, or specialty — never a passive/incidental/
     historical mention on its own (see _PATIENT_DESIRE_VERB_TOKENS /
-    _PATIENT_BOOKING_INTENT_MARKERS and classify_coe_trigger's Path D)."""
+    _PATIENT_BOOKING_INTENT_MARKERS)."""
     tokens = _tokens(text)
     if any(t in _NORMALIZED_DESIRE_VERB_TOKENS for t in tokens):
         return True
     return any(_contains_phrase(tokens, m) for m in _PATIENT_BOOKING_INTENT_MARKERS)
+
+
+# ── New diagnostic test request (without a doctor/specialty/COE need) ──────
+# "اريد اعمل تحليل سكر"/"عايز أحجز أشعة" ask to HAVE A NEW TEST DONE — a
+# diagnostic test alone (new OR completed-result retrieval) is never a
+# specialty or COE booking on its own (see "DISTINGUISH RESULTS FROM NEW
+# CARE"). Distinguished from a genuine doctor/clinic/specialty booking by
+# the presence of an ACTUAL clinic/doctor/appointment word: "اريد اعمل
+# تحليل سكر" (bare test only) is excluded, but "أنا مريض سكر وأريد أحجز
+# عيادة السكر" (names a CLINIC) or "عندي قدم سكري وأحتاج دكتور" (names a
+# DOCTOR) are not — the test-object word alone never overrides an
+# actually-present clinic/doctor/appointment request in the SAME clause.
+_TEST_REQUEST_OBJECT_MARKERS: set[str] = {
+    "تحليل", "تحاليل", "أشعة", "اشعة", "فحص", "فحوصات", "سونار", "منظار", "رنين",
+    "test", "analysis", "scan", "x-ray", "lab test",
+}
+_CLINIC_DOCTOR_APPOINTMENT_MARKERS: set[str] = {
+    "دكتور", "طبيب", "عيادة", "استشاري", "اخصائي", "أخصائي", "موعد",
+    "doctor", "clinic", "appointment", "specialist",
+}
+
+
+def _clause_is_bare_new_test_request(text: str) -> bool:
+    """True when *text* asks to HAVE a NEW diagnostic test/scan performed,
+    with no accompanying doctor/clinic/appointment word — the object of
+    the patient's request is the TEST itself, not a specialty booking
+    (see _TEST_REQUEST_OBJECT_MARKERS' docstring). Never true when a
+    genuine clinic/doctor/appointment word is also present in the same
+    text — that always signals an actual booking request instead."""
+    tokens = _tokens(text)
+    has_test_object = any(_contains_phrase(tokens, m) for m in _TEST_REQUEST_OBJECT_MARKERS)
+    has_clinic_or_doctor = any(_contains_phrase(tokens, m) for m in _CLINIC_DOCTOR_APPOINTMENT_MARKERS)
+    return has_test_object and not has_clinic_or_doctor
 
 
 def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
@@ -1162,18 +1291,23 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
       - If only the Patient ever mentions it (the Agent never responds/
         confirms) -> NOT triggered — a customer mention alone is never
         enough (see module docstring's "do not trigger" rules).
-      - If nobody mentions it at all -> checked against Path D next,
-        rather than immediately returning NOT triggered.
+      - If nobody mentions it at all -> checked against Path E
+        (patient_approved_complaint) next, rather than immediately
+        returning NOT triggered.
 
-      Path D ("patient_specialty_booking_intent") — checked only when
-      NEITHER Path A/B/C above already triggered: a Patient turn actively
-      requesting a doctor/appointment/availability (see
-      _patient_turn_has_booking_intent) whose specialty deterministically
-      maps to exactly one supported COE is enough on its own — this
-      validator exists specifically to catch a missed COE recommendation,
-      so it must never require the COE to already have been named before
-      checking whether it SHOULD have been (see
-      _PATIENT_BOOKING_INTENT_MARKERS).
+      Path E ("patient_approved_complaint") — checked only when NEITHER
+      Path A/B/C above already triggered: a Patient turn actively
+      describing one of the restricted, business-approved diagnosis/
+      complaint categories (see COE_RECOMMENDATION_TRIGGERS) is enough on
+      its own to require the human agent to have recommended the mapped
+      COE — this validator exists specifically to catch a missed COE
+      recommendation, so it must never require the COE to already have
+      been named before checking whether it SHOULD have been. A bare
+      specialty/doctor request with no approved complaint category present
+      (e.g. Dental, or Neurology on its own) is deliberately NOT enough —
+      see COE_RECOMMENDATION_TRIGGERS' docstring for the confirmed
+      business rule superseding the earlier, broader specialty-based
+      trigger.
     """
     campaign_evidence = campaign_origin_evidence(call)
     if campaign_evidence:
@@ -1191,6 +1325,12 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
         }
 
     turns = split_transcript_turns(call.transcript)
+    # Which Patient turns are part of a completed-diagnostic-results
+    # inquiry (see _completed_results_turn_flags) — computed once, used to
+    # exclude those turns from Paths D/E below, so a test-NAME word (e.g.
+    # bare "سكر" inside "اخر تحليل سكر تراكمي") is never read as an
+    # active specialty/complaint need on its own.
+    results_flags = _completed_results_turn_flags(turns)
     patient_raised = False
     patient_evidence: str | None = None
 
@@ -1225,67 +1365,36 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
             "patient_evidence": None,
         }
 
-    # Path D — patient specialty-booking-intent. Checked only after NEITHER
-    # of the explicit "مركز التميز"/COE-mention paths above already
-    # triggered — it never overrides or duplicates them, only covers the
-    # case this validator exists for: no one ever said the COE's name, yet
-    # the patient actively asked for an appointment/doctor in a specialty
-    # that deterministically maps to exactly one supported COE.
-    for speaker, text in turns:
-        if speaker != "patient":
-            continue
-        if not _patient_turn_has_booking_intent(text):
-            continue
-        if _clause_is_third_party_or_negated(text):
-            continue  # a family member's condition, or a cancelled/negated request
-        coes = resolve_specialty_coes(text)
-        if len(coes) == 1:
-            return {
-                "triggered": True,
-                "trigger_path": "patient_specialty_booking_intent",
-                "trigger_reason": (
-                    f"The customer actively requested an appointment/doctor in a specialty "
-                    f"mapped to the {coes[0]} Center of Excellence, without ever using COE "
-                    "terminology — the human agent was still required to recommend/explain "
-                    "that COE service."
-                ),
-                "evidence": text.strip()[:300],
-                "patient_evidence": text.strip()[:300],
-            }
-        if ambiguous_specialty_mentions(text):
-            # A SHARED specialty (e.g. ENT) with no context to disambiguate
-            # it yet — still an active booking request, so the eligibility
-            # check still runs (this trigger path exists), but which COE
-            # it belongs to genuinely cannot be determined here; never
-            # guessed, and never punitive on its own (see build_coe_
-            # contexts/ambiguous_specialty_mentions — no context is ever
-            # created for it, so it can never produce a missed/wrong_coe
-            # finding by itself).
-            return {
-                "triggered": True,
-                "trigger_path": "patient_specialty_booking_intent",
-                "trigger_reason": (
-                    "The customer actively requested an appointment/doctor in a specialty "
-                    "shared by more than one Center of Excellence, with no context yet to "
-                    "determine which one applies — eligibility is checked, but never guessed."
-                ),
-                "evidence": text.strip()[:300],
-                "patient_evidence": text.strip()[:300],
-            }
+    # Path D ("patient_specialty_booking_intent" — a request for ANY
+    # specialty in the broad COE_SPECIALTIES/SPECIALTY_REGISTRY taxonomy
+    # was, by itself, enough to trigger) is REMOVED — SUPERSEDED by the
+    # confirmed business rule that the broad specialty taxonomy may be
+    # used for supporting-specialty/referral/doctor-association
+    # classification ONLY, never to decide recommendation_required/
+    # missed_recommendation/the trigger itself (see "SEPARATE TWO
+    # DIFFERENT CONCEPTS" and COE_RECOMMENDATION_TRIGGERS' docstring). A
+    # bare specialty request — Dental, Ophthalmology, ENT, Cardiology,
+    # Psychiatry, Neurology on its own, Nutrition, General Surgery,
+    # Orthopedics, Diabetic Educator, generic Allergy/Pulmonology — no
+    # longer independently triggers this validator; it may still
+    # contribute supporting-specialty/doctor evidence WITHIN a context
+    # already established by Path E below.
 
-    # Path E — patient_approved_complaint. Checked only after Paths A-D
-    # above never triggered — a patient stating one of the restricted,
-    # business-approved diagnosis/complaint categories (see COE_COMPLAINTS)
-    # is, on its own, enough to require the human agent to have
-    # recommended the mapped COE, even with no specialty/doctor request
-    # and no COE terminology at all (e.g. "عندي صداع نصفي وأريد أحجز له").
-    # Deliberately narrower than Path D's specialty-booking-intent check —
-    # a vague, unapproved symptom never reaches this far (see
+    # Path E — patient_approved_complaint. The SOLE remaining "patient's
+    # own active need" trigger — a patient stating one of the restricted,
+    # business-approved diagnosis/complaint categories (see
+    # COE_RECOMMENDATION_TRIGGERS) is, on its own, enough to require the
+    # human agent to have recommended the mapped COE, even with no COE
+    # terminology at all (e.g. "عندي صداع نصفي وأريد أحجز له"). A vague,
+    # unapproved symptom — OR a bare specialty/doctor request with no
+    # approved category — never reaches this far (see
     # resolve_approved_complaint, which only ever recognises the literal
     # approved alias lists, never a broader inferred category).
-    for speaker, text in turns:
+    for idx, (speaker, text) in enumerate(turns):
         if speaker != "patient":
             continue
+        if results_flags[idx]:
+            continue  # retrieving an already-completed lab/radiology result, not a complaint
         for clause in (_split_clauses(text) or [text]):
             if _clause_is_third_party_or_negated(clause):
                 continue
@@ -1323,6 +1432,24 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
             ),
             "evidence": None,
             "patient_evidence": patient_evidence,
+        }
+    if any(results_flags):
+        # A completed-diagnostic-results inquiry is not, on its own,
+        # evidence of nothing — it's a specific, deliberate exclusion
+        # (see COMPLETED RESULTS INQUIRY) called out separately here so
+        # both the logs and the trigger reason are honest about WHY this
+        # call was skipped, rather than reading "no discussion found" for
+        # a call that plainly discussed test results.
+        return {
+            "triggered": False,
+            "trigger_path": None,
+            "trigger_reason": (
+                "completed_diagnostic_results_inquiry: the customer is requesting an already-"
+                "completed laboratory/radiology result, not booking care for a COE-related "
+                "complaint or specialty."
+            ),
+            "evidence": None,
+            "patient_evidence": None,
         }
     return {
         "triggered": False,
@@ -2068,6 +2195,12 @@ def build_coe_contexts(
     """
     scripts = scripts or DEFAULT_SCRIPTS_AR
     turns = split_transcript_turns(call.transcript)
+    # Which Patient turns are a completed-diagnostic-results inquiry (see
+    # _completed_results_turn_flags) — a test NAME mentioned only while
+    # retrieving an already-completed result (e.g. bare "سكر" inside "اخر
+    # تحليل سكر تراكمي") must never independently ground a
+    # patient_complaint/patient_specialty source.
+    results_flags = _completed_results_turn_flags(turns)
     contexts: dict[str, dict[str, Any]] = {}
 
     def _ctx(coe: str) -> dict[str, Any]:
@@ -2187,7 +2320,7 @@ def build_coe_contexts(
             # purposes this recommendation-eligibility route must not
             # inherit (a vague symptom like dizziness or nausea must never
             # by itself create a recommendation obligation).
-            for clause in (_split_clauses(text) or [text]):
+            for clause in ([] if results_flags[turn_idx] else (_split_clauses(text) or [text])):
                 if _clause_is_third_party_or_negated(clause):
                     continue
                 for coe, category, matched_alias in detect_approved_complaints(clause):
@@ -2220,8 +2353,14 @@ def build_coe_contexts(
         # the turn with those clauses removed, never the raw excerpt
         # actually stored as evidence.
         if speaker == "patient":
-            qualifying_clauses = [
-                cl for cl in (_split_clauses(text) or [text]) if not _clause_is_third_party_or_negated(cl)
+            # A whole turn classified as a completed-diagnostic-results
+            # inquiry never contributes specialty evidence either — a
+            # test NAME (e.g. bare "سكر" in "اخر تحليل سكر تراكمي") is
+            # an investigation, never a specialty request on its own (see
+            # "TEST NAMES ARE NOT DIAGNOSES OR SPECIALTIES").
+            qualifying_clauses = [] if results_flags[turn_idx] else [
+                cl for cl in (_split_clauses(text) or [text])
+                if not _clause_is_third_party_or_negated(cl) and not _clause_is_bare_new_test_request(cl)
             ]
             specialty_scan_text = "، ".join(qualifying_clauses)
         else:
@@ -2766,14 +2905,22 @@ def build_coe_evaluations(
         has_actionable_mapped_service = (
             explicit_agent_recommended or "agent_actionable_service" in ctx["context_sources"]
         )
-        # Patient-originated eligibility evidence — a diagnosis, active
-        # complaint, requested specialty/appointment, or the campaign
-        # entry point itself (the campaign establishes the patient's COE
-        # context even though it can never itself satisfy the human-agent
-        # recommendation requirement — see PATIENT ELIGIBILITY /
-        # CAMPAIGN ATTRIBUTION). Never derived from an agent-only mention.
+        # Patient-originated eligibility evidence — an approved diagnosis/
+        # active complaint (see COE_RECOMMENDATION_TRIGGERS) or the
+        # campaign entry point itself (the campaign establishes the
+        # patient's COE context even though it can never itself satisfy
+        # the human-agent recommendation requirement — see PATIENT
+        # ELIGIBILITY / CAMPAIGN ATTRIBUTION). Never derived from an
+        # agent-only mention, and — per the confirmed business rule
+        # superseding the earlier one — never derived from a bare
+        # "patient_specialty" mention either: a patient requesting Dental,
+        # Ophthalmology, ENT, Cardiology, Neurology, etc. on its own is
+        # NOT, by itself, evidence that a COE recommendation was owed. A
+        # specialty mention may still be reported for supporting/referral
+        # context (see canonical_specialty/specialty_evidence below), but
+        # it never sets patient_eligible.
         patient_eligible = any(
-            s in ctx["context_sources"] for s in ("campaign", "patient_complaint", "patient_specialty")
+            s in ctx["context_sources"] for s in ("campaign", "patient_complaint")
         )
         if has_actionable_mapped_service:
             service_alignment_status = "pass"
@@ -2806,38 +2953,17 @@ def build_coe_evaluations(
             (s for s in ctx["specialties"] if s.get("speaker") == "patient"), None
         )
         complaint_detail = ctx["complaint_details"][0] if ctx["complaint_details"] else None
-        # Bare organ/clinic words are inherently shared vocabulary between
-        # the specialty registry and the complaint registry (e.g. "الكبد"
-        # alone is a GIT specialty alias, and "أمراض الجهاز الهضمي" is
-        # BOTH a GIT alias AND an approved digestive_disease complaint) —
-        # a patient's own specialty mention is only a genuine Route A
-        # "direct specialty/service REQUEST" when its OWN evidence
-        # actually shows active booking intent ("ابغى دكتور..."/"ابغى
-        # موعد..."); a purely descriptive "عندي [specialty name]"
-        # statement, with no request language at all, is a diagnosis
-        # statement (Route B) even though the specialty word appears in
-        # it — never labelled Route A merely because the same word also
-        # happens to be a specialty alias.
-        specialty_is_genuine_request = bool(
-            patient_specialty_entry
-            and _patient_turn_has_booking_intent(patient_specialty_entry.get("verbatim_evidence") or "")
-        )
-        has_patient_specialty = (
-            "patient_specialty" in ctx["context_sources"] and patient_specialty_entry and specialty_is_genuine_request
-        )
+        # Only two routes can ever establish eligibility now — an approved
+        # complaint/diagnosis category (COE_RECOMMENDATION_TRIGGERS) or the
+        # campaign entry point itself. A bare "patient_specialty" mention
+        # (Dental, Ophthalmology, ENT, Cardiology, Neurology alone, etc.)
+        # is REMOVED as an eligibility route per the confirmed business
+        # rule — it is reported below only as supporting/referral
+        # reference data (canonical_specialty/specialty_evidence), never
+        # as the reason a recommendation was required.
         has_patient_complaint = "patient_complaint" in ctx["context_sources"] and complaint_detail
-        if has_patient_specialty:
-            eligibility_source = "patient_specialty_booking_intent"
-        elif has_patient_complaint:
+        if has_patient_complaint:
             eligibility_source = "patient_approved_complaint"
-        elif "patient_specialty" in ctx["context_sources"] and patient_specialty_entry:
-            # A specialty mention with no booking-intent language of its
-            # own and no approved complaint either — still worth labelling
-            # as the specialty route for reporting purposes (it did
-            # contribute a specialty match), just not treated as a
-            # "genuine request" tie-break winner over an approved
-            # complaint above.
-            eligibility_source = "patient_specialty_booking_intent"
         elif campaign_coe:
             eligibility_source = "campaign_origin"
         else:

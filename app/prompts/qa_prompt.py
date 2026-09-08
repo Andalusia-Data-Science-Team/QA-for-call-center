@@ -919,6 +919,63 @@ You are extracting facts about a Center of Excellence (COE) discussion in a call
 transcript — nothing else. A deterministic check already confirmed this call DOES contain a
 genuine COE/specialized-center discussion (reason below); do not re-decide that.
 
+## CLASSIFY THE PATIENT'S INTENT BEFORE CLASSIFYING MEDICAL TERMS (critical — do this FIRST)
+First determine whether each distinct patient request concerns:
+- An active complaint or diagnosis.
+- A doctor/specialty appointment.
+- A COE package or service.
+- A new diagnostic test (a test the patient wants to HAVE DONE — still not itself a COE
+  recommendation requirement on its own; see below).
+- Retrieval of an already completed test, image, or report (a PAST result the patient wants
+  to VIEW/DOWNLOAD/RECEIVE).
+- A non-clinical administrative request.
+
+Do NOT interpret a laboratory or radiology TEST NAME as a diagnosis or a specialty. A test
+name (e.g. "سكر تراكمي"/HbA1c, "كوليسترول", CBC, "وظائف كبد", "أشعة مقطعية", "رنين مغناطيسي")
+describes an INVESTIGATION, never a disease, complaint, or specialty by itself — no matter how
+strongly that test is normally ASSOCIATED with a given specialty in general medical knowledge.
+
+If the patient is asking to retrieve, view, download, receive, or locate an ALREADY COMPLETED
+lab result, radiology result, medical report, or image — rather than asking to book, request,
+or discuss ongoing/new care — mark that request:
+    intent_type = "completed_diagnostic_results_inquiry"
+    coe_eligible = false
+This is true even when the test name mentioned is normally connected to a COE specialty (e.g.
+a blood-sugar test connects to Diabetes, a liver-function test connects to IBD) — asking for
+the RESULT of a test already done is never itself a booking/complaint/specialty request. A
+short, verb-less follow-up naming another test right after such a request (e.g. "وكوليسترول"
+right after "اريد اخر تحليل سكر تراكمي") is part of the SAME results-retrieval request, not a
+new, separate need.
+
+Worked example:
+- "اريد اخر تحليل سكر تراكمي" is a request for an EXISTING lab result (a completed HbA1c
+  test) — it is NOT a Diabetes appointment/booking request, even though "سكر" is a word also
+  used for the Diabetes specialty.
+- "وكوليسترول" immediately after it continues the SAME lab-result request — it is not a
+  separate IBD/Nutrition/Cardiology request.
+- An agent response directing the patient to retrieve results from the mobile application
+  (e.g. "يمكنك الحصول عليها من خلال التطبيق") is an ordinary administrative answer — it is
+  NEVER a COE recommendation, and never satisfies the human-agent recommendation requirement
+  for any COE.
+- By contrast, "أنا مريض سكر وأريد أحجز عيادة السكر" IS an active diagnosis + explicit
+  booking request — Diabetes COE eligibility DOES apply there.
+
+A NEW test request with no accompanying diagnosis, complaint, or specialty/doctor booking
+(e.g. "اريد اعمل تحليل سكر", "عايز أحجز أشعة") is ALSO not, by itself, enough to require a COE
+recommendation — a diagnostic test alone is not a specialty or COE booking, whether it is a
+request for a NEW test or for an OLD result.
+
+Do not let this exclusion swallow a genuinely separate, independently active need stated
+elsewhere in the same call — e.g. "أريد نتيجة التحليل السابق وبعدها أريد أحجز عيادة السكر"
+has TWO distinct requests: exclude the results-retrieval part, but the explicit Diabetes
+booking request that follows remains fully eligible on its own.
+
+Do not exclude genuine COE conversations merely because an investigation is mentioned as part
+of an active package/journey — e.g. "هل باقة الصداع تشمل الأشعة؟" or "برنامج مركز التميز
+للصداع يشمل الأشعة المقطعية" are asking about what an ACTIVE Headache COE package includes;
+the radiology mention there is supporting context, not a completed-results retrieval, and it
+does not replace or cancel the active Headache COE intent.
+
 ## SPEAKER ATTRIBUTION (critical)
 Only what the AGENT (human call-center employee) says counts as a recommendation,
 confirmation, offer, or booking action. Never treat something the CUSTOMER/PATIENT says as if
@@ -954,7 +1011,7 @@ This call's trigger path is: {trigger_path or "(not available)"}
       appointment, extract that doctor even though the agent never repeats the COE name.
 
 ## REFERENCE DATA IS NOT TRANSCRIPT EVIDENCE (critical)
-The SUPPORTED COE REFERENCE section below lists the four categories this system CAN
+The SUPPORTING/REFERRAL REFERENCE section below lists the four categories this system CAN
 recognise and their approved scripts — it describes what is POSSIBLE, not what happened on
 this call. Do not select IBD, Asthma, Diabetes, or Headache for primary_complaint_category,
 campaign_coe, or recommended_coe merely because that COE's name or script text appears in the
@@ -1028,6 +1085,73 @@ COE make you think a doctor discussed under a DIFFERENT COE is also fine:
 - Never return a generic procedural or referral phrase (e.g. "تحويل", "تحويل طبي", "استشارة",
   "موعد", "التحويل بعد ذلك") as if it were a doctor's personal name — if no actual personal
   name is present, omit that mention rather than inventing a name from the surrounding words.
+- Multiple COEs are ONLY genuinely present when there are at least TWO independently eligible
+  patient needs that resolve to at least TWO DISTINCT canonical specialties belonging to at
+  least TWO DISTINCT COEs. Two DIFFERENT specialties that both belong to the SAME COE (e.g.
+  Ophthalmology and Cardiology, both under Headache) are still only ONE COE context — merge
+  them, never report two. Do not create a second COE context merely because a second medical
+  keyword appears somewhere in the call.
+
+## STRICT COE RECOMMENDATION ELIGIBILITY (critical — read before coe_eligible)
+A patient requesting or being offered a specialty/doctor that is merely ASSOCIATED with a COE
+(as a supporting, referral, or package specialty) is NOT, by itself, evidence that a COE
+recommendation was owed. Only an approved diagnosis/complaint category, an explicit COE
+campaign/post with a real COE identifier, or explicit patient/agent COE discussion may make
+coe_eligible=true. In particular, the following specialties/requests must NEVER, on their own,
+require their associated COE's recommendation:
+- Dental/أسنان, Neurology alone/مخ واعصاب alone, Ophthalmology/عيون, ENT/أنف وأذن وحنجرة,
+  Cardiology/قلب, and Psychiatry/طب نفسي do NOT require the Headache COE.
+- Nutrition/تغذية علاجية and General Surgery/جراحة عامة alone do NOT require the IBD COE.
+- Pulmonology/صدرية alone, ENT, generic Allergy/حساسية with no chest/respiratory context, and
+  Immunology alone do NOT require the Asthma COE.
+- Diabetic Educator/مثقف سكري alone and Orthopedics/عظام do NOT require the Diabetes COE.
+A specialty from this list may still appear as SUPPORTING/REFERRAL context inside a COE
+context that is ALREADY established by a genuine approved complaint or explicit COE
+discussion elsewhere in the same call — it simply can never be the SOLE reason coe_eligible is
+true. When a specialty/doctor request like this is the ONLY thing the patient said, with no
+approved complaint and no COE/campaign language anywhere in the call, mark that intent
+coe_eligible=false, even though it maps to a COE in the reference data below.
+
+## STRUCTURED INTENT OUTPUT (produce this before any COE context)
+For every distinct patient request in the call, classify its intent BEFORE deciding whether it
+is COE-eligible. Return a "patient_intents" list, then a "coe_contexts" list built ONLY from
+the intents you marked coe_eligible=true:
+```json
+{{
+  "patient_intents": [
+    {{
+      "intent_type": "completed_diagnostic_results_inquiry",
+      "evidence": "اريد اخر تحليل سكر تراكمي",
+      "active_booking_intent": false,
+      "coe_eligible": false,
+      "canonical_specialty": null,
+      "candidate_coes": []
+    }}
+  ],
+  "coe_contexts": []
+}}
+```
+`intent_type` is one of: "active_complaint_or_diagnosis", "specialty_or_doctor_appointment",
+"coe_package_or_service", "new_diagnostic_test_request", "completed_diagnostic_results_inquiry",
+"administrative_request".
+
+Explicitly:
+- Do not infer Diabetes from an HbA1c/blood-sugar test name alone.
+- Do not infer IBD, Nutrition, or Cardiology from a cholesterol test name alone.
+- Do not treat an agent's app-download/results-retrieval response as a COE recommendation for
+  any COE.
+- Do not generate multiple COE contexts from multiple test names in a results-retrieval
+  request — a results inquiry produces ZERO coe_contexts, regardless of how many test names it
+  lists.
+- The SUPPORTING/REFERRAL REFERENCE section and any CRM record are classification references
+  describing what is POSSIBLE — never transcript evidence that something was actually said.
+- Only intents you marked coe_eligible=true may produce a coe_context.
+- Every coe_context you return must cite its own patient-side evidence (a verbatim excerpt),
+  never evidence borrowed from a different intent or a different COE.
+- A multi-context output (more than one entry in coe_contexts) requires at least two
+  DISTINCT eligible canonical specialties belonging to at least two DISTINCT COEs — never
+  produce two contexts for the same COE, and never produce two contexts merely because two
+  test names or two keywords appeared.
 
 ## RULES
 - Never invent a complaint, COE, or doctor name that is not actually present in the transcript.
@@ -1045,7 +1169,10 @@ WHY THIS CALL TRIGGERED COE VALIDATION
 {trigger_reason or "(not available)"}
 
 ════════════════════════════════════════════════════════════
-SUPPORTED COE REFERENCE (first clinic + approved script per COE — context only)
+SUPPORTING/REFERRAL REFERENCE — NOT COE RECOMMENDATION ELIGIBILITY
+(first clinic + approved script + any CRM specialty/member data per COE — context only; see
+STRICT COE RECOMMENDATION ELIGIBILITY above. Nothing in this section, including a specialty
+or doctor name it lists, may by itself make an intent coe_eligible or ground a coe_context.)
 ════════════════════════════════════════════════════════════
 {coe_reference or "(not available)"}
 
