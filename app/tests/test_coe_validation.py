@@ -22,14 +22,21 @@ import pytest
 from app.models.input import CallTranscript
 from app.service_hub.coe_validation import (
     AUTHORITATIVE_PRIMARY_DOCTORS,
+    COE_COMPLAINTS,
+    COE_KEYS,
     COE_SPECIALTIES,
     DEFAULT_SCRIPTS_AR,
+    resolve_approved_complaint,
     PRIMARY_DOCTOR_ALIASES,
     SPECIALTY_ALIASES,
+    SPECIALTY_REGISTRY,
     SPECIALTY_TO_COES,
     WEAK_SPECIALTY_ALIASES,
     _agent_turn_supports_category,
+    _norm,
     ambiguous_specialty_mentions,
+    is_primary_specialty_for_coe,
+    is_supporting_specialty_for_coe,
     build_coe_contexts,
     build_coe_evaluations,
     build_coe_reference,
@@ -52,6 +59,7 @@ from app.service_hub.coe_validation import (
     resolve_primary_doctor_identity,
     resolve_recommended_coe,
     resolve_specialty_coes,
+    specialty_evidence_is_grounded,
     unassociated_initial_doctors,
 )
 from app.agent.nodes import infer_coe_validation, skip_coe_validation
@@ -717,23 +725,32 @@ def test_ambiguous_doctor_to_coe_association_is_uncertain_not_guessed():
 
 
 def test_passing_context_does_not_hide_a_failing_context():
-    """Item 13 — a passing Headache context must not hide a failing IBD
-    context in the aggregate result.
+    """Item 13 — an unapproved IBD doctor's failure is never hidden by
+    anything happening in the separate Headache context.
 
     Uses a genuinely unapproved IBD doctor name — "داليندا عرفاوي" is now
     a recognised alias of the approved IBD doctor "Dalinda" (see
     PRIMARY_DOCTOR_ALIASES) and would legitimately pass, which is not what
-    this test is checking."""
+    this test is checking.
+
+    Under the missed-COE-recommendation business rule, Headache ALSO now
+    legitimately violates here (its own booking — "بيكون كشفية اون لاين
+    مع دكتور عمر أيوب" — is an ordinary appointment with no actual COE
+    recommendation, an approved doctor notwithstanding) — this does not
+    weaken the test's point: IBD's own doctor-approval failure is
+    independently, correctly reported (primary_doctor_status=fail) and
+    never hidden or reclassified because of anything happening in the
+    separate Headache context."""
     transcript = (
         MAHMOUD_ELHORANY_REGRESSION_TRANSCRIPT.replace("محمود الحوراني", "عمر أيوب")
         + "\nAgent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في علاج أمراض الجهاز الهضمي مع دكتور سالم الغامدي"
     )
     result, stub = run_coe_node(transcript)
     by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
-    assert by_coe["Headache"]["is_violation"] is False
+    assert by_coe["Headache"]["primary_doctor_status"] == "pass"
+    assert by_coe["IBD"]["primary_doctor_status"] == "fail"
     assert by_coe["IBD"]["is_violation"] is True
     assert result["is_violation"] is True
-    assert result["overall_coe_status"] == "fail"
     assert result["overall_coe_status"] == "fail"
 
 
@@ -1257,14 +1274,31 @@ def test_faithful_paraphrase_recommendation_accepted():
 
 
 def test_multiple_complaints_no_clear_primary_is_uncertain_not_fabricated_fail():
-    """Item 18 (node-level) — uncertain, not a fabricated failure."""
+    """Item 18 (node-level) — the legacy scalar coe_match_status is
+    genuinely "uncertain" (no single primary complaint can be established
+    between Headache and Diabetes).
+
+    SUPERSEDED for is_violation by the missed-COE-recommendation business
+    rule, and FURTHER REFINED by the restricted-complaint-registry work:
+    bare "صداع" (general head pain, with no approved Headache category
+    qualifier such as migraine/tension/chronic/sinus) no longer counts as
+    patient-side eligibility for Headache on its own — so the agent's
+    Headache recommendation now has NO patient-approved-complaint basis
+    of its own, while the patient's clearly-stated, APPROVED Diabetes
+    complaint ("السكر") goes unaddressed. This is exactly the
+    unjustified-substitution pattern recommendation_status=wrong_coe
+    exists to capture (see evaluate_context_doctors' sibling logic in
+    build_coe_evaluations) — a real, grounded finding, not a fabricated
+    one, so is_violation is genuinely True either way."""
     transcript = (
         "Patient: عندي صداع وعندي كمان مشاكل في السكر\n"
         "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع"
     )
     result, stub = run_coe_node(transcript)
     assert result["coe_match_status"] == "uncertain"
-    assert result["is_violation"] is False
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Diabetes"]["recommendation_status"] == "wrong_coe"
+    assert result["is_violation"] is True
 
 
 def test_coe_discussed_but_no_doctor_selection_is_not_applicable_for_doctor_check():
@@ -1844,6 +1878,22 @@ _TAXONOMY_REGRESSION_TRANSCRIPT = (
     "Agent: تم تأكيد حجزك مع داليندا عرفاوي استشاري امراض الجهاز الهضمي والكبد والمناظير\n"
 )
 
+# A variant of the same conversation where the agent ALSO explicitly
+# recommends/explains the IBD COE for the second (GIT) need — unlike
+# _TAXONOMY_REGRESSION_TRANSCRIPT (which, per the missed-COE-recommendation
+# business rule, now correctly reports IBD as a MISSED recommendation),
+# this variant genuinely has both contexts pass, used by tests that need a
+# real "both agent-engaged contexts pass" fixture.
+_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT = (
+    "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+    "Patient: ابغى احجز باقة الصداع\n"
+    "Agent: برنامج مركز التميز للصداع، هيبدأ الحجز في عيادة المخ والاعصاب مع دكتور اسامة عبدالسلام\n"
+    "Patient: تمام موافقه على اسامه\n"
+    "Patient: وبعده بدي جهاز هضمي\n"
+    "Agent: تمام هنرشحلك برنامج مركز التميز المتخصص في علاج امراض الجهاز الهضمي\n"
+    "Agent: تم تأكيد حجزك مع داليندا عرفاوي استشاري امراض الجهاز الهضمي والكبد والمناظير\n"
+)
+
 
 def test_regression_produces_exactly_two_contexts():
     """Item 44 — the exact consolidated-prompt regression conversation
@@ -1881,14 +1931,20 @@ def test_regression_no_false_doctor_candidates_leak_into_either_context():
         assert bad_name not in all_names
 
 
-def test_regression_via_full_node_path_overall_status_pass():
+def test_regression_via_full_node_path_reports_missed_ibd_recommendation():
     """Item 48 — run through the real infer_coe_validation node (not just
-    the pure builder functions) and confirm the aggregate outcome is a
-    clean pass with no violation."""
+    the pure builder functions).
+
+    Superseded by the missed-COE-recommendation business rule: the agent
+    never explicitly recommends/explains the IBD COE in this transcript
+    (only a Headache campaign + explicit Headache recommendation, then an
+    ORDINARY GIT appointment) — so the aggregate outcome is now correctly
+    a fail (IBD's missed recommendation), not a clean pass."""
     result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
-    assert result["overall_coe_status"] == "pass"
-    assert result["is_violation"] is False
+    assert result["overall_coe_status"] == "fail"
+    assert result["is_violation"] is True
     assert {e["coe"] for e in result["coe_evaluations"]} == {"Headache", "IBD"}
+    assert result["missed_recommendation_coes"] == ["IBD"]
 
 
 def test_regression_evaluations_carry_specialties_for_logging():
@@ -1899,6 +1955,1447 @@ def test_regression_evaluations_carry_specialties_for_logging():
     for e in evaluations:
         specialty_names = [s["canonical_specialty"] for s in e["specialties"]]
         assert specialty_names, f"{e['coe']} context must carry at least one specialty"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 10 — multi-context aggregation is authoritative over legacy
+# scalars; explicit-recommendation/service-alignment separation; specialty
+# grounding safeguards (see the consolidated-prompt aggregation fix).
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_multi_context_aggregation_ignores_obsolete_global_scalar_comparison():
+    """Item 1 — the legacy global expected_coe/recommended_coe comparison
+    (which previously compared Headache's OWN complaint against a
+    completely different, later IBD-context mention) must never drive the
+    result once two agent-engaged contexts exist; the ambiguous scalars
+    are excluded (None), not fabricated from cross-context data."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    assert result["expected_coe"] is None
+    assert result["recommended_coe"] is None
+    assert result["validation_coe"] is None
+    assert result["coe_match_status"] is None
+
+
+def test_headache_and_ibd_contexts_both_pass_independently():
+    """Item 2 — Headache and IBD each pass on their own terms when the
+    agent explicitly recommends/explains BOTH COEs (see the missed-COE-
+    recommendation business rule — _BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT
+    is used here rather than _TAXONOMY_REGRESSION_TRANSCRIPT, whose IBD
+    context now correctly reports a missed recommendation instead)."""
+    result, stub = run_coe_node(_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT)
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Headache"]["primary_doctor_status"] == "pass"
+    assert by_coe["Headache"]["is_violation"] is False
+    assert by_coe["IBD"]["primary_doctor_status"] == "pass"
+    assert by_coe["IBD"]["is_violation"] is False
+
+
+def test_global_expected_cannot_be_compared_against_another_contexts_value():
+    """Item 3 — a global expected=Headache is never compared against a
+    DIFFERENT context's IBD value; both contexts are independently
+    represented in coe_evaluations instead of being collapsed into one
+    cross-context scalar comparison."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    assert {e["coe"] for e in result["coe_evaluations"]} == {"Headache", "IBD"}
+    assert result["expected_coe"] is None  # never fabricated from either context alone
+
+
+def test_is_violation_false_when_every_grounded_context_has_no_violation():
+    """Item 4 — is_violation is computed purely from coe_evaluations (here,
+    using the both-explicitly-recommended fixture, since a missed COE
+    recommendation is now itself a real per-context violation)."""
+    result, stub = run_coe_node(_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT)
+    assert all(not e["is_violation"] for e in result["coe_evaluations"])
+    assert result["is_violation"] is False
+
+
+def test_overall_pass_when_applicable_checks_pass_and_others_not_applicable():
+    """Item 5 — overall=pass when every applicable check passes."""
+    result, stub = run_coe_node(_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT)
+    assert result["overall_coe_status"] == "pass"
+
+
+def test_ibd_service_alignment_pass_while_recommendation_missed():
+    """Item 6 — SUPERSEDED: an actionable mapped-service response alone is
+    no longer sufficient COE confirmation (see the missed-COE-
+    recommendation business rule). IBD's service_alignment_status still
+    passes (the service itself WAS handled correctly) but
+    recommendation_status/coe_match_status now correctly report "missed"
+    since no agent turn ever recommended/explained the IBD COE itself —
+    this is the exact business scenario the new rule exists to catch."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["service_alignment_status"] == "pass"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["coe_match_status"] == "missed"
+    assert by_coe["IBD"]["explicit_agent_recommended"] is False
+    assert by_coe["IBD"]["explicit_coe_recommendation_status"] == "not_applicable"
+    assert by_coe["IBD"]["missed_recommendation"] is True
+    assert by_coe["IBD"]["is_violation"] is True
+
+
+def test_missing_explicit_recommendation_produces_a_missed_finding():
+    """Item 7 — SUPERSEDED: a not_applicable explicit-recommendation check
+    together with passing service-alignment/primary-doctor checks used to
+    read as an overall pass; the new missed-COE-recommendation rule
+    correctly turns this into a real violation instead, since the human
+    agent never actually recommended the COE the patient's need mapped
+    to."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["explicit_coe_recommendation_status"] == "not_applicable"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["primary_doctor_status"] == "pass"
+    assert by_coe["IBD"]["is_violation"] is True
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    assert result["overall_coe_status"] == "fail"
+
+
+def test_only_neurology_retained_for_headache_context():
+    """Item 8 — only Neurology is retained for the Headache context in
+    this transcript (no hallucinated Ophthalmology/Cardiology)."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    specialties = {s["canonical_specialty"] for s in by_coe["Headache"]["specialties"]}
+    assert specialties == {"Neurology"}
+
+
+def test_ophthalmology_and_cardiology_rejected_without_transcript_evidence():
+    """Item 9 — Ophthalmology/Cardiology are never retained unless their
+    OWN alias words are actually present in the transcript."""
+    assert specialty_evidence_is_grounded("Ophthalmology", "المخ والاعصاب", _TAXONOMY_REGRESSION_TRANSCRIPT) is False
+    assert specialty_evidence_is_grounded("Cardiology", "المخ والاعصاب", _TAXONOMY_REGRESSION_TRANSCRIPT) is False
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    specialties = {s["canonical_specialty"] for s in by_coe["Headache"]["specialties"]}
+    assert "Ophthalmology" not in specialties
+    assert "Cardiology" not in specialties
+
+
+def test_only_git_retained_for_ibd_context():
+    """Item 10 — only GIT is retained for the IBD context in this
+    transcript."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    specialties = {s["canonical_specialty"] for s in by_coe["IBD"]["specialties"]}
+    assert specialties == {"GIT"}
+
+
+def test_taxonomy_reference_content_cannot_become_transcript_evidence():
+    """Item 11 — a specialty name that exists only in COE_SPECIALTIES/the
+    CRM reference block (never actually said in the transcript) is never
+    accepted as grounded evidence."""
+    assert specialty_evidence_is_grounded("Psychiatry", "طب نفسي", "Agent: تمام\nPatient: تمام") is False
+    transcript = "Patient: عندي اسعار الكشف العادي\nAgent: الكشف بـ 300 ريال"
+    assert build_coe_contexts(call(transcript), scripts=DEFAULT_SCRIPTS_AR) == {}
+
+
+def test_every_retained_specialty_has_grounded_verbatim_evidence():
+    """Item 12 — every specialties[] entry surviving into a context
+    carries evidence that is (a) a real transcript substring and (b)
+    independently re-confirmed by the deterministic specialty
+    detectors."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    for e in evaluations:
+        for s in e["specialties"]:
+            assert specialty_evidence_is_grounded(s["canonical_specialty"], s["evidence"], _TAXONOMY_REGRESSION_TRANSCRIPT)
+
+
+def test_osama_remains_associated_only_with_headache_and_passes():
+    """Item 13 — Osama Abdel Salam is associated only with Headache."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["doctors"][0]["canonical_name"] == "Osama Abdel Salam"
+    assert by_coe["Headache"]["doctors"][0]["primary_doctor_status"] == "pass"
+    assert all(d["canonical_name"] != "Osama Abdel Salam" for d in by_coe["IBD"]["doctors"])
+
+
+def test_dalinda_remains_associated_only_with_ibd_and_passes():
+    """Item 14 — Dalinda is associated only with IBD."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["doctors"][0]["canonical_name"] == "Dalinda"
+    assert by_coe["IBD"]["doctors"][0]["primary_doctor_status"] == "pass"
+    assert all(d["canonical_name"] != "Dalinda" for d in by_coe["Headache"]["doctors"])
+
+
+def test_single_context_legacy_scalar_output_remains_compatible():
+    """Item 15 — a genuinely single-COE call (or one with only ONE
+    agent-engaged context) keeps its EXACT pre-existing scalar-field
+    behaviour — the new authoritative multi-context override never
+    activates."""
+    transcript = (
+        "Patient: عندي اسهال مزمن وآلام في الجهاز الهضمي من فترة طويلة\n"
+        "Agent: لضمان تحقيق أقصى استفادة، سيتم حجز موعد لحضرتك بمركز التميز المتخصص في "
+        "علاج أمراض الجهاز الهضمي مع Dr. Dalinda"
+    )
+    result, stub = run_coe_node(transcript)
+    assert result["expected_coe"] == "IBD"
+    assert result["recommended_coe"] == "IBD"
+    assert result["validation_coe"] == "IBD"
+    assert result["coe_match_status"] == "pass"
+    assert result["primary_doctor_status"] == "pass"
+    assert result["is_violation"] is False
+    assert result["validated_coes"] == ["IBD"]
+
+
+def test_definite_failure_in_either_context_still_fails_the_aggregate():
+    """Item 16 — a genuine, definite doctor-approval failure in EITHER
+    context still makes the aggregate fail, even with two agent-engaged
+    contexts present."""
+    transcript = (
+        "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+        "Patient: عندي صداع مزمن\n"
+        "Agent: هيبدأ الحجز بعيادة المخ والاعصاب مع دكتور اسامة عبدالسلام\n"
+        "Patient: وبعده عايز جهاز هضمي\n"
+        "Agent: تمام هحولك لعيادة الجهاز الهضمي مع دكتور فلان الفلاني\n"
+    )
+    result, stub = run_coe_node(transcript)
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Headache"]["is_violation"] is False
+    assert by_coe["IBD"]["is_violation"] is True
+    assert result["is_violation"] is True
+    assert result["overall_coe_status"] == "fail"
+
+
+def test_diabetes_complaint_but_unrelated_agent_recommendation_still_fails():
+    """A patient's SOLE, unambiguous complaint being ignored in favour of
+    a totally unprompted agent recommendation for a different COE is a
+    real mismatch — the multi-context override must not swallow it just
+    because the deterministic builder also created a complaint-only
+    context for the patient's own topic (see the module comment on
+    is_multi_context in infer_coe_validation)."""
+    transcript = (
+        "Patient: عندي مرض السكر وعايز اتابع حالتي\n"
+        "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع"
+    )
+    result, stub = run_coe_node(transcript)
+    assert result["coe_match_status"] == "fail"
+    assert result["is_violation"] is True
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 11 — legitimately not_applicable checks must never read as
+# "uncertain" in aggregation; chronological (first-evidence) context
+# ordering; specialty-grounding regression coverage.
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_not_applicable_explicit_recommendation_field_does_not_itself_punish():
+    """Item 1 — explicit_coe_recommendation_status=not_applicable is not,
+    on its own, a punitive signal — IBD's service_alignment_status still
+    passes here. (Per the missed-COE-recommendation business rule, this
+    context's overall recommendation_status is now correctly "missed",
+    which IS a real, separately-tracked violation — see
+    test_missing_explicit_recommendation_produces_a_missed_finding.)"""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["explicit_coe_recommendation_status"] == "not_applicable"
+    assert by_coe["IBD"]["service_alignment_status"] == "pass"
+
+
+def test_service_derived_ibd_context_with_passing_checks_still_flags_missed_recommendation():
+    """Item 2 — SUPERSEDED: a service-derived IBD context whose service_
+    alignment and doctor checks both pass is NOT, on its own, a fully
+    passing context anymore — the missed-COE-recommendation rule still
+    requires an actual agent recommendation, so this context correctly
+    reports a violation via recommendation_status=missed."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    ibd = by_coe["IBD"]
+    assert ibd["service_alignment_status"] == "pass"
+    assert ibd["primary_doctor_status"] == "pass"
+    assert ibd["recommendation_status"] == "missed"
+    assert ibd["is_violation"] is True
+
+
+def test_two_passing_contexts_produce_overall_pass():
+    """Item 3 — Headache and IBD both passing (both explicitly
+    recommended) yields overall=pass."""
+    result, stub = run_coe_node(_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT)
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Headache"]["is_violation"] is False
+    assert by_coe["IBD"]["is_violation"] is False
+    assert result["overall_coe_status"] == "pass"
+
+
+def test_is_violation_false_when_both_contexts_explicitly_recommended():
+    """Item 4 — is_violation stays False when every context is genuinely
+    addressed (both explicitly recommended here)."""
+    result, stub = run_coe_node(_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT)
+    assert result["is_violation"] is False
+
+
+def test_ophthalmology_rejected_when_only_in_llm_response_or_taxonomy():
+    """Item 5 — an Ophthalmology claim sourced only from the LLM's own
+    output or from the COE_SPECIALTIES/CRM taxonomy (never independently
+    supported by a transcript excerpt) is rejected outright."""
+    # "Ophthalmology" is a real, valid taxonomy entry for Headache — that
+    # alone must never be enough (see COE_SPECIALTIES/SPECIALTY_ALIASES).
+    assert "Ophthalmology" in COE_SPECIALTIES["Headache"]
+    # An LLM-produced claim citing evidence that isn't genuinely about
+    # ophthalmology (here, the actual Neurology excerpt) is rejected.
+    assert specialty_evidence_is_grounded("Ophthalmology", "المخ والاعصاب", _TAXONOMY_REGRESSION_TRANSCRIPT) is False
+    # A claim citing evidence that was never said at all is rejected too.
+    assert specialty_evidence_is_grounded("Ophthalmology", "طب العيون", _TAXONOMY_REGRESSION_TRANSCRIPT) is False
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    specialties = {s["canonical_specialty"] for s in by_coe["Headache"]["specialties"]}
+    assert specialties == {"Neurology"}
+    assert "Ophthalmology" not in specialties
+
+
+def test_neurology_retained_from_al_mukh_wal_aasab_evidence():
+    """Item 6 — "المخ والاعصاب" ("brain and nerves") independently grounds
+    Neurology via the deterministic resolver."""
+    assert resolve_canonical_specialty("المخ والاعصاب") == "Neurology"
+    assert specialty_evidence_is_grounded("Neurology", "المخ والاعصاب", _TAXONOMY_REGRESSION_TRANSCRIPT) is True
+
+
+def test_every_retained_specialty_has_exact_grounded_transcript_evidence():
+    """Item 7 — every specialty surviving into either context is backed by
+    a verbatim, independently-reconfirmed transcript excerpt."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    assert evaluations, "expected at least one grounded context"
+    for e in evaluations:
+        assert e["specialties"], f"{e['coe']} must retain at least one specialty"
+        for s in e["specialties"]:
+            assert specialty_evidence_is_grounded(s["canonical_specialty"], s["evidence"], _TAXONOMY_REGRESSION_TRANSCRIPT)
+
+
+def test_contexts_appear_in_first_evidence_chronological_order():
+    """Item 8 — Headache (campaign + first booking) is grounded before IBD
+    (raised later, after the "وبعده" topic change), and coe_evaluations/
+    validated_coes must reflect that chronological order, never COE_KEYS'
+    fixed alphabetical-ish declaration order (which would put IBD first)."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    assert [e["coe"] for e in evaluations] == ["Headache", "IBD"]
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    assert result["validated_coes"] == ["Headache", "IBD"]
+    assert [e["coe"] for e in result["coe_evaluations"]] == ["Headache", "IBD"]
+
+
+def test_final_regression_output_matches_exactly():
+    """Item 9 — SUPERSEDED by the missed-COE-recommendation business rule:
+    the consolidated-prompt regression conversation now correctly reports
+    a missed IBD recommendation (the agent only ever booked an ordinary
+    GIT appointment, never recommending/explaining the IBD COE), while
+    the specialty grounding and doctor approvals remain exactly correct."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+
+    assert list(by_coe) == ["Headache", "IBD"]
+
+    assert [s["canonical_specialty"] for s in by_coe["Headache"]["specialties"]] == ["Neurology"]
+    assert by_coe["Headache"]["primary_doctor_status"] == "pass"
+    assert by_coe["Headache"]["recommendation_status"] == "pass"
+
+    assert {s["canonical_specialty"] for s in by_coe["IBD"]["specialties"]} == {"GIT"}
+    assert by_coe["IBD"]["primary_doctor_status"] == "pass"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["missed_recommendation"] is True
+
+    assert result["validated_coes"] == ["Headache", "IBD"]
+    assert result["overall_coe_status"] == "fail"
+    assert result["is_violation"] is True
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 12 — a COE can be confirmed through an actionable, grounded mapped-
+# service response alone, with no requirement to repeat "COE"/"Center of
+# Excellence"/"مركز التميز" (confirmed business rule).
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_git_request_plus_agent_doctor_offer_produces_ibd_service_alignment_pass():
+    """A customer GIT request plus an agent GIT doctor offer produces IBD
+    service_alignment_status=pass."""
+    transcript = "Patient: وبدي جهاز هضمي\nAgent: بخصوص عيادة الجهاز الهضمي متواجد الدكتورة داليندا عرفاوي"
+    evaluations = build_coe_evaluations(call(transcript))
+    assert len(evaluations) == 1
+    assert evaluations[0]["coe"] == "IBD"
+    assert evaluations[0]["service_alignment_status"] == "pass"
+
+
+def test_git_need_plus_ordinary_appointment_without_recommendation_is_missed():
+    """Required test 2 — SUPERSEDED: a confirmed GIT appointment with no
+    actual COE recommendation now correctly produces recommendation_
+    status=missed (not a pass) — the ordinary appointment alone is never
+    enough under the missed-COE-recommendation business rule."""
+    transcript = "Patient: أحتاج كشف قولون\nAgent: تم تأكيد الموعد مع طبيب الجهاز الهضمي"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["service_alignment_status"] == "pass"
+    assert by_coe["IBD"]["is_violation"] is True
+
+
+def test_git_need_plus_explicit_ibd_recommendation_passes():
+    """Required test 3 — a patient GIT need plus an explicit IBD COE
+    recommendation (a faithful paraphrase of the approved script, never
+    literally saying "IBD") produces recommendation_status=pass."""
+    transcript = (
+        "Patient: وبعده بدي جهاز هضمي\n"
+        "Agent: تمام هنرشحلك برنامج مركز التميز المتخصص في علاج امراض الجهاز الهضمي\n"
+        "Agent: تم تأكيد حجزك مع داليندا عرفاوي استشاري امراض الجهاز الهضمي والكبد والمناظير\n"
+    )
+    c = call(transcript)
+    assert "IBD" not in c.transcript.upper().replace("BU-AHJ-COE", "")
+    evaluations = build_coe_evaluations(c)
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["recommendation_status"] == "pass"
+    assert by_coe["IBD"]["human_agent_recommended_coe"] is True
+    assert by_coe["IBD"]["is_violation"] is False
+
+
+def test_explicit_coe_recommendation_status_not_applicable_when_not_named():
+    """explicit_coe_recommendation_status stays not_applicable when the
+    agent never explicitly named the COE, even though coe_match_status
+    itself passes via actionable service alignment."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["explicit_coe_recommendation_status"] == "not_applicable"
+    assert by_coe["IBD"]["explicit_agent_recommended"] is False
+
+
+def test_result_never_falsely_attributes_explicit_ibd_coe_language_to_agent():
+    """The result must never claim the agent explicitly recommended IBD as
+    a COE in this conversation — only Headache was ever explicitly named/
+    confirmed by an actual agent turn."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    assert result["explicit_agent_recommended_coes"] == ["Headache"]
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["IBD"]["explicit_agent_recommended"] is False
+    assert by_coe["IBD"]["explicit_coe_recommendation_status"] == "not_applicable"
+
+
+def test_customer_only_git_mention_without_agent_response_does_not_pass():
+    """A customer-only GIT mention that the agent never substantively
+    engages with does not pass — service alignment is genuinely
+    unresolved, never guessed into a pass."""
+    transcript = (
+        "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+        "Patient: عندي صداع مزمن\n"
+        "Agent: هيبدأ الحجز بعيادة المخ والاعصاب مع دكتور اسامة عبدالسلام\n"
+        "Patient: وبعده بدي جهاز هضمي\n"
+        "Agent: تمام, في اي حاجة تانية احب اساعدك فيها؟\n"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["service_alignment_status"] != "pass"
+    assert by_coe["IBD"]["coe_match_status"] != "pass"
+
+
+def test_incidental_specialty_mention_does_not_automatically_pass():
+    """An agent mentioning a mapped specialty only in passing — with no
+    booking/routing/confirmation action and no doctor named — does not
+    automatically produce a pass."""
+    transcript = (
+        "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+        "Patient: عندي صداع مزمن\n"
+        "Agent: هيبدأ الحجز بعيادة المخ والاعصاب مع دكتور اسامة عبدالسلام\n"
+        "Patient: وبعده بدي جهاز هضمي\n"
+        "Agent: احنا كمان عندنا خدمات تانية للجهاز الهضمي لو حبيت تعرف اكتر بعدين\n"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["service_alignment_status"] != "pass"
+    assert by_coe["IBD"]["coe_match_status"] != "pass"
+
+
+def test_agent_booking_conflicting_coe_service_produces_a_fail():
+    """An agent booking a COE service that conflicts with the customer's
+    own grounded (sole, unambiguous) request produces a fail."""
+    transcript = (
+        "Patient: عندي مرض السكر وعايز اتابع حالتي\n"
+        "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع"
+    )
+    result, stub = run_coe_node(transcript)
+    assert result["coe_match_status"] == "fail"
+    assert result["is_violation"] is True
+
+
+def test_headache_and_ibd_evaluated_independently():
+    """Headache and IBD are evaluated independently — Osama's Headache
+    approval never leaks into IBD's own doctor validation, and vice
+    versa."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["doctors"][0]["canonical_name"] == "Osama Abdel Salam"
+    assert by_coe["IBD"]["doctors"][0]["canonical_name"] == "Dalinda"
+    assert all(d["canonical_name"] != "Dalinda" for d in by_coe["Headache"]["doctors"])
+    assert all(d["canonical_name"] != "Osama Abdel Salam" for d in by_coe["IBD"]["doctors"])
+
+
+def test_headache_and_ibd_both_pass_when_both_explicitly_recommended():
+    """Headache and IBD both pass when the agent explicitly recommends
+    both (see _BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT — the original
+    _TAXONOMY_REGRESSION_TRANSCRIPT's IBD context now correctly reports a
+    missed recommendation instead, per the missed-COE-recommendation
+    business rule)."""
+    evaluations = build_coe_evaluations(call(_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["context_status"] == "pass"
+    assert by_coe["IBD"]["context_status"] == "pass"
+    assert by_coe["Headache"]["is_violation"] is False
+    assert by_coe["IBD"]["is_violation"] is False
+
+
+def test_two_passing_contexts_produce_overall_pass_service_based():
+    """Two passing contexts (both explicitly recommended) produce
+    overall=pass."""
+    result, stub = run_coe_node(_BOTH_EXPLICITLY_RECOMMENDED_TRANSCRIPT)
+    assert result["overall_coe_status"] == "pass"
+    assert result["is_violation"] is False
+
+
+def test_not_applicable_explicit_recommendation_field_does_not_cause_uncertainty():
+    """A not_applicable explicit_coe_recommendation_status is never, on its
+    own, translated into aggregate "uncertain" — it either legitimately
+    resolves to a definite recommendation_status (here: "missed", a real,
+    separately-tracked fail — never a vague "uncertain")."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["explicit_coe_recommendation_status"] == "not_applicable"
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    assert result["overall_coe_status"] != "uncertain"
+
+
+def test_existing_explicit_campaign_and_agent_recommendation_behavior_unchanged():
+    """Existing explicit campaign and agent-recommendation behavior is
+    unchanged by the new actionable-service pathway."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["campaign_coe"] is True
+    assert by_coe["Headache"]["explicit_agent_recommended"] is True
+    assert by_coe["Headache"]["explicit_coe_recommendation_status"] == "pass"
+    assert by_coe["Headache"]["coe_match_status"] == "pass"
+    # Existing single-context legacy scalar behaviour also stays intact.
+    single_context_transcript = (
+        "Patient: عندي اسهال مزمن وآلام في الجهاز الهضمي من فترة طويلة\n"
+        "Agent: لضمان تحقيق أقصى استفادة، سيتم حجز موعد لحضرتك بمركز التميز المتخصص في "
+        "علاج أمراض الجهاز الهضمي مع Dr. Dalinda"
+    )
+    result, stub = run_coe_node(single_context_transcript)
+    assert result["coe_match_status"] == "pass"
+    assert result["expected_coe"] == "IBD"
+    assert result["recommended_coe"] == "IBD"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 13 — missed-COE-recommendation business rule: an actionable mapped-
+# service response alone is NO LONGER sufficient COE confirmation
+# (supersedes the actionable-service-alone-passes rule from Phase 12). The
+# human agent must actually recommend/explain the relevant COE whenever the
+# patient's own diagnosis, complaint, or requested service maps to one.
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_patient_headache_need_plus_agent_headache_recommendation_passes():
+    """Required test 1 — patient Headache need + agent Headache COE
+    recommendation -> pass."""
+    transcript = (
+        "Patient: عندي صداع نصفي شديد جدا من فتره طويلة\n"
+        "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع مع دكتور عمر أيوب"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["recommendation_status"] == "pass"
+    assert by_coe["Headache"]["human_agent_recommended_coe"] is True
+    assert by_coe["Headache"]["is_violation"] is False
+
+
+def test_liver_need_plus_ordinary_appointment_is_ibd_missed():
+    """Required test 4 — patient liver need + ordinary liver appointment
+    -> IBD missed recommendation."""
+    transcript = "Patient: عندي مشكلة في الكبد وعايز احجز كشف\nAgent: تمام هحجزلك كشف عادي عند دكتور الكبد بكرة الساعة 5"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["missed_recommendation"] is True
+    assert by_coe["IBD"]["is_violation"] is True
+
+
+def test_colon_need_plus_explicit_ibd_recommendation_passes():
+    """Required test 5 — patient colon need + explicit IBD COE
+    recommendation -> pass."""
+    transcript = (
+        "Patient: عايز اعمل منظار قولون\n"
+        "Agent: هنرشحلك برنامج مركز التميز المتخصص في علاج امراض الجهاز الهضمي والقولون"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["recommendation_status"] == "pass"
+    assert by_coe["IBD"]["is_violation"] is False
+
+
+def test_respiratory_need_plus_ordinary_pulmonology_booking_is_asthma_missed():
+    """Required test 6 — patient respiratory need + ordinary pulmonology
+    booking -> Asthma missed recommendation."""
+    transcript = "Patient: عندي ضيق في التنفس من فترة\nAgent: تمام هحجزلك عند دكتور الجهاز التنفسي بكرة"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Asthma"]["recommendation_status"] == "missed"
+    assert by_coe["Asthma"]["is_violation"] is True
+
+
+def test_diabetes_need_plus_ordinary_appointment_is_diabetes_missed():
+    """Required test 7 — patient Diabetes need + ordinary diabetes
+    appointment -> Diabetes missed recommendation."""
+    transcript = "Patient: عندي سكري من فترة وعايز اتابع\nAgent: تمام هحجزلك عند دكتور السكري بكرة"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Diabetes"]["recommendation_status"] == "missed"
+    assert by_coe["Diabetes"]["is_violation"] is True
+
+
+def test_campaign_text_alone_does_not_satisfy_human_agent_requirement():
+    """Required test 8 — campaign COE text alone does not satisfy the
+    human-agent recommendation requirement, even though it establishes
+    the patient's COE context."""
+    transcript = (
+        "Patient: BU-AHJ-COE- أضغطي علي إرسال للاستفادة بعروضنا في مركز تميز الصداع\n"
+        "Agent: تمام، هحولك لعيادة المخ والاعصاب"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["campaign_coe"] is True
+    assert by_coe["Headache"]["human_agent_recommended_coe"] is False
+    assert by_coe["Headache"]["recommendation_status"] == "missed"
+    assert by_coe["Headache"]["is_violation"] is True
+
+
+def test_bot_coe_text_does_not_satisfy_human_agent_requirement():
+    """Required test 9 — a Bot-labeled turn's COE wording is never
+    attributed to the human agent (split_transcript_turns drops any
+    speaker label it doesn't recognise as agent/patient)."""
+    transcript = (
+        "Patient: عايز احجز جهاز هضمي\n"
+        "Bot: هنرشحلك برنامج مركز التميز المتخصص في علاج امراض الجهاز الهضمي\n"
+        "Agent: تمام هحجزلك دكتور جهاز هضمي بكرة"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["human_agent_recommended_coe"] is False
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["is_violation"] is True
+
+
+def test_doctor_offer_alone_does_not_satisfy_recommendation_requirement():
+    """Required test 10 — a doctor offer alone (no COE explanation) does
+    not satisfy the recommendation requirement, even though it is enough
+    for service_alignment_status=pass."""
+    transcript = "Patient: وبدي جهاز هضمي\nAgent: بخصوص عيادة الجهاز الهضمي متواجد الدكتورة داليندا عرفاوي"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["service_alignment_status"] == "pass"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["is_violation"] is True
+
+
+def test_mapped_specialty_booking_passes_alignment_while_failing_recommendation():
+    """Required test 11 — a mapped specialty booking can pass service
+    alignment while failing (missing) the recommendation check."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["service_alignment_status"] == "pass"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+
+
+def test_multiple_needs_evaluated_independently_headache_pass_ibd_missed():
+    """Required test 12 — multiple needs (Headache, IBD) are evaluated
+    independently in the supplied regression conversation."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["recommendation_status"] == "pass"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+
+
+def test_passing_context_does_not_hide_another_missed_recommendation():
+    """Required test 13 — a passing Headache context does not hide IBD's
+    missed recommendation in the aggregate."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Headache"]["recommendation_status"] == "pass"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert result["overall_coe_status"] == "fail"
+    assert result["missed_recommendation_coes"] == ["IBD"]
+
+
+def test_wrong_coe_recommendation_produces_wrong_coe():
+    """Required test 14 — the human agent explicitly recommending a
+    DIFFERENT, unjustified COE (with no patient-side basis of its own)
+    while the patient's sole real need goes unaddressed produces
+    recommendation_status=wrong_coe."""
+    transcript = (
+        "Patient: عندي مرض السكر وعايز اتابع حالتي\n"
+        "Agent: سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Diabetes"]["recommendation_status"] == "wrong_coe"
+    assert by_coe["Diabetes"]["is_violation"] is True
+
+
+def test_ambiguous_ent_case_remains_uncertain_and_non_punitive():
+    """Required test 15 — an ambiguous ENT mention (no complaint,
+    campaign, or other context to disambiguate Headache vs. Asthma)
+    produces zero grounded contexts — never a punitive missed/wrong_coe
+    finding for either COE."""
+    transcript = "Patient: عايز احجز عيادة انف واذن وحنجرة\nAgent: تمام هحجزلك بكرة"
+    evaluations = build_coe_evaluations(call(transcript))
+    assert evaluations == []
+    ambiguous = ambiguous_specialty_mentions("عيادة انف واذن وحنجرة")
+    assert ambiguous and ambiguous[0][0] == "ENT"
+
+
+def test_incidental_family_member_complaint_does_not_trigger_requirement():
+    """Required test 16 — a family member's condition, when the patient is
+    booking for something else, does not trigger the recommendation
+    requirement."""
+    transcript = "Patient: امي عندها سكري، بس انا عايز احجز كشف عادي لنفسي\nAgent: تمام هحجزلك بكرة"
+    assert build_coe_evaluations(call(transcript)) == []
+
+
+def test_negated_complaint_does_not_trigger_requirement():
+    """Required test 16 (continued) — a negated complaint does not trigger
+    the recommendation requirement."""
+    transcript = "Patient: مش عندي سكري خالص\nAgent: تمام"
+    assert build_coe_evaluations(call(transcript)) == []
+
+
+def test_unsupported_llm_specialty_mapping_is_rejected():
+    """Required test 17 — an LLM-claimed specialty/COE association with no
+    real, independently-confirmed transcript evidence is rejected (see
+    specialty_evidence_is_grounded and ground_llm_coe_value)."""
+    transcript = "Patient: عايز اعرف اسعار الكشف العادي\nAgent: الكشف العادي بـ 300 ريال"
+    assert ground_llm_coe_value(call(transcript), "IBD") is None
+    assert specialty_evidence_is_grounded("Ophthalmology", "طب العيون", transcript) is False
+    assert build_coe_contexts(call(transcript)) == {}
+
+
+def test_every_retained_finding_contains_grounded_evidence():
+    """Required test 18 — every retained context's patient_need_evidence
+    and specialty evidence are real transcript substrings, and a missed
+    finding's note cites that same grounded evidence."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    for e in evaluations:
+        if e["patient_need_evidence"]:
+            assert _norm(e["patient_need_evidence"]) in _norm(_TAXONOMY_REGRESSION_TRANSCRIPT)
+        for s in e["mapped_specialties"]:
+            assert specialty_evidence_is_grounded(s["canonical_specialty"], s["evidence"], _TAXONOMY_REGRESSION_TRANSCRIPT)
+        if e["missed_recommendation"]:
+            assert e["note"] is not None
+            assert e["patient_need_evidence"] in e["note"]
+
+
+def test_existing_doctor_and_multi_context_behavior_unchanged():
+    """Required test 19 — Osama/Dalinda alias resolution and multi-context
+    isolation are unaffected by the missed-recommendation rule."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["doctors"][0]["canonical_name"] == "Osama Abdel Salam"
+    assert by_coe["Headache"]["doctors"][0]["primary_doctor_status"] == "pass"
+    assert by_coe["IBD"]["doctors"][0]["canonical_name"] == "Dalinda"
+    assert by_coe["IBD"]["doctors"][0]["primary_doctor_status"] == "pass"
+    assert set(by_coe) == {"Headache", "IBD"}
+
+
+def test_supplied_regression_conversation_passes_headache_reports_missed_ibd():
+    """Required test 20 — the supplied Headache+GIT regression conversation
+    passes Headache but reports a missed IBD recommendation."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Headache"]["recommendation_status"] == "pass"
+    assert by_coe["Headache"]["primary_doctor_status"] == "pass"
+    assert by_coe["Headache"]["is_violation"] is False
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["primary_doctor_status"] == "pass"
+    assert by_coe["IBD"]["missed_recommendation"] is True
+    assert by_coe["IBD"]["is_violation"] is True
+    assert by_coe["IBD"]["note"] is not None
+    assert result["overall_coe_status"] == "fail"
+    assert result["is_violation"] is True
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 14 — patient specialty-booking-intent trigger path (no explicit
+# COE mention required); offered-vs-selected/confirmed doctor narrowing.
+#
+# Regression call: a masked test id stands in for the real conversation
+# (41D59D44-369B-F111-9B33-000D3AA9D409) — no raw patient identity numbers
+# appear in this transcript or anywhere in this file (see the shared
+# call() helper's fixed placeholder phone number).
+# ═════════════════════════════════════════════════════════════════════════
+
+_MAHMOUD_BOOKING_INTENT_TRANSCRIPT = (
+    "Patient: السلام عليكم ابغى دكتور مخ واعصاب يوم الخميس\n"
+    "Patient: مين الدكتور الموجود؟\n"
+    "Agent: متاح دكتور اسمة عبدالسلام ودكتور محمود الحوارني\n"
+    "Patient: ابغى موعد مع الدكتور محمود الساعة ٤\n"
+    "Agent: تم تأكيد حجزك مع دكتور محمود الحوراني بعيادة المخ والاعصاب\n"
+)
+
+
+def test_booking_intent_phrase_maps_to_neurology_and_headache():
+    """Required test 1 — "ابغى دكتور مخ واعصاب" maps to Neurology and
+    Headache."""
+    assert resolve_canonical_specialty("مخ واعصاب") == "Neurology"
+    assert resolve_specialty_coes("ابغى دكتور مخ واعصاب") == ["Headache"]
+
+
+def test_mapped_specialty_booking_triggers_without_explicit_coe_wording():
+    """Required test 2 — a mapped specialty booking request triggers COE
+    validation without any explicit COE wording anywhere in the call."""
+    c = call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT, call_id="coe-test-regression-mahmoud")
+    assert "مركز التميز" not in c.transcript
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True
+
+
+def test_trigger_path_is_patient_specialty_booking_intent():
+    """Required test 3 — the trigger path is exactly
+    patient_specialty_booking_intent."""
+    c = call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT)
+    ctx = classify_coe_trigger(c)
+    assert ctx["trigger_path"] == "patient_specialty_booking_intent"
+
+
+def test_ordinary_neurology_booking_does_not_count_as_coe_recommendation():
+    """Required test 4 — the agent's ordinary Neurology booking/
+    confirmation never counts as recommending the Headache COE."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["human_agent_recommended_coe"] is False
+    assert by_coe["Headache"]["explicit_coe_recommendation_status"] == "not_applicable"
+
+
+def test_recommendation_status_is_missed_for_mahmoud_regression():
+    """Required test 5 — recommendation_status is missed."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["recommendation_status"] == "missed"
+    assert by_coe["Headache"]["missed_recommendation"] is True
+
+
+def test_specific_missed_recommendation_note_is_generated_for_mahmoud():
+    """Required test 6 — a specific, grounded missed-recommendation note
+    is generated (never a generic failure message)."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    note = by_coe["Headache"]["note"]
+    assert note is not None
+    assert "Headache" in note
+    assert "Neurology" in note
+
+
+def test_osama_and_mahmoud_both_recognized_as_offered_alternatives():
+    """Required test 7 — Osama and Mahmoud are both recognized as offered
+    alternatives."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    offered = by_coe["Headache"]["offered_doctors"]
+    assert len(offered) == 2
+    assert any("محمود" in n for n in offered)
+    assert any("عبدالسلام" in n for n in offered)
+
+
+def test_patient_selection_of_mahmoud_supersedes_the_alternative_offer():
+    """Required test 8 — the patient's selection of Mahmoud supersedes the
+    earlier alternative offer of Osama for the primary-doctor decision."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    doctors = {d["extracted_name"]: d["role"] for d in by_coe["Headache"]["doctors"]}
+    mahmoud_roles = [role for name, role in doctors.items() if "محمود" in name]
+    osama_roles = [role for name, role in doctors.items() if "عبدالسلام" in name or "اسمة" in name]
+    assert mahmoud_roles == ["initial_primary"]
+    assert osama_roles == ["initial_supporting"]
+
+
+def test_final_booking_confirms_mahmoud_as_selected_initial_doctor():
+    """Required test 9 — the final booking confirms Mahmoud as the
+    selected initial doctor."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    selected = by_coe["Headache"]["selected_initial_doctors"]
+    assert len(selected) == 1
+    assert "محمود" in selected[0]
+
+
+def test_osamas_approved_status_does_not_make_mahmouds_booking_pass():
+    """Required test 10 — Osama's approved status must not make Mahmoud's
+    selected booking pass."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["primary_doctor_status"] == "fail"
+    assert by_coe["Headache"]["is_violation"] is True
+
+
+def test_mahmoud_remains_unapproved_for_headache():
+    """Required test 11 — Mahmoud Al-Horany (any spelling) remains
+    unapproved for Headache; he is never added to the approved list."""
+    assert match_primary_doctor("محمود الحوراني", "Headache") is False
+    assert match_primary_doctor("محمود الحوارني", "Headache") is False
+    assert resolve_primary_doctor_identity("محمود الحوراني", "Headache") is None
+
+
+def test_primary_doctor_status_is_fail_for_mahmoud_regression():
+    """Required test 12 — primary-doctor status is fail."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["primary_doctor_status"] == "fail"
+
+
+def test_recommendation_and_doctor_failures_reported_separately():
+    """Required test 13 — recommendation and doctor failures are two
+    independent, separately-visible fields, never collapsed into one
+    vague failure."""
+    evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    ctx = by_coe["Headache"]
+    assert ctx["recommendation_status"] == "missed"
+    assert ctx["primary_doctor_status"] == "fail"
+    assert ctx["service_alignment_status"] == "pass"
+
+
+def test_app_download_template_does_not_suppress_validation():
+    """Required test 14 — a standard post-booking application-download
+    template does not suppress or alter COE validation."""
+    transcript = _MAHMOUD_BOOKING_INTENT_TRANSCRIPT + "Agent: حمل تطبيق الاندلسية لمتابعة حجوزاتك ومواعيدك\n"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["recommendation_status"] == "missed"
+    assert by_coe["Headache"]["primary_doctor_status"] == "fail"
+    assert by_coe["Headache"]["selected_initial_doctors"] and "محمود" in by_coe["Headache"]["selected_initial_doctors"][0]
+
+
+def test_bot_menu_specialty_text_not_attributed_to_human_agent():
+    """Required test 15 — Bot menu specialty/service text is never
+    attributed to the human agent (a Bot-labeled turn is dropped by
+    split_transcript_turns entirely — see app.services.text_helpers)."""
+    transcript = (
+        "Patient: السلام عليكم ابغى دكتور مخ واعصاب يوم الخميس\n"
+        "Bot: برنامج مركز التميز للصداع متاح، اضغط هنا\n"
+        "Agent: متاح دكتور محمود الحوراني\n"
+        "Agent: تم تأكيد حجزك مع دكتور محمود الحوراني بعيادة المخ والاعصاب\n"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["human_agent_recommended_coe"] is False
+    assert by_coe["Headache"]["explicit_agent_recommended"] is False
+    assert by_coe["Headache"]["recommendation_status"] == "missed"
+
+
+def test_no_raw_patient_identity_numbers_in_regression_fixture():
+    """Required test 16 — the regression fixture and its call() wrapper
+    never carry a raw patient identity number; only the fixed test
+    placeholder phone number is used."""
+    c = call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT, call_id="coe-test-regression-mahmoud")
+    assert c.Patient_Phone == "501234567"
+    assert "41D59D44" not in c.call_id
+    assert "41D59D44-369B-F111-9B33-000D3AA9D409" not in c.transcript
+
+
+def test_existing_campaign_and_multi_context_behavior_unchanged_by_path_d():
+    """Required test 17 — existing campaign-origin, explicit-recommendation,
+    and multi-context behavior (the Headache+IBD regression) is unaffected
+    by adding the new patient_specialty_booking_intent trigger path."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    ctx = classify_coe_trigger(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    assert ctx["trigger_path"] == "campaign_origin"
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Headache"]["recommendation_status"] == "pass"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert result["overall_coe_status"] == "fail"
+
+
+def test_mahmoud_regression_full_expected_result():
+    """The complete supplied regression scenario end-to-end."""
+    result, stub = run_coe_node(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT)
+    assert result["applicable"] is True
+    assert result["triggered"] is True
+    assert result["trigger_path"] == "patient_specialty_booking_intent"
+    assert result["validated_coes"] == ["Headache"]
+    assert result["overall_coe_status"] == "fail"
+    assert result["is_violation"] is True
+
+    ctx = result["coe_evaluations"][0]
+    assert ctx["coe"] == "Headache"
+    assert ctx["recommendation_required"] is True
+    assert ctx["human_agent_recommended_coe"] is False
+    assert ctx["recommendation_status"] == "missed"
+    assert ctx["recommendation_evidence"] is None
+    assert ctx["service_alignment_status"] == "pass"
+    assert len(ctx["offered_doctors"]) == 2
+    assert ctx["selected_initial_doctors"] == ["محمود الحوراني"] or (
+        len(ctx["selected_initial_doctors"]) == 1 and "محمود" in ctx["selected_initial_doctors"][0]
+    )
+    assert ctx["primary_doctor_status"] == "fail"
+    assert ctx["missed_recommendation"] is True
+    assert ctx["is_violation"] is True
+    assert ctx["note"] is not None
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 15 — centralized SPECIALTY_REGISTRY audit: every configured
+# specialty participates consistently across routing, patient-need
+# detection, context creation, shared-specialty disambiguation, doctor
+# association, and missed-recommendation validation. All tests below are
+# DRIVEN from the registry itself — never a second, hand-typed specialty
+# list — so an incomplete/misconfigured registry entry fails automatically.
+# ═════════════════════════════════════════════════════════════════════════
+
+_EXPECTED_SPECIALTY_TO_COES = {
+    "GIT": ["IBD"],
+    "Nutrition": ["IBD"],
+    "General Surgery": ["IBD"],
+    "Neurology": ["Headache"],
+    "Ophthalmology": ["Headache"],
+    "ENT": ["Headache", "Asthma"],
+    "Cardiology": ["Headache"],
+    "Psychiatry": ["Headache"],
+    "Dental": ["Headache"],
+    "Diabetes": ["Diabetes"],
+    "Diabetic Educator": ["Diabetes"],
+    "Orthopedics": ["Diabetes"],
+    "Pulmonology": ["Asthma"],
+    "Allergy & Immunology": ["Asthma"],
+}
+
+
+def test_registry_defines_exactly_the_confirmed_taxonomy():
+    """The registry's specialty set and per-specialty COE membership match
+    the confirmed business taxonomy exactly — no specialty missing, none
+    extra, and no COE membership drift."""
+    assert set(SPECIALTY_REGISTRY) == set(_EXPECTED_SPECIALTY_TO_COES)
+    for specialty, expected_coes in _EXPECTED_SPECIALTY_TO_COES.items():
+        assert set(SPECIALTY_TO_COES[specialty]) == set(expected_coes), specialty
+
+
+@pytest.mark.parametrize("specialty", sorted(SPECIALTY_REGISTRY))
+def test_every_registry_specialty_has_aliases(specialty):
+    """Completeness test 1 — a canonical specialty with no aliases fails
+    automatically."""
+    assert SPECIALTY_REGISTRY[specialty]["aliases"], f"{specialty} has no configured aliases"
+
+
+@pytest.mark.parametrize("specialty", sorted(SPECIALTY_REGISTRY))
+def test_every_registry_specialty_canonical_name_resolves(specialty):
+    """Completeness test 2 — the canonical English name itself always
+    resolves to its own specialty (it is always listed as its own first
+    alias)."""
+    assert resolve_canonical_specialty(specialty) == specialty
+
+
+# Every (specialty, alias) pair in the registry — both English and Arabic
+# aliases are covered by the SAME parameterized sweep (a stricter test
+# than "at least one English alias" / "every Arabic alias" individually).
+_ALL_SPECIALTY_ALIAS_PAIRS = [
+    (specialty, alias)
+    for specialty in sorted(SPECIALTY_REGISTRY)
+    for alias in SPECIALTY_REGISTRY[specialty]["aliases"]
+]
+
+
+@pytest.mark.parametrize("specialty,alias", _ALL_SPECIALTY_ALIAS_PAIRS)
+def test_every_configured_alias_resolves_to_its_specialty(specialty, alias):
+    """Completeness tests 3-4 — every configured alias (English and
+    Arabic) independently resolves to its own registered specialty, and
+    the specialty resolves to its registered COE(s)."""
+    assert resolve_canonical_specialty(alias) == specialty
+    mentions = dict(detect_specialty_mentions(alias))
+    assert mentions.get(specialty) == SPECIALTY_TO_COES[specialty]
+
+
+@pytest.mark.parametrize(
+    "specialty,coes",
+    sorted((s, tuple(c)) for s, c in _EXPECTED_SPECIALTY_TO_COES.items() if len(c) == 1),
+)
+def test_unambiguous_specialty_booking_request_triggers_eligibility(specialty, coes):
+    """Completeness test: a patient booking request for every unambiguous
+    (non-shared) registry specialty triggers COE validation."""
+    alias = SPECIALTY_REGISTRY[specialty]["aliases"][-1]  # a configured Arabic alias
+    c = call(f"Patient: ابغى {alias}\nAgent: تمام")
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True, f"{specialty} did not trigger routing"
+    assert ctx["trigger_path"] == "patient_specialty_booking_intent"
+
+
+@pytest.mark.parametrize(
+    "specialty,coes",
+    sorted((s, tuple(c)) for s, c in _EXPECTED_SPECIALTY_TO_COES.items() if len(c) == 1),
+)
+def test_unambiguous_specialty_ordinary_booking_produces_missed(specialty, coes):
+    """Completeness test: an ordinary agent booking (no COE recommendation)
+    for every unambiguous registry specialty produces recommendation_
+    status=missed — never silently skipped, never a false pass."""
+    alias = SPECIALTY_REGISTRY[specialty]["aliases"][-1]
+    transcript = f"Patient: ابغى {alias}\nAgent: تمام هحجزلك موعد عادي بكرة"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert coes[0] in by_coe, f"{specialty} produced no {coes[0]} context"
+    assert by_coe[coes[0]]["recommendation_status"] == "missed"
+    assert by_coe[coes[0]]["is_violation"] is True
+
+
+@pytest.mark.parametrize("coe", COE_KEYS)
+def test_explicit_coe_script_recommendation_produces_pass(coe):
+    """Completeness test: an explicit human-agent recommendation (a
+    faithful full-script paraphrase) for every one of the four COEs
+    produces recommendation_status=pass, regardless of which specialty
+    the patient originally requested."""
+    specialty = _EXPECTED_SPECIALTY_TO_COES_FOR_FIRST_CLINIC = {
+        "IBD": "GIT", "Headache": "Neurology", "Asthma": "Pulmonology", "Diabetes": "Diabetes",
+    }[coe]
+    alias = SPECIALTY_REGISTRY[specialty]["aliases"][-1]
+    transcript = f"Patient: ابغى {alias}\nAgent: {DEFAULT_SCRIPTS_AR[coe]}"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe[coe]["recommendation_status"] == "pass"
+    assert by_coe[coe]["is_violation"] is False
+
+
+@pytest.mark.parametrize("phrase,expected_specialty", [
+    ("الجهاز الهضمي", "GIT"),
+    ("كبد", "GIT"),
+    ("قولون", "GIT"),
+    ("تغذية علاجية", "Nutrition"),
+    ("جراحة عامة", "General Surgery"),
+    ("مخ واعصاب", "Neurology"),
+    ("عيون", "Ophthalmology"),
+    ("انف واذن وحنجرة", "ENT"),
+    ("قلب", "Cardiology"),
+    ("طب نفسي", "Psychiatry"),
+    ("اسنان", "Dental"),
+    ("سكر", "Diabetes"),
+    ("مثقف سكري", "Diabetic Educator"),
+    ("عظام", "Orthopedics"),
+    ("صدرية", "Pulmonology"),
+    ("حساسية ومناعة", "Allergy & Immunology"),
+])
+def test_arabic_regression_phrase_resolves_to_specialty(phrase, expected_specialty):
+    """Required Arabic regression phrases — each resolves to its exact
+    expected canonical specialty."""
+    assert resolve_canonical_specialty(phrase) == expected_specialty
+
+
+def test_prompt_reference_data_alone_cannot_create_transcript_evidence_registry():
+    """A transcript with genuinely no specialty/complaint/campaign language
+    produces zero contexts regardless of the full COE reference (which
+    necessarily names every registry specialty) passed alongside it."""
+    transcript = "Patient: عايز اعرف اسعار الكشف العادي\nAgent: الكشف العادي بـ 300 ريال"
+    assert build_coe_contexts(call(transcript), scripts=DEFAULT_SCRIPTS_AR) == {}
+    for specialty in SPECIALTY_REGISTRY:
+        assert specialty not in transcript
+
+
+def test_multiple_specialties_different_coes_create_independent_contexts_registry():
+    """Multiple specialties from different COEs (here: GIT and Neurology)
+    create independent contexts."""
+    transcript = "Patient: ابغى جهاز هضمي وكمان عايز دكتور مخ واعصاب\nAgent: تمام هحجزلك الاتنين"
+    evaluations = build_coe_evaluations(call(transcript))
+    assert {e["coe"] for e in evaluations} == {"IBD", "Headache"}
+
+
+def test_shared_ent_disambiguated_by_complaint_registry():
+    """Shared ENT is disambiguated correctly by the patient's own
+    complaint (Headache vs. Asthma), never guessed."""
+    headache_ent = call("Patient: عندي صداع مزمن\nAgent: هحولك لعيادة انف واذن وحنجرة")
+    asthma_ent = call("Patient: عندي ربو وضيق تنفس\nAgent: هحولك لعيادة انف واذن وحنجرة")
+    assert set(build_coe_contexts(headache_ent)) == {"Headache"}
+    assert set(build_coe_contexts(asthma_ent)) == {"Asthma"}
+
+
+def test_ambiguous_ent_alone_triggers_but_is_non_punitive_registry():
+    """An ambiguous bare ENT booking request triggers eligibility checking
+    (Path D) but never produces a punitive finding for either candidate
+    COE."""
+    c = call("Patient: محتاج موعد انف واذن وحنجرة\nAgent: تمام هحجزلك بكرة")
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True
+    assert build_coe_contexts(c) == {}
+    evaluations = build_coe_evaluations(c)
+    assert evaluations == []
+
+
+def test_supporting_specialty_metadata_never_approves_or_rejects_a_doctor():
+    """Primary vs. supporting specialty classification is advisory/
+    reporting only — it never feeds evaluate_context_doctors' pass/fail
+    decision. Nutrition (a SUPPORTING IBD specialty, per FIRST_CLINIC)
+    still independently fails on an unapproved doctor exactly like GIT
+    (the PRIMARY IBD specialty) would."""
+    assert is_primary_specialty_for_coe("GIT", "IBD") is True
+    assert is_supporting_specialty_for_coe("Nutrition", "IBD") is True
+    assert is_supporting_specialty_for_coe("GIT", "IBD") is False
+    assert is_primary_specialty_for_coe("Nutrition", "IBD") is False
+    # Unrelated coe/specialty pairing is neither primary nor supporting.
+    assert is_primary_specialty_for_coe("Nutrition", "Headache") is False
+    assert is_supporting_specialty_for_coe("Nutrition", "Headache") is False
+
+    transcript = "Patient: احتاج تغذية علاجية\nAgent: تمام هحجزلك عند دكتور فلان الفلاني"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["IBD"]["primary_doctor_status"] == "fail"
+
+
+def test_specialty_entry_carries_full_grounding_schema():
+    """Every retained specialty entry carries the full grounding schema:
+    canonical_specialty, original_text, speaker, verbatim_evidence,
+    matched_alias, candidate_coes, resolved_coe."""
+    transcript = "Patient: عندي صداع مزمن\nAgent: هيبدأ الحجز بعيادة المخ والاعصاب"
+    contexts = build_coe_contexts(call(transcript))
+    entry = contexts["Headache"]["specialties"][0]
+    for field in (
+        "canonical_specialty", "original_text", "speaker", "verbatim_evidence",
+        "matched_alias", "candidate_coes", "resolved_coe",
+    ):
+        assert field in entry, f"missing {field}"
+    assert entry["canonical_specialty"] == "Neurology"
+    assert entry["resolved_coe"] == "Headache"
+    assert entry["candidate_coes"] == ["Headache"]
+    assert entry["original_text"] in transcript
+
+
+def test_existing_doctor_selection_and_multi_context_behavior_unchanged_registry():
+    """Existing doctor selection (Osama/Dalinda alias resolution, Mahmoud's
+    offered-vs-selected narrowing) and multi-context isolation remain
+    unaffected by the SPECIALTY_REGISTRY consolidation."""
+    evaluations = build_coe_evaluations(call(_TAXONOMY_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["doctors"][0]["canonical_name"] == "Osama Abdel Salam"
+    assert by_coe["IBD"]["doctors"][0]["canonical_name"] == "Dalinda"
+
+    mahmoud_evaluations = build_coe_evaluations(call(_MAHMOUD_BOOKING_INTENT_TRANSCRIPT))
+    by_coe2 = {e["coe"]: e for e in mahmoud_evaluations}
+    assert len(by_coe2["Headache"]["selected_initial_doctors"]) == 1
+    assert "محمود" in by_coe2["Headache"]["selected_initial_doctors"][0]
+    assert by_coe2["Headache"]["primary_doctor_status"] == "fail"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 16 — restricted, business-approved COE_COMPLAINTS registry: two
+# independent eligibility routes (patient_specialty_booking_intent /
+# patient_approved_complaint), each parameterized directly from its own
+# registry so a missing/misconfigured category fails automatically.
+# ═════════════════════════════════════════════════════════════════════════
+
+_APPROVED_COMPLAINT_SAMPLES = [
+    (coe, category, aliases[0])
+    for coe, categories in COE_COMPLAINTS.items()
+    for category, aliases in categories.items()
+]
+
+
+@pytest.mark.parametrize("coe,category,alias", _APPROVED_COMPLAINT_SAMPLES)
+def test_approved_complaint_triggers_and_resolves(coe, category, alias):
+    """Required tests 1-3 — the patient stating the complaint as an active
+    booking need triggers Path E, resolves the correct COE, and sets
+    recommendation_required=true."""
+    c = call(f"Patient: عندي {alias}\nAgent: تمام")
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True
+    assert ctx["trigger_path"] == "patient_approved_complaint"
+    evaluations = build_coe_evaluations(c)
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert coe in by_coe, f"{category} did not resolve to {coe}"
+    assert by_coe[coe]["complaint_category"] == category
+    assert by_coe[coe]["eligibility_source"] == "patient_approved_complaint"
+    assert by_coe[coe]["recommendation_required"] is True
+
+
+@pytest.mark.parametrize("coe,category,alias", _APPROVED_COMPLAINT_SAMPLES)
+def test_approved_complaint_missing_recommendation_is_missed(coe, category, alias):
+    """Required test 4 — an ordinary agent booking (no COE recommendation)
+    for every approved complaint category produces recommendation_
+    status=missed."""
+    transcript = f"Patient: عندي {alias}\nAgent: تمام هحجزلك موعد عادي بكرة"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe[coe]["recommendation_status"] == "missed"
+    assert by_coe[coe]["missed_recommendation"] is True
+    assert by_coe[coe]["is_violation"] is True
+    assert by_coe[coe]["note"] is not None
+
+
+@pytest.mark.parametrize("coe,category,alias", _APPROVED_COMPLAINT_SAMPLES)
+def test_approved_complaint_explicit_recommendation_produces_pass(coe, category, alias):
+    """Required test 5 — a correct human-agent COE recommendation for
+    every approved complaint category produces recommendation_status=pass."""
+    transcript = f"Patient: عندي {alias}\nAgent: {DEFAULT_SCRIPTS_AR[coe]}"
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe[coe]["recommendation_status"] == "pass"
+    assert by_coe[coe]["is_violation"] is False
+
+
+@pytest.mark.parametrize("coe,category,alias", _APPROVED_COMPLAINT_SAMPLES)
+def test_approved_complaint_bot_recommendation_does_not_satisfy(coe, category, alias):
+    """Required test 6 — a Bot-labeled recommendation never satisfies the
+    human-agent requirement, even alongside an approved complaint."""
+    transcript = (
+        f"Patient: عندي {alias}\n"
+        f"Bot: هنرشحلك برنامج مركز التميز\n"
+        f"Agent: تمام هحجزلك موعد عادي"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe[coe]["human_agent_recommended_coe"] is False
+    assert by_coe[coe]["recommendation_status"] == "missed"
+
+
+@pytest.mark.parametrize("phrase", [
+    "عندي دوخة بس", "حاسس بتنميل في ايدي", "عندي مشاكل في الذاكرة",
+    "عندي تشنجات", "عندي وجع في راسي", "عندي مشاكل في النوم",
+    "عندي وجع في رقبتي", "عندي وجع في ضهري",
+])
+def test_broad_neurological_symptoms_do_not_trigger_headache_complaint(phrase):
+    """Negative tests — removed broad neurological symptoms (dizziness,
+    numbness, memory problems, seizures, general head pain, sleep
+    problems, back/neck pain) never trigger Headache complaint-based
+    eligibility."""
+    transcript = f"Patient: {phrase}\nAgent: تمام"
+    assert build_coe_evaluations(call(transcript)) == []
+    assert classify_coe_trigger(call(transcript))["triggered"] is False
+
+
+@pytest.mark.parametrize("phrase", [
+    "عندي وجع في بطني", "حاسس بغثيان", "عندي ترجيع",
+    "حاسس بعسر هضم مؤقت", "مفيش شهية عندي", "عندي إحساس بعدم الراحة في بطني",
+])
+def test_vague_gastrointestinal_symptoms_do_not_trigger_ibd_complaint(phrase):
+    """Negative tests — vague nonspecific IBD symptoms (general stomach
+    pain, nausea, vomiting, temporary indigestion, loss of appetite,
+    general abdominal discomfort) never trigger IBD complaint-based
+    eligibility."""
+    transcript = f"Patient: {phrase}\nAgent: تمام"
+    assert build_coe_evaluations(call(transcript)) == []
+
+
+@pytest.mark.parametrize("phrase", [
+    "عندي كحة", "عندي زكام", "عندي انفلونزا", "حلقي بيوجعني",
+    "انفي مسدود", "عندي وجع في صدري",
+])
+def test_vague_respiratory_symptoms_do_not_trigger_asthma_complaint(phrase):
+    """Negative tests — vague respiratory symptoms (cough, cold, flu, sore
+    throat, nasal congestion, chest pain without respiratory context)
+    never trigger Asthma complaint-based eligibility."""
+    transcript = f"Patient: {phrase}\nAgent: تمام"
+    assert build_coe_evaluations(call(transcript)) == []
+
+
+@pytest.mark.parametrize("phrase", [
+    "عندي وجع في رجلي", "اترضيت في رجلي وانا بلعب", "حاسس بتعب عام", "وزني اتغير شوية",
+])
+def test_vague_diabetes_unrelated_symptoms_do_not_trigger_diabetes_complaint(phrase):
+    """Negative tests — generic foot pain, an orthopedic injury, general
+    tiredness, and weight change alone never trigger Diabetes complaint-
+    based eligibility."""
+    transcript = f"Patient: {phrase}\nAgent: تمام"
+    assert build_coe_evaluations(call(transcript)) == []
+
+
+def test_direct_specialty_request_still_triggers_despite_restricted_complaints():
+    """Route A (direct specialty request) is unaffected by the restricted
+    complaint registry — "ابغى دكتور مخ واعصاب" still maps to Headache
+    even though it describes no approved headache symptom at all."""
+    c = call("Patient: ابغى دكتور مخ واعصاب\nAgent: تمام هحجزلك موعد عادي")
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True
+    assert ctx["trigger_path"] == "patient_specialty_booking_intent"
+    evaluations = build_coe_evaluations(c)
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["recommendation_status"] == "missed"
+
+
+def test_direct_specialty_request_not_mislabeled_as_diagnosis():
+    """A direct specialty request's eligibility_source is
+    patient_specialty_booking_intent, never patient_approved_complaint,
+    and carries no complaint_category."""
+    evaluations = build_coe_evaluations(call("Patient: ابغى دكتور عيون\nAgent: تمام"))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["eligibility_source"] == "patient_specialty_booking_intent"
+    assert by_coe["Headache"]["complaint_category"] is None
+    assert by_coe["Headache"]["canonical_specialty"] == "Ophthalmology"
+
+
+def test_historical_resolved_complaint_does_not_trigger():
+    """A historical, resolved condition does not trigger the complaint
+    route, even alongside an unrelated active request in the same turn."""
+    transcript = "Patient: كان عندي صداع نصفي لكنه انتهى وأنا أريد حجز أسنان\nAgent: تمام هحجزلك"
+    evaluations = build_coe_evaluations(call(transcript))
+    assert all(e["coe"] != "Headache" for e in evaluations)
+
+
+def test_active_complaint_with_booking_intent_triggers():
+    """The paired positive example: an active, current complaint with
+    explicit booking language triggers Headache."""
+    c = call("Patient: عندي صداع نصفي وأريد أحجز له\nAgent: تمام هحجزلك موعد عادي")
+    ctx = classify_coe_trigger(c)
+    assert ctx["triggered"] is True
+    assert ctx["trigger_path"] == "patient_approved_complaint"
+
+
+def test_negated_complaint_does_not_trigger_registry():
+    transcript = "Patient: مش عندي صداع نصفي خالص\nAgent: تمام"
+    assert build_coe_evaluations(call(transcript)) == []
+
+
+def test_family_members_complaint_does_not_trigger_registry():
+    transcript = "Patient: امي عندها مرض في الكبد، بس انا عايز احجز اسنان\nAgent: تمام"
+    evaluations = build_coe_evaluations(call(transcript))
+    assert all(e["coe"] != "IBD" for e in evaluations)
+
+
+def test_hypothetical_complaint_question_does_not_trigger():
+    transcript = "Patient: لو كان عندي صداع نصفي هل اقدر احجز؟\nAgent: تمام"
+    assert build_coe_evaluations(call(transcript)) == []
+
+
+def test_llm_cannot_expand_the_approved_complaint_list():
+    """Deterministic-only architecture: a vague symptom is never expanded
+    into an approved category regardless of general medical plausibility
+    — resolve_approved_complaint only ever recognises the literal,
+    explicitly-approved alias lists."""
+    assert resolve_approved_complaint("حاسس بتعب") is None
+    assert resolve_approved_complaint("دايخ شوية") is None
+    assert resolve_approved_complaint("عندي وجع في بطني") is None
+
+
+def test_multi_context_different_approved_complaint_categories():
+    """Multi-context conversations can contain different approved
+    complaint categories, each its own independent context."""
+    transcript = (
+        "Patient: عندي صداع مزمن\n"
+        "Agent: تمام\n"
+        "Patient: وبعده عندي مرض في الكبد\n"
+        "Agent: تمام هحجزلك"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    assert by_coe["Headache"]["complaint_category"] == "chronic_headache"
+    assert by_coe["IBD"]["complaint_category"] == "liver_disease"
+
+
+def test_shared_ent_disambiguated_by_restricted_complaint_categories():
+    """Shared ENT is disambiguated using ONLY the restricted complaint
+    categories — sinus headache -> Headache, chest allergy/shortness of
+    breath -> Asthma."""
+    sinus = call("Patient: عندي صداع الجيوب الأنفية\nAgent: هحولك لعيادة انف واذن وحنجرة")
+    allergy = call("Patient: عندي حساسية صدرية\nAgent: هحولك لعيادة انف واذن وحنجرة")
+    breath = call("Patient: عندي ضيق في التنفس\nAgent: هحولك لعيادة انف واذن وحنجرة")
+    assert set(build_coe_contexts(sinus)) == {"Headache"}
+    assert set(build_coe_contexts(allergy)) == {"Asthma"}
+    assert set(build_coe_contexts(breath)) == {"Asthma"}
+
+
+def test_existing_doctor_context_recommendation_aggregation_unchanged_by_complaints():
+    """Existing doctor, context, recommendation, and aggregation behavior
+    remains unchanged by the restricted-complaint-registry work."""
+    result, stub = run_coe_node(_TAXONOMY_REGRESSION_TRANSCRIPT)
+    by_coe = {e["coe"]: e for e in result["coe_evaluations"]}
+    assert by_coe["Headache"]["recommendation_status"] == "pass"
+    assert by_coe["Headache"]["doctors"][0]["canonical_name"] == "Osama Abdel Salam"
+    assert by_coe["IBD"]["recommendation_status"] == "missed"
+    assert by_coe["IBD"]["doctors"][0]["canonical_name"] == "Dalinda"
+    assert result["overall_coe_status"] == "fail"
+    assert result["is_violation"] is True
 
 
 def test_graph_run_no_coe_trigger_skips_and_state_present():

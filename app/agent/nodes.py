@@ -2344,6 +2344,10 @@ def _not_applicable_coe_result(reason: str) -> dict:
         "coe_evaluations": [],
         "overall_coe_status": "not_applicable",
         "unassociated_initial_doctors": [],
+        "validated_coes": [],
+        "campaign_coes": [],
+        "explicit_agent_recommended_coes": [],
+        "missed_recommendation_coes": [],
     }
 
 
@@ -2661,12 +2665,103 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
             f"{' '.join(failing) if failing else 'a doctor mention could not be confidently associated with a specific COE context.'}"
         ).strip()
 
+    # ── Aggregate status ─────────────────────────────────────────────────────
+    #   fail:          any grounded context has a definite failed applicable
+    #                  check or is_violation=True.
+    #   uncertain:     no context fails, but at least one REQUIRED APPLICABLE
+    #                  check is itself uncertain.
+    #   pass:          every required applicable check passes; a check that
+    #                  is legitimately not_applicable (e.g. coe_match_status
+    #                  when the agent never explicitly named a COE, or
+    #                  primary_doctor_status when no initial_primary doctor
+    #                  was offered) is IGNORED, never treated as uncertain.
+    #   not_applicable: no grounded COE context exists at all.
+    # Each context's own "context_status" (see build_coe_evaluations) has
+    # already applied this exact rule at the context level — filtering out
+    # legitimately not_applicable checks (e.g. coe_match_status when the
+    # agent never explicitly named a COE, or primary_doctor_status when no
+    # initial_primary doctor was offered) before looking for "uncertain",
+    # so a legitimately-skipped check never downgrades a passing call.
     overall_coe_status = (
         "fail" if any(c["is_violation"] for c in coe_evaluations)
-        else "uncertain" if (any(c["primary_doctor_status"] == "uncertain" for c in coe_evaluations) or unassociated_doctors)
+        else "uncertain" if (any(c["context_status"] == "uncertain" for c in coe_evaluations) or unassociated_doctors)
         else "pass" if coe_evaluations
-        else "uncertain"
+        else "not_applicable"
     )
+
+    # ── Multi-context authoritative aggregation ─────────────────────────────
+    # A single GLOBAL "patient's expected complaint vs. agent's recommended
+    # COE" scalar comparison cannot describe a call that legitimately
+    # discusses more than one independently-grounded COE context without
+    # comparing one context's own evidence against a COMPLETELY DIFFERENT
+    # context's evidence (e.g. an earlier Headache complaint vs. a later,
+    # separately-grounded IBD service discussion) — that false cross-context
+    # comparison is exactly what multi-context evaluation exists to prevent,
+    # so it must never drive is_violation/coe_match_status/confidence here.
+    # Each context's OWN coe_match_status/primary_doctor_status/is_violation
+    # (see build_coe_evaluations) is authoritative instead; the ambiguous
+    # single-scalar fields are set to None (excluded from aggregation) so a
+    # consumer can never mistake one context's value for a global verdict.
+    # A genuinely single-context (or zero-context) call keeps its EXACT
+    # pre-existing scalar behaviour, unchanged.
+    validated_coes = [c["coe"] for c in coe_evaluations]
+    campaign_coes = [c["coe"] for c in coe_evaluations if c["campaign_coe"]]
+    explicit_agent_recommended_coes = [c["coe"] for c in coe_evaluations if c["explicit_agent_recommended"]]
+    # A patient's independently-eligible need (diagnosis/complaint/
+    # requested specialty or appointment) that no human-agent turn ever
+    # recommended or explained the matching COE for — see
+    # build_coe_evaluations' recommendation_status/missed_recommendation
+    # (a passed service/doctor check never hides this).
+    missed_recommendation_coes = [c["coe"] for c in coe_evaluations if c["missed_recommendation"]]
+
+    # "Multi-context" here means more than one context the AGENT actually
+    # engaged with (agent_recommendation/agent_specialty evidence) — two
+    # separately-serviced journeys, each closed out on its own. A context
+    # built from patient_complaint alone, with NO agent follow-through at
+    # all, is not a second independent journey; it is the patient's own
+    # (possibly sole) stated need going unaddressed while the agent
+    # recommended something else entirely, which the classic expected-vs-
+    # recommended comparison below must still be free to flag as a real
+    # mismatch (e.g. a patient's only complaint is Diabetes but the agent
+    # proactively recommends Headache instead — see
+    # test_diabetes_complaint_but_agent_recommends_headache_coe_fails).
+    _agent_engaged_contexts = [
+        c for c in coe_evaluations
+        if any(s in c["context_sources"] for s in ("agent_recommendation", "agent_specialty"))
+    ]
+    is_multi_context = len(_agent_engaged_contexts) > 1
+    if is_multi_context:
+        expected_coe = None
+        campaign_coe = None
+        recommended_coe = None
+        validation_coe = None
+        coe_match_status = None
+        coe_reason = (
+            f"This call discusses {len(coe_evaluations)} independently-grounded COE "
+            f"contexts ({', '.join(validated_coes)}); a single global expected-vs-"
+            "recommended comparison does not apply — each context's own match and "
+            "primary-doctor result (see coe_evaluations) is authoritative."
+        )
+        is_violation = any(c["is_violation"] for c in coe_evaluations)
+        confidence = (
+            0.9
+            if not any(c["context_status"] == "uncertain" for c in coe_evaluations) and not unassociated_doctors
+            else 0.5
+        )
+    else:
+        # Escalate-only: the legacy scalar comparison predates the missed-
+        # COE-recommendation rule and has no concept of recommendation_
+        # status/missed_recommendation, so a single-context call whose
+        # ONLY problem is a missed recommendation (approved doctor, no
+        # legacy expected-vs-recommended mismatch) must still surface as
+        # a violation here — never silently pass while overall_coe_status
+        # (always computed from coe_evaluations) correctly reports "fail".
+        is_violation = (
+            coe_match_status == "fail"
+            or primary_doctor_status == "fail"
+            or any(c["is_violation"] for c in coe_evaluations)
+        )
+        confidence = 0.9 if coe_match_status in ("pass", "fail") and primary_doctor_status != "uncertain" else 0.5
 
     trigger_paths: list[str] = [trigger_ctx["trigger_path"]]
     for _c in coe_evaluations:
@@ -2694,31 +2789,59 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
         "existing_patient_exception": existing_exception,
         "evidence": evidence,
         "reason": f"{coe_reason} {doctor_reason_text}".strip(),
-        "confidence": 0.9 if coe_match_status in ("pass", "fail") and primary_doctor_status != "uncertain" else 0.5,
-        "is_violation": coe_match_status == "fail" or primary_doctor_status == "fail",
+        "confidence": confidence,
+        "is_violation": is_violation,
         # Multi-context representation — one independent, fully-evaluated
         # entry per grounded COE (see app.service_hub.coe_validation.
         # build_coe_evaluations). The scalar fields above are kept unchanged
         # for backward compatibility and already match this list's single
-        # entry when exactly one COE was discussed; consumers that need to
-        # see EVERY context (never just the first) should read this list.
+        # entry when exactly one COE was discussed; for a call discussing
+        # MORE than one COE, expected_coe/campaign_coe/recommended_coe/
+        # validation_coe/coe_match_status above are deliberately None (see
+        # the multi-context aggregation block above) — read validated_coes/
+        # campaign_coes/explicit_agent_recommended_coes and coe_evaluations
+        # instead of trying to force a single global answer.
         "trigger_paths": trigger_paths,
         "coe_evaluations": coe_evaluations,
         "overall_coe_status": overall_coe_status,
         "unassociated_initial_doctors": unassociated_doctors,
+        "validated_coes": validated_coes,
+        "campaign_coes": campaign_coes,
+        "explicit_agent_recommended_coes": explicit_agent_recommended_coes,
+        "missed_recommendation_coes": missed_recommendation_coes,
     }
+    print(
+        f"[coe] routing | triggered={trigger_ctx['triggered']} "
+        f"trigger_path={trigger_ctx['trigger_path']} coes={validated_coes}",
+        flush=True,
+    )
     logger.info(
         "coe validation | call_id=%s coe_match=%s primary_doctor=%s expected=%s campaign=%s "
         "recommended=%s validation=%s contexts=%d overall=%s",
         call.call_id, coe_match_status, primary_doctor_status, expected_coe, campaign_coe,
         recommended_coe, validation_coe, len(coe_evaluations), overall_coe_status,
     )
-    print(
-        f"[coe] outcome | coe_match={coe_match_status} primary_doctor={primary_doctor_status} "
-        f"expected={expected_coe} campaign={campaign_coe} recommended={recommended_coe} "
-        f"validation={validation_coe} doctors={initial_grounded}",
-        flush=True,
-    )
+    if is_multi_context:
+        # The single-scalar expected/campaign/recommended/validation
+        # comparison is deliberately None for a multi-context call (see
+        # above) — printing it here would repeat the exact misleading
+        # cross-context comparison this design exists to prevent. Each
+        # context's own line below (and validated_coes/campaign_coes/
+        # explicit_agent_recommended_coes) carries the real picture.
+        print(
+            f"[coe] outcome | multi_context=True contexts={len(coe_evaluations)} "
+            f"validated_coes={validated_coes} campaign_coes={campaign_coes} "
+            f"explicit_agent_recommended_coes={explicit_agent_recommended_coes} "
+            f"primary_doctor={primary_doctor_status}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[coe] outcome | coe_match={coe_match_status} primary_doctor={primary_doctor_status} "
+            f"expected={expected_coe} campaign={campaign_coe} recommended={recommended_coe} "
+            f"validation={validation_coe} doctors={initial_grounded}",
+            flush=True,
+        )
     for _c in coe_evaluations:
         _specialties = []
         for _s in _c.get("specialties", []):
@@ -2727,9 +2850,16 @@ async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict
                 _specialties.append(_name)
         print(
             f"[coe] context | coe={_c['coe']} specialties={_specialties} "
-            f"doctors={[d['extracted_name'] for d in _c['doctors']]} primary_doctor={_c['primary_doctor_status']}",
+            f"explicit_recommendation={_c['explicit_coe_recommendation_status']} "
+            f"service_alignment={_c['service_alignment_status']} "
+            f"recommendation={_c['recommendation_status']} "
+            f"offered_doctors={_c['offered_doctors']} "
+            f"selected_doctors={_c['selected_initial_doctors']} "
+            f"primary_doctor={_c['primary_doctor_status']} violation={_c['is_violation']}",
             flush=True,
         )
+        if _c["missed_recommendation"]:
+            print(f"[coe] missed | coe={_c['coe']} note={_c['note']!r}", flush=True)
     print(
         f"[coe] aggregate | coes={[_c['coe'] for _c in coe_evaluations]} "
         f"contexts={len(coe_evaluations)} overall={overall_coe_status} "

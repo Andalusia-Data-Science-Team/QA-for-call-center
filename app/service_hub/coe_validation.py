@@ -125,6 +125,11 @@ PRIMARY_DOCTOR_ALIASES: dict[str, dict[str, list[str]]] = {
             "أسامه عبد السلام",
             "اسامة عبدالسلام",
             "أسامة عبدالسلام",
+            # "اسمة عبدالسلام" — a shortened/typo'd spelling (missing the
+            # middle alef of "اسامة") observed in real transcripts; same
+            # person, not a new identity.
+            "اسمة عبدالسلام",
+            "اسمه عبدالسلام",
             "دكتور اسامة عبد السلام",
             "دكتور أسامة عبد السلام",
             "دكتور اسامه عبد السلام",
@@ -284,15 +289,227 @@ COMPLAINT_KEYWORDS: dict[str, set[str]] = {
     },
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# Restricted, business-approved complaint/diagnosis categories — the
+# AUTHORITATIVE, SOLE source for the "patient_approved_complaint"
+# recommendation-eligibility route (see classify_coe_trigger's Path E and
+# build_coe_contexts' "patient_complaint" source below).
+#
+# Deliberately SEPARATE from COMPLAINT_KEYWORDS above: COMPLAINT_KEYWORDS
+# is the older, intentionally BROADER symptom vocabulary that still
+# powers the legacy single-scalar expected_coe/coe_match_status path
+# (resolve_primary_complaint/detect_complaint_categories),
+# _unambiguous_coe_matches' campaign disambiguation, and
+# CAMPAIGN_COE_CONTEXT_MARKERS' LLM-grounding vocabulary — none of those
+# pre-existing, independently-tested behaviors are in scope here. This
+# registry answers a NARROWER, DIFFERENT question — "does an EXPLICITLY
+# APPROVED diagnosis/complaint category, on its OWN (with no specialty
+# request at all), obligate the human agent to have recommended a COE" —
+# and is therefore held to a stricter, business-confirmed list: a vague
+# symptom (dizziness, nausea, cough, general foot pain, ...) must NEVER
+# by itself create this obligation, even though it may still remain in
+# COMPLAINT_KEYWORDS for the older, broader classification purposes above.
+#
+# Structure: {coe: {category_key: [aliases...]}}. Every alias is matched
+# phrase/token-aware (see _contains_phrase) — never naive substring.
+COE_COMPLAINTS: dict[str, dict[str, list[str]]] = {
+    "Headache": {
+        "migraine": [
+            "الصداع النصفي", "صداع نصفي", "الشقيقة", "الشقيقه", "Migraine",
+        ],
+        "tension_headache": [
+            "الصداع التوتري", "صداع توتري", "Tension headache", "Tension-type headache",
+        ],
+        "chronic_headache": [
+            "الصداع المزمن", "صداع مزمن", "Chronic headache", "Chronic headaches",
+        ],
+        "sinus_headache": [
+            "صداع الجيوب الأنفية", "صداع الجيوب الانفية", "الصداع الناتج عن الجيوب الأنفية",
+            "Sinus headache",
+        ],
+    },
+    "IBD": {
+        "digestive_disease": [
+            "أمراض الجهاز الهضمي", "امراض الجهاز الهضمي", "مرض في الجهاز الهضمي",
+            "مشاكل الجهاز الهضمي", "أمراض المعدة والأمعاء", "امراض المعدة والامعاء",
+            "Gastrointestinal disease", "Digestive disease", "Bowel disease",
+        ],
+        "colon_disease": [
+            "قولون", "القولون", "أمراض القولون", "التهاب القولون", "كرون", "مرض كرون",
+            "Colon disease", "Colitis", "Crohn's disease", "Crohn disease",
+        ],
+        "liver_disease": [
+            "أمراض الكبد", "امراض الكبد", "مرض في الكبد", "كبد", "الكبد",
+            "Liver disease", "Hepatic disease",
+        ],
+        "pancreatic_disease": [
+            "أمراض البنكرياس", "امراض البنكرياس", "مرض في البنكرياس", "التهاب البنكرياس",
+            "بنكرياس", "البنكرياس", "Pancreatic disease", "Pancreatitis",
+        ],
+    },
+    "Asthma": {
+        "asthma": ["الربو", "ربو", "Asthma"],
+        "bronchial_asthma": ["الربو الشعبي", "ربو شعبي", "Bronchial asthma"],
+        "chest_allergy": [
+            "الحساسية الصدرية", "حساسية صدرية", "Chest allergy", "Respiratory allergy",
+        ],
+        "shortness_of_breath": [
+            "ضيق التنفس", "ضيق في التنفس", "صعوبة التنفس",
+            "Shortness of breath", "Difficulty breathing", "Breathlessness",
+        ],
+    },
+    "Diabetes": {
+        "diabetes": [
+            "السكر", "مرض السكر", "السكري", "مرض السكري", "مريض سكر",
+            "Diabetes", "Diabetes mellitus", "Diabetic",
+        ],
+        "endocrine_disease": [
+            "الغدد الصماء", "غدد صماء", "أمراض الغدد الصماء", "امراض الغدد الصماء",
+            "Endocrine disease", "Endocrinology",
+        ],
+        "diabetic_foot": [
+            "قدم سكري", "القدم السكري", "القدم السكرية", "مشاكل القدم السكري",
+            "Diabetic foot", "Diabetic foot complications",
+        ],
+    },
+}
+
+
+def resolve_approved_complaint(text: str) -> tuple[str, str, str] | None:
+    """Deterministic, phrase-aware, longest-alias-wins resolution of the
+    approved complaint CATEGORY named in *text*, as (coe, category,
+    matched_alias) — or None when no approved-complaint alias is present.
+    Never expanded beyond COE_COMPLAINTS' literal alias lists — see the
+    module's "DO NOT EXPAND THE LIST SEMANTICALLY" requirement; a vague,
+    unlisted symptom always returns None here, regardless of general
+    medical plausibility."""
+    tokens = _tokens(text)
+    if not tokens:
+        return None
+    best: tuple[str, str, str, int] | None = None
+    for coe, categories in COE_COMPLAINTS.items():
+        for category, aliases in categories.items():
+            for alias in aliases:
+                alias_tokens = _tokens(alias)
+                if alias_tokens and _contains_phrase(tokens, alias):
+                    if best is None or len(alias_tokens) > best[3]:
+                        best = (coe, category, alias, len(alias_tokens))
+    return (best[0], best[1], best[2]) if best else None
+
+
+def detect_approved_complaints(text: str) -> list[tuple[str, str, str]]:
+    """Every (coe, category, matched_alias) approved-complaint mention in
+    *text* — unlike resolve_approved_complaint (single best match across
+    ALL coes), this returns one entry per COE that has ANY match, e.g. a
+    turn describing both a chronic headache AND a separate liver
+    complaint. WITHIN one COE, only the single LONGEST/most specific
+    matching category wins (mirrors resolve_canonical_specialty's
+    longest-alias-wins design) — e.g. "الربو الشعبي" (2 tokens,
+    bronchial_asthma) must win over the bare "الربو" (1 token, asthma)
+    it also happens to contain, never reporting the less specific
+    category merely because of dict iteration order."""
+    tokens = _tokens(text)
+    if not tokens:
+        return []
+    best_per_coe: dict[str, tuple[str, str, int]] = {}
+    for coe, categories in COE_COMPLAINTS.items():
+        for category, aliases in categories.items():
+            for alias in aliases:
+                alias_tokens = _tokens(alias)
+                if alias_tokens and _contains_phrase(tokens, alias):
+                    if coe not in best_per_coe or len(alias_tokens) > best_per_coe[coe][2]:
+                        best_per_coe[coe] = (category, alias, len(alias_tokens))
+    return [(coe, category, alias) for coe, (category, alias, _length) in best_per_coe.items()]
+
+# A complaint keyword found in a clause naming a THIRD PARTY (a family
+# member) or under NEGATION is never the PATIENT's own active complaint —
+# see ELIGIBILITY DETECTION's "do not trigger from ... a negated complaint
+# / a family member's condition when the patient is booking for something
+# else". Deliberately clause-scoped (via _split_clauses below), never
+# whole-turn, so an unrelated family-member mention earlier in the SAME
+# turn never suppresses the patient's own, separately-stated complaint.
+_THIRD_PARTY_SUBJECT_MARKERS: set[str] = {
+    "امي", "أمي", "ابويا", "أبويا", "والدي", "والدتي", "اخويا", "أخويا",
+    "اخي", "أخي", "اختي", "أختي", "زوجي", "جوزي", "زوجتي", "مراتي",
+    "ابني", "ابنتي", "بنتي", "جدي", "جدتي", "عمي", "عمتي", "خالي", "خالتي",
+    "my mother", "my father", "my son", "my daughter", "my husband", "my wife",
+}
+_NEGATION_MARKERS: set[str] = {
+    "مش", "مافيش", "مفيش", "ماعندي", "ما عندي", "معنديش", "بدون", "لا يوجد",
+    "no longer", "not anymore",
+}
+
+# A complaint/specialty mention framed as PAST/RESOLVED ("كان عندي ... لكنه
+# انتهى" — "I HAD ... but it's over") or as a HYPOTHETICAL ("لو كان عندي"
+# — "if I had") is never the patient's CURRENT, active reason for seeking
+# service — see ACTIVE PATIENT NEED's "a historical resolved condition" /
+# "a hypothetical question" exclusions.
+_HISTORICAL_RESOLVED_MARKERS: set[str] = {
+    "كان عندي", "كان عندها", "كان عندك", "انتهى", "انتهت", "خلص", "خلصت",
+    "اتعالجت", "اتعالج", "ماعادش", "ما عادش", "قبل كده", "من زمان وخلص",
+    "used to have", "no longer have", "resolved now", "it's over now",
+}
+_HYPOTHETICAL_MARKERS: set[str] = {
+    "لو كان", "لو كنت", "لو عندي", "افرض", "بفرض", "لو حصل", "ايه لو",
+    "if i had", "what if", "hypothetically",
+}
+
+
+def _clause_is_third_party_or_negated(clause: str) -> bool:
+    """True when *clause* names a THIRD PARTY (a family member), is under
+    NEGATION, describes a PAST/RESOLVED condition, or poses a
+    HYPOTHETICAL — none of these are the patient's own CURRENT, active
+    reason for seeking service (see ACTIVE PATIENT NEED). Phrase/token-
+    aware (via _contains_phrase, defined below) — never a naive substring
+    check, which would false-positive on e.g. "مشكلة" ("problem") merely
+    because it happens to START WITH the negation marker "مش" ("not")."""
+    tokens = _tokens(clause)
+    return (
+        any(_contains_phrase(tokens, m) for m in _THIRD_PARTY_SUBJECT_MARKERS)
+        or any(_contains_phrase(tokens, m) for m in _NEGATION_MARKERS)
+        or any(_contains_phrase(tokens, m) for m in _HISTORICAL_RESOLVED_MARKERS)
+        or any(_contains_phrase(tokens, m) for m in _HYPOTHETICAL_MARKERS)
+    )
+
 # ── COE-name recognition markers (used to tell WHICH COE the Agent actually
 # recommended/confirmed — deliberately more specific than the bare trigger
 # phrases below, so a generic "مركز التميز" mention alone still falls back
 # to script-similarity matching rather than a wrong specialty guess) ────────
+#
+# IBD deliberately does NOT list the bare specialty/complaint phrases
+# "الجهاز الهضمي"/"امراض الجهاز الهضمي" here (unlike the other three COEs,
+# whose markers are specific enough not to double as generic language) —
+# those exact words are also a doctor's ordinary specialty/title
+# description (e.g. "استشاري امراض الجهاز الهضمي والكبد والمناظير" naming a
+# GIT consultant while confirming a booking) and are already fully covered
+# as evidence via COMPLAINT_KEYWORDS/SPECIALTY_ALIASES["GIT"]. Keeping them
+# here would count a doctor's specialty title as if the agent had
+# explicitly announced "the IBD Center of Excellence", which is exactly
+# the false cross-context "explicit recommendation" that previously
+# corrupted multi-context aggregation (see build_coe_evaluations'
+# explicit_agent_recommended field and its module-level regression note).
 COE_NAME_MARKERS: dict[str, set[str]] = {
-    "IBD": {"الجهاز الهضمي", "امراض الجهاز الهضمي", "gastroenterology", "ibd"},
-    "Headache": {"تشخيص وعلاج الصداع", "علاج الصداع", "الصداع", "headache"},
-    "Asthma": {"امراض الصدر والجهاز التنفسي", "امراض الصدر", "الصدر والجهاز التنفسي", "asthma"},
-    "Diabetes": {"امراض السكر والغدد الصماء", "السكر والغدد الصماء", "diabetes"},
+    "IBD": {"gastroenterology", "ibd"},
+    # Bare "صداع" (no definite article) deliberately mirrors COMPLAINT_
+    # KEYWORDS["Headache"]'s own bare form, so a prefixed/attached spelling
+    # like "للصداع" ("for the headache", in e.g. "مركز التميز للصداع") still
+    # matches — "الصداع" alone does NOT match "للصداع" as a substring
+    # (Arabic's ل+ال contraction drops the alef), which previously made an
+    # agent's own campaign-branded COE announcement invisible to this
+    # marker even though the exact same word already counts as complaint
+    # evidence when the PATIENT says it.
+    "Headache": {"تشخيص وعلاج الصداع", "علاج الصداع", "صداع", "headache"},
+    # Bare "ربو"/"سكر" (no definite article) mirror the SAME "صداع" fix
+    # above for the SAME reason — "مركز التميز للربو"/"...للسكر" use the
+    # ل+ال contraction ("للربو"/"للسكر"), which "الربو"/"السكري" alone
+    # would never match as a substring. Both words are already accepted,
+    # by the same precedent as "صداع", as sufficiently COE-specific
+    # (never a generic complaint-only word) to serve as an explicit-
+    # recommendation marker.
+    "Asthma": {
+        "امراض الصدر والجهاز التنفسي", "امراض الصدر", "الصدر والجهاز التنفسي", "asthma", "ربو",
+    },
+    "Diabetes": {"امراض السكر والغدد الصماء", "السكر والغدد الصماء", "diabetes", "سكر"},
 }
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -310,11 +527,17 @@ COE_NAME_MARKERS: dict[str, set[str]] = {
 # is an approved COE primary doctor).
 # ═════════════════════════════════════════════════════════════════════════
 
-# COE -> the canonical specialties organizationally grouped under it.
-# "ENT" deliberately appears under BOTH Headache and Asthma — a genuinely
-# SHARED specialty that must never be arbitrarily resolved to one COE on
-# its own (see resolve_specialty_coes / the disambiguation priority order
-# documented on detect_specialty_mentions).
+# COE -> the canonical specialties organizationally grouped under it. This
+# is the ROOT of the whole specialty taxonomy — the confirmed business
+# taxonomy, authored ONCE, here. "ENT" deliberately appears under BOTH
+# Headache and Asthma — a genuinely SHARED specialty that must never be
+# arbitrarily resolved to one COE on its own (see resolve_specialty_coes /
+# the disambiguation priority order documented on detect_specialty_
+# mentions). Every other structure below (SPECIALTY_REGISTRY,
+# SPECIALTY_TO_COES, SPECIALTY_ALIASES, WEAK_SPECIALTY_ALIASES,
+# SPECIALTY_MARKERS, CAMPAIGN_COE_CONTEXT_MARKERS) is DERIVED from this
+# dict plus the alias data below — never a second, independently-authored
+# copy of the COE/specialty membership.
 COE_SPECIALTIES: dict[str, list[str]] = {
     "IBD": ["GIT", "Nutrition", "General Surgery"],
     "Headache": ["Neurology", "Ophthalmology", "ENT", "Cardiology", "Psychiatry", "Dental"],
@@ -322,44 +545,91 @@ COE_SPECIALTIES: dict[str, list[str]] = {
     "Asthma": ["Pulmonology", "ENT", "Allergy & Immunology"],
 }
 
+# Each COE's normally-PRIMARY specialty (its "first clinic") — used ONLY
+# for the advisory is_primary_specialty_for_coe/is_supporting_specialty_
+# for_coe classification below, NEVER for doctor approval (see
+# "PRIMARY VS SUPPORTING SPECIALTIES" in the module docstring): specialty
+# membership determines COE eligibility, not primary-doctor status. Every
+# specialty is canonical-key-matched here (unlike the human-readable
+# FIRST_CLINIC display strings above, e.g. "Gastroenterology"/"Diabetes/
+# Endocrinology", which are for display/reference text only).
+_FIRST_CLINIC_SPECIALTY: dict[str, str] = {
+    "IBD": "GIT",
+    "Headache": "Neurology",
+    "Asthma": "Pulmonology",
+    "Diabetes": "Diabetes",
+}
+
 # Canonical specialty -> English/Arabic aliases (common spelling/spacing/
-# transliteration variants). Matched phrase-aware (see _contains_phrase),
-# never via naive substring containment — several of these aliases are
-# short enough (e.g. "قلب", "كبد", "سكر") that blind substring matching
-# could false-positive inside an unrelated longer word (e.g. "قلب" inside
-# "انقلاب").
-SPECIALTY_ALIASES: dict[str, list[str]] = {
+# transliteration variants) — the SOLE place alias lists are hand-authored.
+# Matched phrase-aware (see _contains_phrase), never via naive substring
+# containment — several of these aliases are short enough (e.g. "قلب",
+# "كبد", "سكر", "عظام", "عيون", "صدر", "ENT", "GIT") that blind substring
+# matching could false-positive inside an unrelated longer word (e.g.
+# "قلب" inside "انقلاب").
+_SPECIALTY_ALIAS_DATA: dict[str, list[str]] = {
     "GIT": [
-        "GIT", "Gastroenterology", "Gastrointestinal", "Digestive system", "Digestive",
-        "الجهاز الهضمي", "جهاز هضمي", "أمراض الجهاز الهضمي", "امراض الجهاز الهضمي",
+        "GIT", "Gastroenterology", "Gastrointestinal", "Digestive system", "Digestive diseases",
+        "Digestive", "Hepatology", "Liver", "Colon", "Colorectal",
+        "الجهاز الهضمي", "جهاز هضمي", "أمراض الجهاز الهضمي", "امراض الجهاز الهضمي", "هضمي",
         "كبد", "الكبد", "أمراض الكبد", "امراض الكبد", "قولون", "القولون",
     ],
-    "Nutrition": ["Nutrition", "Clinical Nutrition", "تغذية", "التغذية", "تغذية علاجية"],
-    "General Surgery": ["General Surgery", "جراحة عامة", "الجراحة العامة"],
+    "Nutrition": [
+        "Nutrition", "Clinical Nutrition", "Dietitian", "Dietetics",
+        "تغذية", "التغذية", "تغذية علاجية", "التغذية العلاجية", "أخصائي تغذية", "اخصائي تغذية",
+    ],
+    "General Surgery": [
+        "General Surgery", "General Surgeon", "جراحة عامة", "الجراحة العامة", "جراح عام",
+    ],
     "Neurology": [
-        "Neurology", "Neurological", "مخ وأعصاب", "مخ واعصاب", "المخ والأعصاب", "المخ والاعصاب",
-        "مخ و اعصاب", "مخ و أعصاب", "اعصاب", "أعصاب", "الأعصاب", "الاعصاب",
+        "Neurology", "Neurologist", "Neurological", "مخ وأعصاب", "مخ واعصاب",
+        "المخ والأعصاب", "المخ والاعصاب", "مخ و اعصاب", "مخ و أعصاب",
+        "أعصاب", "اعصاب", "الأعصاب", "الاعصاب",
     ],
-    "Ophthalmology": ["Ophthalmology", "طب العيون", "عيون"],
+    "Ophthalmology": [
+        "Ophthalmology", "Ophthalmologist", "Eye Clinic", "Eye Doctor",
+        "طب العيون", "عيون", "طبيب عيون", "دكتور عيون",
+    ],
     "ENT": [
-        "ENT", "Ear, Nose and Throat", "Otolaryngology", "أنف وأذن وحنجرة", "انف واذن وحنجرة",
+        "ENT", "Ear, Nose and Throat", "Otolaryngology",
+        "أنف وأذن وحنجرة", "انف واذن وحنجرة", "أنف اذن حنجرة", "انف اذن حنجرة",
+        "أنف وأذن", "انف واذن",
     ],
-    "Cardiology": ["Cardiology", "قلب", "القلب", "طب القلب"],
-    "Psychiatry": ["Psychiatry", "طب نفسي", "نفسي", "الصحة النفسية"],
-    "Dental": ["Dental", "Dentistry", "أسنان", "اسنان", "طب الأسنان"],
-    "Diabetes": ["Diabetes", "Diabetology", "سكري", "السكري", "سكر", "مرض السكر"],
+    "Cardiology": [
+        "Cardiology", "Cardiologist", "Heart Clinic",
+        "قلب", "القلب", "طب القلب", "أمراض القلب", "امراض القلب", "دكتور قلب",
+    ],
+    "Psychiatry": [
+        "Psychiatry", "Psychiatrist", "Mental Health",
+        "طب نفسي", "طبيب نفسي", "نفسي", "الصحة النفسية", "صحة نفسية",
+    ],
+    "Dental": [
+        "Dental", "Dentistry", "Dentist",
+        "أسنان", "اسنان", "طب الأسنان", "طب الاسنان", "طبيب أسنان", "دكتور أسنان",
+    ],
+    "Diabetes": [
+        "Diabetes", "Diabetology", "Diabetologist",
+        "سكري", "السكري", "سكر", "مرض السكر", "عيادة السكر", "طبيب سكر",
+    ],
     "Diabetic Educator": [
-        "Diabetic Educator", "Diabetes Educator", "مثقف سكري", "مثقفة سكري",
-        "تثقيف سكري", "التثقيف السكري",
+        "Diabetic Educator", "Diabetes Educator", "Diabetes Education",
+        "مثقف سكري", "مثقفة سكري", "مثقف السكر", "مثقفة السكر",
+        "تثقيف سكري", "التثقيف السكري", "تثقيف مرضى السكر",
     ],
-    "Orthopedics": ["Orthopedics", "Orthopedic", "عظام", "العظام", "جراحة العظام"],
+    "Orthopedics": [
+        "Orthopedics", "Orthopedic", "Orthopaedics", "Orthopaedic",
+        "عظام", "العظام", "جراحة العظام", "طبيب عظام", "دكتور عظام",
+    ],
     "Pulmonology": [
-        "Pulmonology", "Pulmonary", "Respiratory", "Chest",
-        "صدر", "صدرية", "أمراض الصدر", "امراض الصدر", "الجهاز التنفسي", "جهاز تنفسي",
+        "Pulmonology", "Pulmonologist", "Pulmonary", "Respiratory", "Respiratory Medicine",
+        "Chest", "Chest Clinic",
+        "صدر", "صدرية", "أمراض الصدر", "امراض الصدر", "طب الصدر",
+        "الجهاز التنفسي", "جهاز تنفسي", "أمراض الجهاز التنفسي", "امراض الجهاز التنفسي",
     ],
     "Allergy & Immunology": [
-        "Allergy & Immunology", "Allergy and Immunology", "Allergy", "Immunology",
-        "حساسية ومناعة", "الحساسية والمناعة", "حساسية", "مناعة",
+        "Allergy & Immunology", "Allergy and Immunology", "Allergist", "Immunology", "Allergy",
+        "حساسية ومناعة", "الحساسية والمناعة", "حساسية", "الحساسية", "مناعة", "المناعة",
+        "طبيب حساسية", "عيادة الحساسية",
     ],
 }
 
@@ -371,27 +641,83 @@ SPECIALTY_ALIASES: dict[str, list[str]] = {
 # "مناظير"/"منظار" (endoscopy/scopes) is ambiguous on its own — it is only
 # GIT/IBD evidence when connected to actual gastroenterology or liver
 # context.
-WEAK_SPECIALTY_ALIASES: dict[str, list[str]] = {
+_WEAK_SPECIALTY_ALIAS_DATA: dict[str, list[str]] = {
     "GIT": ["مناظير", "منظار"],
 }
 
 
-def _build_specialty_to_coes() -> dict[str, list[str]]:
-    mapping: dict[str, list[str]] = {}
+def _build_specialty_registry() -> dict[str, dict[str, Any]]:
+    """The single authoritative, specialty-keyed registry — built from
+    COE_SPECIALTIES (membership) plus _SPECIALTY_ALIAS_DATA/
+    _WEAK_SPECIALTY_ALIAS_DATA (aliases) above. Every other specialty-
+    aware structure in this module (SPECIALTY_ALIASES, WEAK_SPECIALTY_
+    ALIASES, SPECIALTY_TO_COES, SPECIALTY_MARKERS, CAMPAIGN_COE_CONTEXT_
+    MARKERS) is a thin DERIVED view of this registry, kept only for
+    backward-compatible naming — none of them is ever hand-authored a
+    second time. A specialty is "shared" precisely when len(coes) > 1
+    (e.g. ENT -> ["Headache", "Asthma"]) — never a separately-tracked
+    boolean that could drift out of sync with its own coes list."""
+    registry: dict[str, dict[str, Any]] = {}
     for coe, specialties in COE_SPECIALTIES.items():
         for specialty in specialties:
-            mapping.setdefault(specialty, [])
-            if coe not in mapping[specialty]:
-                mapping[specialty].append(coe)
-    return mapping
+            entry = registry.setdefault(specialty, {"coes": [], "aliases": [], "weak_aliases": []})
+            if coe not in entry["coes"]:
+                entry["coes"].append(coe)
+    for specialty, entry in registry.items():
+        entry["aliases"] = list(_SPECIALTY_ALIAS_DATA.get(specialty, []))
+        entry["weak_aliases"] = list(_WEAK_SPECIALTY_ALIAS_DATA.get(specialty, []))
+    return registry
 
+
+# ── THE authoritative specialty registry ────────────────────────────────────
+# {canonical_specialty: {"coes": [...], "aliases": [...], "weak_aliases":
+# [...]}} — the single source every specialty-aware layer of the pipeline
+# (routing, patient-need detection, context creation, shared-specialty
+# disambiguation, doctor-to-context association, prompt reference data,
+# LLM-output grounding, service-alignment/recommendation validation,
+# logging) reads from, directly or via one of the thin derived views below.
+SPECIALTY_REGISTRY: dict[str, dict[str, Any]] = _build_specialty_registry()
+
+# Thin derived views — kept under their existing names for every caller
+# and test already using them; each is computed ONCE from SPECIALTY_
+# REGISTRY, never independently authored.
+SPECIALTY_ALIASES: dict[str, list[str]] = {sp: meta["aliases"] for sp, meta in SPECIALTY_REGISTRY.items()}
+WEAK_SPECIALTY_ALIASES: dict[str, list[str]] = {
+    sp: meta["weak_aliases"] for sp, meta in SPECIALTY_REGISTRY.items() if meta["weak_aliases"]
+}
 
 # Canonical specialty -> every COE it organizationally supports. Length 1
 # for an unambiguous specialty (e.g. "Neurology" -> ["Headache"]), length
 # 2+ for a genuinely SHARED specialty (e.g. "ENT" -> ["Headache",
 # "Asthma"]) that must be disambiguated, never guessed (see
 # detect_specialty_mentions).
-SPECIALTY_TO_COES: dict[str, list[str]] = _build_specialty_to_coes()
+SPECIALTY_TO_COES: dict[str, list[str]] = {sp: list(meta["coes"]) for sp, meta in SPECIALTY_REGISTRY.items()}
+
+
+def is_shared_specialty(specialty: str) -> bool:
+    """True when *specialty* organizationally supports more than one COE
+    (e.g. ENT) — derived from SPECIALTY_TO_COES, never a separately
+    tracked flag."""
+    return len(SPECIALTY_TO_COES.get(specialty, [])) > 1
+
+
+def is_primary_specialty_for_coe(specialty: str, coe: str) -> bool:
+    """Advisory classification ONLY (see "PRIMARY VS SUPPORTING
+    SPECIALTIES" in the module docstring) — whether *specialty* is *coe*'s
+    normally-primary ("first clinic") specialty. Specialty membership
+    determines COE eligibility and the recommendation requirement; it
+    NEVER determines primary-doctor approval on its own, and this
+    function is never consulted by evaluate_context_doctors or any
+    pass/fail decision."""
+    return _FIRST_CLINIC_SPECIALTY.get(coe) == specialty
+
+
+def is_supporting_specialty_for_coe(specialty: str, coe: str) -> bool:
+    """The complement of is_primary_specialty_for_coe — *specialty*
+    belongs to *coe* but is not its normally-primary specialty. False for
+    a specialty that doesn't belong to *coe* at all (see SPECIALTY_TO_
+    COES). Advisory/reporting only — see is_primary_specialty_for_coe."""
+    return coe in SPECIALTY_TO_COES.get(specialty, []) and not is_primary_specialty_for_coe(specialty, coe)
 
 
 def _tokens(text: str | None) -> list[str]:
@@ -414,6 +740,39 @@ def _contains_phrase(haystack_tokens: list[str], needle: str) -> bool:
     )
 
 
+# Common Arabic function-word prefixes (preposition/conjunction + optional
+# definite article, including the ل+ال -> لل contraction) — tried LONGEST
+# cluster first so e.g. "بال" is stripped as one unit rather than leaving
+# a stray "ال". Used ONLY by _contains_phrase_arabic_prefix_tolerant below,
+# for a small set of deliberately bare, single-word EXPLICIT markers (see
+# COE_NAME_MARKERS) where an attached preposition ("للصداع"/"للربو"/
+# "للسكر") must still match the bare word ("صداع"/"ربو"/"سكر") — never
+# used for SPECIALTY_ALIASES matching, which already lists every needed
+# "ال"-prefixed form explicitly.
+_ARABIC_PREFIX_STRIP_RE = re.compile(r"^(?:وال|فال|بال|كال|لل|ال|و|ف|ب|ل|ك)")
+
+
+def _contains_phrase_arabic_prefix_tolerant(haystack_tokens: list[str], needle: str) -> bool:
+    """Like _contains_phrase, but for a single-token *needle* also matches
+    a haystack token that equals *needle* once ONE leading Arabic
+    preposition/article prefix cluster is stripped from it (see
+    _ARABIC_PREFIX_STRIP_RE) — e.g. needle "صداع" matches the token
+    "للصداع" ("لل" stripped) but never merely a SUBSTRING match: "السكري"
+    stripped of "ال" is "سكري", which still does not equal "سكر", so it
+    correctly does NOT match (the residual must be an EXACT token match,
+    not a further substring check) — this is what keeps a short marker
+    safe against a longer, morphologically DIFFERENT word (see the
+    _contains_phrase docstring's "قلب" vs "انقلاب" example, which applies
+    here identically)."""
+    if _contains_phrase(haystack_tokens, needle):
+        return True
+    needle_tokens = _tokens(needle)
+    if len(needle_tokens) != 1:
+        return False  # only single bare-word markers need this tolerance
+    needle_token = needle_tokens[0]
+    return any(_ARABIC_PREFIX_STRIP_RE.sub("", t, count=1) == needle_token for t in haystack_tokens)
+
+
 def resolve_canonical_specialty(text: str) -> str | None:
     """Deterministic, phrase-aware, longest-alias-wins resolution of the
     canonical specialty named in *text* (e.g. "المخ والاعصاب" -> "Neurology",
@@ -430,6 +789,42 @@ def resolve_canonical_specialty(text: str) -> str | None:
             if alias_tokens and _contains_phrase(tokens, alias) and len(alias_tokens) > best_len:
                 best, best_len = canonical, len(alias_tokens)
     return best
+
+
+def _matched_alias_for_specialty(text: str, canonical_specialty: str) -> tuple[str, str] | None:
+    """The single LONGEST alias of *canonical_specialty* (from either
+    SPECIALTY_ALIASES or WEAK_SPECIALTY_ALIASES) that appears as a phrase
+    in *text*, as (matched_alias, raw_span):
+      - matched_alias — the alias-table entry itself (a stable, canonical
+        spelling, for grounding/reporting).
+      - raw_span — the ACTUAL substring from *text* at that position (the
+        literal wording as said/typed, diacritics/spelling-variant
+        preserved) when a positional token-count mapping is safe, else
+        the same value as matched_alias.
+    None when no alias of this specialty is present."""
+    tokens = _tokens(text)
+    if not tokens:
+        return None
+    raw_tokens = text.split()
+    positional_mapping_safe = len(raw_tokens) == len(tokens)
+    candidates = list(SPECIALTY_ALIASES.get(canonical_specialty, [])) + list(
+        WEAK_SPECIALTY_ALIASES.get(canonical_specialty, [])
+    )
+    best, best_len, best_start = None, 0, None
+    for alias in candidates:
+        alias_tokens = _tokens(alias)
+        n = len(alias_tokens)
+        if not alias_tokens or n <= best_len:
+            continue
+        for i in range(len(tokens) - n + 1):
+            if tokens[i:i + n] == alias_tokens:
+                best, best_len, best_start = alias, n, i
+                break
+    if best is None:
+        return None
+    if positional_mapping_safe and best_start is not None:
+        return best, " ".join(raw_tokens[best_start:best_start + best_len])
+    return best, best
 
 
 def detect_specialty_mentions(text: str) -> list[tuple[str, list[str]]]:
@@ -690,6 +1085,55 @@ def resolve_campaign_coe(call: CallTranscript) -> str | None:
     return None
 
 
+# ── Path D: patient specialty-booking-intent ─────────────────────────────
+# The validator exists to catch a MISSED COE recommendation — requiring an
+# existing "مركز التميز"/COE mention before even checking eligibility would
+# make it structurally unable to ever find the exact failure it targets
+# (the agent never says those words). A patient ACTIVELY asking for an
+# appointment/doctor/availability in a specialty that deterministically
+# maps to a supported COE is, on its own, enough to require the human
+# agent to have recommended that COE — see classify_coe_trigger's Path D.
+# A standalone "I want/need" desire-verb TOKEN, anywhere in the turn, is
+# enough on its own — the patient may follow it with a booking noun
+# ("ابغى موعد"), a doctor/availability question ("ابغى دكتور"), or the
+# SPECIALTY NAME directly ("ابغى جهاز هضمي", "ابغى حساسية ومناعة",
+# "احتاج مثقف سكري") — enumerating every possible following noun/specialty
+# combination would never be complete (this registry-consistency audit's
+# whole point), so the verb alone is the trigger; whether it is actually
+# about a mapped specialty is decided separately, by resolve_specialty_
+# coes on the SAME turn (see classify_coe_trigger's Path D). Still gated
+# by _clause_is_third_party_or_negated, so "مش عايز موعد"/"امي عايزة ..."
+# are correctly excluded despite containing a desire verb.
+_PATIENT_DESIRE_VERB_TOKENS: set[str] = {
+    "ابغى", "ابي", "أبغى", "عايز", "عاوز", "عايزة", "عاوزة",
+    "محتاج", "محتاجة", "احتاج", "أحتاج", "بدي", "اريد", "أريد",
+}
+
+# Phrases with no standalone desire-verb token of their own (asking who/
+# what is already available is a direct continuation of an active booking
+# request, never an incidental/historical mention on its own) plus a few
+# English equivalents.
+_PATIENT_BOOKING_INTENT_MARKERS: set[str] = {
+    "مين الدكتور", "الدكتور الموجود", "متاح دكتور", "في دكتور متاح",
+    "want an appointment", "need an appointment", "book an appointment",
+    "i want a doctor", "i need a doctor",
+}
+
+
+_NORMALIZED_DESIRE_VERB_TOKENS: set[str] = {_norm(v) for v in _PATIENT_DESIRE_VERB_TOKENS}
+
+
+def _patient_turn_has_booking_intent(text: str) -> bool:
+    """True when *text* (one Patient turn) actively asks for a doctor,
+    appointment, availability, or specialty — never a passive/incidental/
+    historical mention on its own (see _PATIENT_DESIRE_VERB_TOKENS /
+    _PATIENT_BOOKING_INTENT_MARKERS and classify_coe_trigger's Path D)."""
+    tokens = _tokens(text)
+    if any(t in _NORMALIZED_DESIRE_VERB_TOKENS for t in tokens):
+        return True
+    return any(_contains_phrase(tokens, m) for m in _PATIENT_BOOKING_INTENT_MARKERS)
+
+
 def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
     """Determine whether COE validation should run at all, and via which
     path — turn-order-aware and speaker-attributed, so a Patient statement
@@ -718,7 +1162,18 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
       - If only the Patient ever mentions it (the Agent never responds/
         confirms) -> NOT triggered — a customer mention alone is never
         enough (see module docstring's "do not trigger" rules).
-      - If nobody mentions it at all -> NOT triggered.
+      - If nobody mentions it at all -> checked against Path D next,
+        rather than immediately returning NOT triggered.
+
+      Path D ("patient_specialty_booking_intent") — checked only when
+      NEITHER Path A/B/C above already triggered: a Patient turn actively
+      requesting a doctor/appointment/availability (see
+      _patient_turn_has_booking_intent) whose specialty deterministically
+      maps to exactly one supported COE is enough on its own — this
+      validator exists specifically to catch a missed COE recommendation,
+      so it must never require the COE to already have been named before
+      checking whether it SHOULD have been (see
+      _PATIENT_BOOKING_INTENT_MARKERS).
     """
     campaign_evidence = campaign_origin_evidence(call)
     if campaign_evidence:
@@ -769,6 +1224,94 @@ def classify_coe_trigger(call: CallTranscript) -> dict[str, Any]:
             "evidence": text.strip()[:300],
             "patient_evidence": None,
         }
+
+    # Path D — patient specialty-booking-intent. Checked only after NEITHER
+    # of the explicit "مركز التميز"/COE-mention paths above already
+    # triggered — it never overrides or duplicates them, only covers the
+    # case this validator exists for: no one ever said the COE's name, yet
+    # the patient actively asked for an appointment/doctor in a specialty
+    # that deterministically maps to exactly one supported COE.
+    for speaker, text in turns:
+        if speaker != "patient":
+            continue
+        if not _patient_turn_has_booking_intent(text):
+            continue
+        if _clause_is_third_party_or_negated(text):
+            continue  # a family member's condition, or a cancelled/negated request
+        coes = resolve_specialty_coes(text)
+        if len(coes) == 1:
+            return {
+                "triggered": True,
+                "trigger_path": "patient_specialty_booking_intent",
+                "trigger_reason": (
+                    f"The customer actively requested an appointment/doctor in a specialty "
+                    f"mapped to the {coes[0]} Center of Excellence, without ever using COE "
+                    "terminology — the human agent was still required to recommend/explain "
+                    "that COE service."
+                ),
+                "evidence": text.strip()[:300],
+                "patient_evidence": text.strip()[:300],
+            }
+        if ambiguous_specialty_mentions(text):
+            # A SHARED specialty (e.g. ENT) with no context to disambiguate
+            # it yet — still an active booking request, so the eligibility
+            # check still runs (this trigger path exists), but which COE
+            # it belongs to genuinely cannot be determined here; never
+            # guessed, and never punitive on its own (see build_coe_
+            # contexts/ambiguous_specialty_mentions — no context is ever
+            # created for it, so it can never produce a missed/wrong_coe
+            # finding by itself).
+            return {
+                "triggered": True,
+                "trigger_path": "patient_specialty_booking_intent",
+                "trigger_reason": (
+                    "The customer actively requested an appointment/doctor in a specialty "
+                    "shared by more than one Center of Excellence, with no context yet to "
+                    "determine which one applies — eligibility is checked, but never guessed."
+                ),
+                "evidence": text.strip()[:300],
+                "patient_evidence": text.strip()[:300],
+            }
+
+    # Path E — patient_approved_complaint. Checked only after Paths A-D
+    # above never triggered — a patient stating one of the restricted,
+    # business-approved diagnosis/complaint categories (see COE_COMPLAINTS)
+    # is, on its own, enough to require the human agent to have
+    # recommended the mapped COE, even with no specialty/doctor request
+    # and no COE terminology at all (e.g. "عندي صداع نصفي وأريد أحجز له").
+    # Deliberately narrower than Path D's specialty-booking-intent check —
+    # a vague, unapproved symptom never reaches this far (see
+    # resolve_approved_complaint, which only ever recognises the literal
+    # approved alias lists, never a broader inferred category).
+    for speaker, text in turns:
+        if speaker != "patient":
+            continue
+        for clause in (_split_clauses(text) or [text]):
+            if _clause_is_third_party_or_negated(clause):
+                continue
+            if detect_coe_mention(clause):
+                # This clause is itself an explicit "مركز تميز"/COE-name
+                # mention (e.g. reciting the official program description
+                # back), not ordinary clinical complaint language — that
+                # is governed by Paths A-C's own, more specific "a bare
+                # customer mention with no agent engagement is never
+                # enough" rule, never by Path E.
+                continue
+            match = resolve_approved_complaint(clause)
+            if match:
+                coe, category, _alias = match
+                return {
+                    "triggered": True,
+                    "trigger_path": "patient_approved_complaint",
+                    "trigger_reason": (
+                        f"The customer actively described an approved {category.replace('_', ' ')} "
+                        f"complaint mapped to the {coe} Center of Excellence, without ever using COE "
+                        "terminology or requesting a specific specialty — the human agent was still "
+                        "required to recommend/explain that COE service."
+                    ),
+                    "evidence": clause.strip()[:300],
+                    "patient_evidence": clause.strip()[:300],
+                }
 
     if patient_raised:
         return {
@@ -876,9 +1419,9 @@ def resolve_recommended_coe(call: CallTranscript, scripts: dict[str, str] | None
     for speaker, text in turns:
         if speaker != "agent":
             continue
-        norm = _norm(text)
+        tokens = _tokens(text)
         for key, markers in COE_NAME_MARKERS.items():
-            if any(_norm(m) in norm for m in markers):
+            if any(_contains_phrase_arabic_prefix_tolerant(tokens, m) for m in markers):
                 return key
         for key, script in scripts.items():
             score = script_similarity(text, script)
@@ -942,6 +1485,14 @@ _DOCTOR_NAME_CLINIC_STOP_WORDS: set[str] = {
     "في",  # covers "في عياده" / "في قسم" / "في تخصص" — "في" alone is
            # never part of a person's name (mirrors doctor_validation.py's
            # own _NAME_STOP_RE, which treats a bare "في" the same way).
+    # A second title word embedded MID-CANDIDATE (e.g. "اسمة عبدالسلام
+    # ودكتور محمود" from "متاح دكتور اسمة عبدالسلام ودكتور محمود ...")
+    # means the shared extraction engine's name-capture ran on past the
+    # first doctor's name into a SECOND "دكتور"-anchored offer — a title
+    # word is never legitimately part of a person's own name, so this is
+    # always an over-capture boundary, never a real name token.
+    "دكتور", "دكتوره", "ودكتور", "ودكتوره", "والدكتور", "والدكتوره",
+    "الدكتور", "الدكتوره",
 }
 
 
@@ -1353,7 +1904,10 @@ def _unambiguous_coe_matches(text: str) -> list[str]:
     markers, complaint keywords, and specialties that map to exactly ONE
     COE (see detect_specialty_mentions)."""
     norm = _norm(text)
-    matched: list[str] = [key for key in COE_KEYS if any(_norm(m) in norm for m in COE_NAME_MARKERS[key])]
+    tokens = _tokens(text)
+    matched: list[str] = [
+        key for key in COE_KEYS if any(_contains_phrase_arabic_prefix_tolerant(tokens, m) for m in COE_NAME_MARKERS[key])
+    ]
     for key in COE_KEYS:
         if key not in matched and any(_norm(kw) in norm for kw in COMPLAINT_KEYWORDS[key]):
             matched.append(key)
@@ -1408,6 +1962,70 @@ def ambiguous_specialty_mentions(text: str, active_coes: Any = ()) -> list[tuple
     return unresolved
 
 
+def specialty_evidence_is_grounded(canonical_specialty: str, evidence: str | None, transcript: str) -> bool:
+    """Defense-in-depth safeguard: a specialty is only ever retained on a
+    context when its *evidence* excerpt (a) is an actual verbatim
+    substring of *transcript* and (b) the deterministic specialty
+    detectors, run over that SAME evidence, independently confirm
+    *canonical_specialty* is genuinely among the specialties that excerpt
+    supports — never accepted merely because the taxonomy
+    (COE_SPECIALTIES/SPECIALTY_ALIASES), CRM reference data, or a prompt's
+    reference block happens to mention it.
+
+    Checks membership rather than "sole winner" deliberately — a single
+    excerpt can legitimately support more than one specialty for the SAME
+    COE (e.g. both GIT and Nutrition mentioned in one turn), so this must
+    not reject a genuine second specialty merely because
+    resolve_canonical_specialty's own longest-alias-wins tie-break would
+    have picked a different one first.
+
+    build_coe_contexts's own specialty detection (detect_specialty_mentions
+    /detect_weak_specialty_mentions) already only ever fires on real
+    transcript text, so this check is always true for evidence it
+    produces — it exists so this remains true by CONSTRUCTION (never by
+    convention) even if a future caller starts assembling specialty
+    entries from another source (e.g. an LLM-touched path).
+    """
+    if not evidence or not canonical_specialty:
+        return False
+    if _norm(evidence) not in _norm(transcript):
+        return False
+    strong = {specialty for specialty, _coes in detect_specialty_mentions(evidence)}
+    weak = {specialty for specialty, _coes in detect_weak_specialty_mentions(evidence)}
+    return canonical_specialty in strong or canonical_specialty in weak
+
+
+# ── Actionable-service evidence (confirmed business rule) ───────────────────
+# A COE can be confirmed through a substantive agent response involving one
+# of its mapped specialties — the agent never has to repeat "COE"/"Center
+# of Excellence"/"مركز التميز" (see build_coe_evaluations' coe_match_status
+# and explicit_coe_recommendation_status, kept deliberately separate).
+# "Substantive" is deliberately narrower than merely NAMING the specialty
+# (a bare/incidental mention like "we also have a GIT department" must
+# never count) — it requires the SAME turn to also show a concrete booking
+# action (offering availability, confirming/creating an appointment,
+# routing the patient) or to name an actual doctor.
+_ACTIONABLE_SERVICE_ACTION_MARKERS: set[str] = {
+    "تم تأكيد", "تأكيد الحجز", "تأكيد الموعد", "تم الحجز", "سيتم حجز",
+    "حجز موعد", "هحجزلك", "هوصلك", "هحولك", "هحجز", "متواجد", "متاح",
+    "confirmed", "available", "booked", "booking",
+}
+
+
+def _turn_suggests_actionable_service(text: str) -> bool:
+    """True when *text* (a single Agent turn already known to mention a
+    mapped specialty) shows a concrete, substantive action — a booking/
+    routing/confirmation marker, or an actual doctor name — rather than
+    just naming the specialty in passing."""
+    norm = _norm(text)
+    if any(_norm(m) in norm for m in _ACTIONABLE_SERVICE_ACTION_MARKERS):
+        return True
+    for raw in _doctor_name_candidates_in_text(text):
+        if is_plausible_coe_doctor_candidate(clean_extracted_doctor_name(raw)):
+            return True
+    return bool(_known_doctor_alias_candidates(text))
+
+
 def build_coe_contexts(
     call: CallTranscript, scripts: dict[str, str] | None = None
 ) -> dict[str, dict[str, Any]]:
@@ -1457,46 +2075,74 @@ def build_coe_contexts(
             "coe": coe,
             "context_sources": [],
             "complaints": [],
+            "complaint_details": [],
             "specialties": [],
             "campaign_evidence": None,
             "agent_coe_evidence": None,
+            # Index (in split_transcript_turns's order) of the FIRST turn
+            # that grounded this COE at all — every context-creating branch
+            # below calls _add_source before any other _ctx() access, so
+            # this is always set on a context's very first touch. Used to
+            # order build_coe_evaluations' output chronologically (by
+            # first grounded evidence) rather than by COE_KEYS' fixed
+            # declaration order.
+            "first_turn_index": None,
         })
 
-    def _add_source(coe: str, source: str) -> None:
+    def _add_source(coe: str, source: str, turn_idx: int) -> None:
         c = _ctx(coe)
+        if c["first_turn_index"] is None:
+            c["first_turn_index"] = turn_idx
         if source not in c["context_sources"]:
             c["context_sources"].append(source)
 
     running_active: list[str] = []
 
-    def _add_specialty(coe: str, canonical_specialty: str, original_text: str, speaker: str, excerpt: str) -> None:
+    def _add_specialty(
+        coe: str, canonical_specialty: str, speaker: str, excerpt: str, candidate_coes: list[str],
+    ) -> None:
+        # Defense-in-depth grounding check (see specialty_evidence_is_
+        # grounded's docstring) — always true for evidence this function's
+        # own callers produce (they already scanned real transcript text),
+        # but guarantees a hallucinated/ungrounded specialty can never
+        # silently slip onto a context even if a future change starts
+        # feeding this from a less trustworthy source.
+        if not specialty_evidence_is_grounded(canonical_specialty, excerpt, call.transcript):
+            return
+        _match = _matched_alias_for_specialty(excerpt, canonical_specialty)
+        matched_alias, original_text = _match if _match else (canonical_specialty, canonical_specialty)
         c = _ctx(coe)
         entry = {
             "canonical_specialty": canonical_specialty,
             "original_text": original_text,
+            "matched_alias": matched_alias,
             "speaker": speaker,
             "evidence": excerpt,
+            "verbatim_evidence": excerpt,
+            "candidate_coes": list(candidate_coes),
+            "resolved_coe": coe,
         }
         if entry not in c["specialties"]:
             c["specialties"].append(entry)
 
-    for speaker, text in turns:
+    for turn_idx, (speaker, text) in enumerate(turns):
         norm = _norm(text)
         excerpt = text.strip()[:300]
         this_turn_coes: list[str] = []
 
         if speaker == "patient" and _CAMPAIGN_ORIGIN_RE.search(text):
             for coe in _unambiguous_coe_matches(text):
-                _add_source(coe, "campaign")
+                _add_source(coe, "campaign", turn_idx)
                 this_turn_coes.append(coe)
                 c = _ctx(coe)
                 if c["campaign_evidence"] is None:
                     c["campaign_evidence"] = excerpt
 
         if speaker == "agent":
+            agent_tokens = _tokens(text)
             for coe, markers in COE_NAME_MARKERS.items():
-                if any(_norm(m) in norm for m in markers):
-                    _add_source(coe, "agent_recommendation")
+                if any(_contains_phrase_arabic_prefix_tolerant(agent_tokens, m) for m in markers):
+                    _add_source(coe, "agent_recommendation", turn_idx)
                     this_turn_coes.append(coe)
                     c = _ctx(coe)
                     if c["agent_coe_evidence"] is None:
@@ -1518,20 +2164,45 @@ def build_coe_contexts(
                 if score > best_script_score:
                     best_script_key, best_script_score = coe, score
             if best_script_key and best_script_score >= SCRIPT_MATCH_THRESHOLD:
-                _add_source(best_script_key, "agent_recommendation")
+                _add_source(best_script_key, "agent_recommendation", turn_idx)
                 this_turn_coes.append(best_script_key)
                 c = _ctx(best_script_key)
                 if c["agent_coe_evidence"] is None:
                     c["agent_coe_evidence"] = excerpt
 
         if speaker == "patient":
-            for coe, kws in COMPLAINT_KEYWORDS.items():
-                if any(_norm(kw) in norm for kw in kws):
-                    _add_source(coe, "patient_complaint")
+            # Clause-scoped (never whole-turn) so an approved complaint
+            # category appearing in a clause naming a THIRD PARTY ("امي
+            # عندها سكري"), under negation, describing a PAST/RESOLVED
+            # condition, or posing a HYPOTHETICAL is never credited as the
+            # patient's OWN CURRENT active complaint — see ACTIVE PATIENT
+            # NEED. A genuinely separate, patient-own complaint stated
+            # elsewhere in the SAME turn (a different clause) is still
+            # credited. Uses ONLY the restricted, business-approved
+            # COE_COMPLAINTS registry (the "patient_approved_complaint"
+            # eligibility route) — deliberately narrower than the legacy
+            # COMPLAINT_KEYWORDS vocabulary still used elsewhere in this
+            # module (resolve_primary_complaint / campaign disambiguation
+            # / LLM grounding), which serves different, pre-existing
+            # purposes this recommendation-eligibility route must not
+            # inherit (a vague symptom like dizziness or nausea must never
+            # by itself create a recommendation obligation).
+            for clause in (_split_clauses(text) or [text]):
+                if _clause_is_third_party_or_negated(clause):
+                    continue
+                for coe, category, matched_alias in detect_approved_complaints(clause):
+                    _add_source(coe, "patient_complaint", turn_idx)
                     this_turn_coes.append(coe)
                     c = _ctx(coe)
                     if excerpt[:200] not in c["complaints"]:
                         c["complaints"].append(excerpt[:200])
+                    detail = {
+                        "category": category,
+                        "matched_alias": matched_alias,
+                        "evidence": excerpt[:200],
+                    }
+                    if detail not in c["complaint_details"]:
+                        c["complaint_details"].append(detail)
 
         # Specialty evidence — resolved with disambiguation, never
         # cross-attributing a SHARED specialty (e.g. ENT) to every COE it
@@ -1543,7 +2214,19 @@ def build_coe_contexts(
         # order: explicit COE/campaign and patient complaint both outrank
         # bare specialty/turn proximity).
         active_for_specialty = set(running_active) | set(this_turn_coes)
-        for specialty, candidate_coes in detect_specialty_mentions(text):
+        # A specialty named only in a clause about a THIRD PARTY or under
+        # negation is never the PATIENT's own eligibility evidence (same
+        # rule as the patient_complaint loop above) — scan a version of
+        # the turn with those clauses removed, never the raw excerpt
+        # actually stored as evidence.
+        if speaker == "patient":
+            qualifying_clauses = [
+                cl for cl in (_split_clauses(text) or [text]) if not _clause_is_third_party_or_negated(cl)
+            ]
+            specialty_scan_text = "، ".join(qualifying_clauses)
+        else:
+            specialty_scan_text = text
+        for specialty, candidate_coes in detect_specialty_mentions(specialty_scan_text):
             resolved_coes = (
                 candidate_coes if len(candidate_coes) == 1
                 else [c for c in candidate_coes if c in active_for_specialty]
@@ -1551,16 +2234,20 @@ def build_coe_contexts(
             if len(resolved_coes) != 1:
                 continue  # ambiguous/unresolved — never guessed into a context
             coe = resolved_coes[0]
-            _add_source(coe, "agent_specialty" if speaker == "agent" else "patient_specialty")
+            _add_source(coe, "agent_specialty" if speaker == "agent" else "patient_specialty", turn_idx)
             this_turn_coes.append(coe)
-            _add_specialty(coe, specialty, specialty, speaker, excerpt[:200])
+            _add_specialty(coe, specialty, speaker, excerpt[:200], candidate_coes)
+            if speaker == "agent" and _turn_suggests_actionable_service(text):
+                _add_source(coe, "agent_actionable_service", turn_idx)
 
-        for specialty, candidate_coes in detect_weak_specialty_mentions(text):
+        for specialty, candidate_coes in detect_weak_specialty_mentions(specialty_scan_text):
             for coe in candidate_coes:
                 if coe not in active_for_specialty:
                     continue  # weak evidence alone never creates/extends a context
-                _add_source(coe, "agent_specialty" if speaker == "agent" else "patient_specialty")
-                _add_specialty(coe, specialty, specialty, speaker, excerpt[:200])
+                _add_source(coe, "agent_specialty" if speaker == "agent" else "patient_specialty", turn_idx)
+                _add_specialty(coe, specialty, speaker, excerpt[:200], candidate_coes)
+                if speaker == "agent" and _turn_suggests_actionable_service(text):
+                    _add_source(coe, "agent_actionable_service", turn_idx)
 
         for coe in this_turn_coes:
             if coe not in running_active:
@@ -1738,24 +2425,56 @@ def _dedupe_doctor_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]
     partial-name guard, because here the question is only "was this
     person already mentioned", not "does this confidently identify an
     APPROVED doctor".
+
+    Each kept entry also tracks "_last_turn_index" — the LATEST turn_index
+    across every mention merged into it — used by evaluate_context_doctors
+    to tell an OFFERED-but-not-revisited doctor apart from the one a later
+    turn actually confirmed/selected (see its docstring).
     """
     kept: list[dict[str, Any]] = []
     for entry in entries:
         norm_name = normalize_doctor_name_for_match(entry.get("extracted_name"))
+        entry_turn_index = entry.get("turn_index", 0) or 0
         merged = False
         if norm_name:
             for existing in kept:
                 existing_norm = normalize_doctor_name_for_match(existing.get("extracted_name"))
                 if not existing_norm:
                     continue
-                if norm_name == existing_norm or norm_name in existing_norm or existing_norm in norm_name:
+                same_person = (
+                    norm_name == existing_norm
+                    or norm_name in existing_norm
+                    or existing_norm in norm_name
+                )
+                if not same_person and len(norm_name) >= _MIN_MATCHABLE_NAME_LENGTH:
+                    # Conservative same-script fuzzy fallback (reuses the
+                    # exact thresholds resolve_primary_doctor_identity uses
+                    # against the approved-alias table) — catches minor
+                    # transcription/ASR spelling variants of an UNAPPROVED
+                    # doctor's name too (e.g. "الحوارني" vs "الحوراني", a
+                    # letter transposition), which the approved-alias
+                    # table naturally never covers since this person isn't
+                    # on it. Never applied across writing systems.
+                    compact, existing_compact = norm_name.replace(" ", ""), existing_norm.replace(" ", "")
+                    shorter, longer = sorted((len(compact), len(existing_compact)))
+                    if (
+                        longer > 0
+                        and shorter / longer >= _FUZZY_LENGTH_RATIO_THRESHOLD
+                        and _is_arabic_text(norm_name) == _is_arabic_text(existing_norm)
+                        and _rfuzz.token_sort_ratio(norm_name, existing_norm) >= _FUZZY_SCORE_THRESHOLD
+                    ):
+                        same_person = True
+                if same_person:
                     if len(entry.get("extracted_name") or "") > len(existing.get("extracted_name") or ""):
                         existing["extracted_name"] = entry["extracted_name"]
                         existing["association_evidence"] = entry.get("association_evidence")
+                    existing["_last_turn_index"] = max(existing.get("_last_turn_index", 0), entry_turn_index)
                     merged = True
                     break
         if not merged:
-            kept.append(dict(entry))
+            new_entry = dict(entry)
+            new_entry["_last_turn_index"] = entry_turn_index
+            kept.append(new_entry)
     return kept
 
 
@@ -1787,9 +2506,32 @@ def evaluate_context_doctors(
       - "not_applicable"  no initial_primary doctor was discussed for this
                           COE (only referral/follow-up/supporting doctors,
                           or none).
+
+    Offered alternatives vs. the selected/confirmed doctor: when a call
+    offers several DISTINCT initial_primary doctors (e.g. "متاح دكتور X
+    ودكتور Y") and a STRICTLY LATER turn goes on to name only ONE of them
+    again (e.g. the patient picks one and the agent confirms the booking),
+    that later, re-confirmed doctor is the one actually booked — the
+    earlier, never-revisited alternative(s) are downgraded to
+    "initial_supporting" so they are reported (never silently dropped)
+    but no longer affect the pass/fail aggregate. This is deliberately
+    NOT applied when every distinct doctor's LATEST mention shares the
+    same turn (e.g. "دكتور X أو دكتور Y" with no follow-up at all) — with
+    no turn ever narrowing it down, both remain genuinely open initial
+    options and BOTH still count (an approved alternative must never let
+    an unapproved one pass — see the module docstring's core requirement).
     """
+    deduped = _dedupe_doctor_entries(doctor_entries)
+    initial_entries = [e for e in deduped if e.get("role", "initial_primary") == "initial_primary"]
+    if len(initial_entries) > 1:
+        latest_turn = max(e.get("_last_turn_index", 0) for e in initial_entries)
+        if any(e.get("_last_turn_index", 0) < latest_turn for e in initial_entries):
+            for e in initial_entries:
+                if e.get("_last_turn_index", 0) < latest_turn:
+                    e["role"] = "initial_supporting"
+
     per_doctor: list[dict[str, Any]] = []
-    for entry in _dedupe_doctor_entries(doctor_entries):
+    for entry in deduped:
         name = entry.get("extracted_name")
         role = entry.get("role", "initial_primary")
         base = {
@@ -1797,6 +2539,17 @@ def evaluate_context_doctors(
             "role": role,
             "association_evidence": entry.get("association_evidence"),
         }
+        if role == "initial_supporting":
+            per_doctor.append({
+                **base,
+                "canonical_name": None,
+                "primary_doctor_status": "not_applicable",
+                "reason": (
+                    f"{name} was offered as an initial alternative but a later turn confirmed a "
+                    "different doctor for this booking — not counted in the primary-doctor decision."
+                ),
+            })
+            continue
         if role != "initial_primary":
             per_doctor.append({
                 **base,
@@ -1841,6 +2594,111 @@ def evaluate_context_doctors(
     return per_doctor, status
 
 
+# Human-readable label for each canonical specialty, used only to phrase
+# the deterministic patient_need/QA-note text below — never used for any
+# matching/grounding decision (those stay driven entirely by
+# COE_SPECIALTIES/SPECIALTY_ALIASES/resolve_canonical_specialty).
+_SPECIALTY_NEED_LABEL: dict[str, str] = {
+    "GIT": "a gastroenterology appointment",
+    "Nutrition": "a nutrition appointment",
+    "General Surgery": "a general surgery appointment",
+    "Neurology": "a neurology appointment",
+    "Ophthalmology": "an ophthalmology appointment",
+    "ENT": "an ENT appointment",
+    "Cardiology": "a cardiology appointment",
+    "Psychiatry": "a psychiatry appointment",
+    "Dental": "a dental appointment",
+    "Diabetes": "a diabetes appointment",
+    "Diabetic Educator": "a diabetes education appointment",
+    "Orthopedics": "an orthopedics appointment",
+    "Pulmonology": "a pulmonology appointment",
+    "Allergy & Immunology": "an allergy/immunology appointment",
+}
+
+
+def _describe_patient_need(coe_key: str, ctx: dict[str, Any]) -> tuple[str, str | None]:
+    """Deterministic (coe_key, ctx) -> (patient_need, patient_need_evidence)
+    — a short, grounded, human-readable description of what the PATIENT
+    actually asked for, plus the verbatim excerpt supporting it. Prefers
+    an actual patient complaint excerpt, then a patient-authored specialty
+    mention, then the campaign entry point — never an agent-side excerpt,
+    since patient_need describes the PATIENT's own need (see ELIGIBILITY
+    DETECTION)."""
+    if ctx["complaints"]:
+        return (
+            f"The patient described a complaint/request connected to the {coe_key} COE.",
+            ctx["complaints"][0],
+        )
+    patient_specialty_entries = [s for s in ctx["specialties"] if s.get("speaker") == "patient"]
+    if patient_specialty_entries:
+        specialty = patient_specialty_entries[0]["canonical_specialty"]
+        label = _SPECIALTY_NEED_LABEL.get(specialty, f"a {specialty} appointment")
+        return (f"The patient requested {label}.", patient_specialty_entries[0]["evidence"])
+    if ctx["campaign_evidence"]:
+        return (
+            f"The patient entered this conversation via a {coe_key} COE campaign/post.",
+            ctx["campaign_evidence"],
+        )
+    return (f"The patient's stated need connects to the {coe_key} COE.", None)
+
+
+_COMPLAINT_CATEGORY_LABEL: dict[str, str] = {
+    "migraine": "migraine headache", "tension_headache": "tension headache",
+    "chronic_headache": "chronic headache", "sinus_headache": "sinus headache",
+    "digestive_disease": "digestive disease", "colon_disease": "colon disease",
+    "liver_disease": "liver disease", "pancreatic_disease": "pancreatic disease",
+    "asthma": "asthma", "bronchial_asthma": "bronchial asthma",
+    "chest_allergy": "chest allergy", "shortness_of_breath": "shortness of breath",
+    "diabetes": "diabetes", "endocrine_disease": "endocrine disease", "diabetic_foot": "diabetic foot",
+}
+
+
+def _build_missed_recommendation_note(
+    coe_key: str,
+    patient_need: str,
+    patient_need_evidence: str | None,
+    mapped_specialties: list[dict[str, Any]],
+    agent_response_evidence: str | None,
+    wrong_coe: bool,
+    complaint_category: str | None = None,
+) -> str:
+    """Deterministic, grounded QA note for a missed/wrong_coe finding —
+    names the patient need, the matched specialty OR approved complaint
+    category (whichever actually grounded eligibility — see OUTPUT AND
+    EVIDENCE), the expected COE, why the agent's response did not qualify
+    as a COE recommendation, and the supporting evidence (see QA NOTE
+    requirements)."""
+    if complaint_category:
+        mapped_via = (
+            f"{_COMPLAINT_CATEGORY_LABEL.get(complaint_category, complaint_category)}, which is an "
+            f"approved {coe_key} COE complaint category"
+        )
+    else:
+        specialty_names = ", ".join(dict.fromkeys(s["canonical_specialty"] for s in mapped_specialties))
+        mapped_via = specialty_names or "a mapped specialty"
+    evidence_bits = [f'patient need: "{patient_need_evidence}"' if patient_need_evidence else None]
+    if wrong_coe:
+        reason = (
+            f"the agent explicitly recommended a DIFFERENT Center of Excellence that has no "
+            f"patient-side basis of its own in this call"
+        )
+    elif agent_response_evidence:
+        evidence_bits.append(f'agent response: "{agent_response_evidence}"')
+        reason = (
+            "the agent's response only handled the specialty/service directly (a doctor offer, "
+            "availability, or an ordinary appointment) without explaining or recommending the "
+            f"{coe_key} Center of Excellence itself"
+        )
+    else:
+        reason = f"no agent turn recommended or explained the {coe_key} Center of Excellence"
+    evidence_text = "; ".join(b for b in evidence_bits if b)
+    return (
+        f"The {coe_key} Center of Excellence should have been recommended. {patient_need} "
+        f"This maps to the {coe_key} COE via {mapped_via}, but {reason}."
+        + (f" Evidence — {evidence_text}." if evidence_text else "")
+    )
+
+
 def build_coe_evaluations(
     call: CallTranscript, scripts: dict[str, str] | None = None
 ) -> list[dict[str, Any]]:
@@ -1861,30 +2719,311 @@ def build_coe_evaluations(
     contexts = build_coe_contexts(call, scripts)
     associations = extract_doctor_context_associations(call)
 
-    evaluations: list[dict[str, Any]] = []
-    for coe_key in COE_KEYS:
-        ctx = contexts.get(coe_key)
-        if ctx is None:
-            continue
+    # Chronological order — by each context's OWN first grounded transcript
+    # evidence (see build_coe_contexts' first_turn_index), never COE_KEYS'
+    # fixed declaration order. A call where a Headache campaign/booking is
+    # discussed first and an unrelated IBD request comes up later (e.g.
+    # after "وبعده") must report Headache before IBD, matching the order
+    # events actually happened in the call.
+    ordered_coe_keys = sorted(
+        (key for key in COE_KEYS if key in contexts),
+        key=lambda key: (
+            contexts[key]["first_turn_index"]
+            if contexts[key]["first_turn_index"] is not None
+            else float("inf")
+        ),
+    )
+
+    # ── Pass 1: per-context facts that do NOT depend on any OTHER context
+    # (doctors, service alignment, explicit-recommendation attribution,
+    # patient-side eligibility). ─────────────────────────────────────────
+    _pending: list[dict[str, Any]] = []
+    for coe_key in ordered_coe_keys:
+        ctx = contexts[coe_key]
         doctors_here = [a for a in associations if coe_key in a["associated_coes"]]
         per_doctor, primary_status = evaluate_context_doctors(coe_key, doctors_here)
 
-        has_recommendation_side = any(
-            s in ctx["context_sources"] for s in ("campaign", "agent_recommendation", "agent_specialty")
-        )
-        coe_match_status = "pass" if has_recommendation_side else "uncertain"
+        campaign_coe = "campaign" in ctx["context_sources"]
+        # "agent_recommendation" is only ever added from an explicit
+        # COE_NAME_MARKERS match or a close full-script paraphrase (see
+        # build_coe_contexts) — never from a bare specialty/complaint
+        # mention (those are tagged "agent_specialty"/"patient_specialty"/
+        # "patient_complaint" instead), so this never mistakes a doctor's
+        # specialty/title description for the agent announcing a COE.
+        explicit_agent_recommended = "agent_recommendation" in ctx["context_sources"]
+        explicit_coe_recommendation_status = "pass" if explicit_agent_recommended else "not_applicable"
 
-        evaluations.append({
+        # "agent_actionable_service" is only ever added when an ACTUAL
+        # Agent turn both uses a mapped-specialty alias word AND shows a
+        # concrete booking/routing/confirmation action or names an actual
+        # doctor (see build_coe_contexts/_turn_suggests_actionable_
+        # service) — i.e. the agent substantively offered, selected, or
+        # booked something connected to this COE's specialty. This is
+        # SERVICE alignment only — per the confirmed business rule
+        # superseding the earlier one, it is NOT by itself a COE
+        # recommendation (see recommendation_status below, computed
+        # separately in pass 2).
+        has_actionable_mapped_service = (
+            explicit_agent_recommended or "agent_actionable_service" in ctx["context_sources"]
+        )
+        # Patient-originated eligibility evidence — a diagnosis, active
+        # complaint, requested specialty/appointment, or the campaign
+        # entry point itself (the campaign establishes the patient's COE
+        # context even though it can never itself satisfy the human-agent
+        # recommendation requirement — see PATIENT ELIGIBILITY /
+        # CAMPAIGN ATTRIBUTION). Never derived from an agent-only mention.
+        patient_eligible = any(
+            s in ctx["context_sources"] for s in ("campaign", "patient_complaint", "patient_specialty")
+        )
+        if has_actionable_mapped_service:
+            service_alignment_status = "pass"
+        elif patient_eligible:
+            # The patient raised/requested this COE's territory, but no
+            # actual Agent turn ever substantively engaged with it (no
+            # offer, booking, or mapped-specialty response) — genuinely
+            # unresolved, never guessed into a "pass".
+            service_alignment_status = "uncertain"
+        else:
+            # A context cannot normally exist with NEITHER agent nor
+            # patient evidence (build_coe_contexts requires at least one
+            # source to create it), but this is a safe, conservative
+            # fallback should that ever change.
+            service_alignment_status = "not_applicable"
+
+        patient_need, patient_need_evidence = _describe_patient_need(coe_key, ctx)
+
+        # Eligibility source/evidence — see OUTPUT AND EVIDENCE: which of
+        # the two independent eligibility routes established this context.
+        # Priority when more than one applies (e.g. a campaign-established
+        # context the patient ALSO later describes a complaint for):
+        # a direct specialty/service request is the most specific signal,
+        # then an approved complaint category, then the campaign entry
+        # point on its own. Never a diagnosis mislabeled as a specialty
+        # request, or vice versa — the two are reported from entirely
+        # separate underlying evidence (ctx["complaint_details"] vs.
+        # ctx["specialties"]).
+        patient_specialty_entry = next(
+            (s for s in ctx["specialties"] if s.get("speaker") == "patient"), None
+        )
+        complaint_detail = ctx["complaint_details"][0] if ctx["complaint_details"] else None
+        # Bare organ/clinic words are inherently shared vocabulary between
+        # the specialty registry and the complaint registry (e.g. "الكبد"
+        # alone is a GIT specialty alias, and "أمراض الجهاز الهضمي" is
+        # BOTH a GIT alias AND an approved digestive_disease complaint) —
+        # a patient's own specialty mention is only a genuine Route A
+        # "direct specialty/service REQUEST" when its OWN evidence
+        # actually shows active booking intent ("ابغى دكتور..."/"ابغى
+        # موعد..."); a purely descriptive "عندي [specialty name]"
+        # statement, with no request language at all, is a diagnosis
+        # statement (Route B) even though the specialty word appears in
+        # it — never labelled Route A merely because the same word also
+        # happens to be a specialty alias.
+        specialty_is_genuine_request = bool(
+            patient_specialty_entry
+            and _patient_turn_has_booking_intent(patient_specialty_entry.get("verbatim_evidence") or "")
+        )
+        has_patient_specialty = (
+            "patient_specialty" in ctx["context_sources"] and patient_specialty_entry and specialty_is_genuine_request
+        )
+        has_patient_complaint = "patient_complaint" in ctx["context_sources"] and complaint_detail
+        if has_patient_specialty:
+            eligibility_source = "patient_specialty_booking_intent"
+        elif has_patient_complaint:
+            eligibility_source = "patient_approved_complaint"
+        elif "patient_specialty" in ctx["context_sources"] and patient_specialty_entry:
+            # A specialty mention with no booking-intent language of its
+            # own and no approved complaint either — still worth labelling
+            # as the specialty route for reporting purposes (it did
+            # contribute a specialty match), just not treated as a
+            # "genuine request" tie-break winner over an approved
+            # complaint above.
+            eligibility_source = "patient_specialty_booking_intent"
+        elif campaign_coe:
+            eligibility_source = "campaign_origin"
+        else:
+            eligibility_source = None
+        canonical_specialty = (
+            patient_specialty_entry["canonical_specialty"] if patient_specialty_entry
+            else (ctx["specialties"][0]["canonical_specialty"] if ctx["specialties"] else None)
+        )
+        specialty_evidence = (
+            patient_specialty_entry["verbatim_evidence"] if patient_specialty_entry
+            else (ctx["specialties"][0]["verbatim_evidence"] if ctx["specialties"] else None)
+        )
+
+        _pending.append({
             "coe": coe_key,
+            "resolved_coe": coe_key,
             "context_sources": ctx["context_sources"],
             "complaints": ctx["complaints"],
+            "complaint_details": ctx["complaint_details"],
             "specialties": ctx["specialties"],
+            "mapped_specialties": ctx["specialties"],
             "campaign_evidence": ctx["campaign_evidence"],
             "agent_coe_evidence": ctx["agent_coe_evidence"],
+            "patient_need": patient_need,
+            "patient_need_evidence": patient_need_evidence,
+            "eligibility_source": eligibility_source,
+            "complaint_category": complaint_detail["category"] if complaint_detail else None,
+            "complaint_evidence": complaint_detail["evidence"] if complaint_detail else None,
+            "canonical_specialty": canonical_specialty,
+            "specialty_evidence": specialty_evidence,
+            # Every eligibility decision in this module is 100%
+            # deterministic (no LLM ever touches specialty/complaint
+            # identification) — always True/1.0 here; kept as explicit
+            # fields per the OUTPUT AND EVIDENCE schema rather than a
+            # hidden assumption.
+            "eligibility_deterministic": True,
+            "eligibility_confidence": 1.0 if eligibility_source else 0.0,
             "doctors": per_doctor,
+            "campaign_coe": campaign_coe,
+            "explicit_agent_recommended": explicit_agent_recommended,
+            "explicit_coe_recommendation_status": explicit_coe_recommendation_status,
+            "service_alignment_status": service_alignment_status,
+            "validated_coe": coe_key,
+            "primary_doctor_status": primary_status,
+            "_patient_eligible": patient_eligible,
+        })
+
+    # ── Pass 2: recommendation_status — the NEW authoritative "was the
+    # relevant COE actually recommended by the human agent" check (see the
+    # module's missed-COE-recommendation business rule, which supersedes
+    # the earlier "an actionable mapped service alone is a recommendation"
+    # rule). Needs visibility into every OTHER context to distinguish:
+    #   - "missed": the patient's own, independently-eligible need (e.g.
+    #     a Headache package AND a separate later GIT request) simply
+    #     never got its OWN COE recommended — the OTHER explicit
+    #     recommendation in the call (if any) is itself justified by ITS
+    #     OWN patient-side evidence, so this is a second, independent,
+    #     unaddressed need, not a substitution.
+    #   - "wrong_coe": the sole patient need went unaddressed while the
+    #     agent explicitly recommended a DIFFERENT COE that has NO
+    #     patient-side eligibility of its own anywhere in the call (e.g.
+    #     patient only ever mentions Diabetes, agent proactively
+    #     recommends Headache instead) — an unjustified substitution,
+    #     not a second legitimate topic. ───────────────────────────────────
+    evaluations: list[dict[str, Any]] = []
+    for entry in _pending:
+        primary_status = entry["primary_doctor_status"]
+        if entry["explicit_agent_recommended"]:
+            # An explicit recommendation is unconditionally a pass — even
+            # a purely proactive one with no prior patient prompt is a
+            # GOOD outcome, never something to obscure as not_applicable.
+            recommendation_required: Any = True
+            recommendation_status = "pass"
+            human_agent_recommended_coe = True
+            recommendation_evidence = entry["agent_coe_evidence"]
+        elif not entry["_patient_eligible"]:
+            # No patient-originated need was ever established for this
+            # COE (e.g. a purely agent-proactive context) — the missed-
+            # recommendation requirement, which exists to catch an
+            # UNADDRESSED patient need, simply does not apply.
+            recommendation_required = False
+            recommendation_status = "not_applicable"
+            human_agent_recommended_coe = False
+            recommendation_evidence = None
+        else:
+            conflicting = [
+                other for other in _pending
+                if other is not entry and other["explicit_agent_recommended"] and not other["_patient_eligible"]
+            ]
+            # "wrong_coe" (an unjustified substitution) only when THIS
+            # context's own need received NO agent engagement of any kind
+            # (service_alignment_status != "pass") — if the agent DID
+            # substantively handle this need too (e.g. an ordinary
+            # specialty booking), the correct finding is "missed" (the
+            # COE recommendation itself was skipped), regardless of some
+            # OTHER, unrelated explicit-but-unjustified recommendation
+            # elsewhere in the same call.
+            recommendation_required = True
+            recommendation_status = (
+                "wrong_coe" if conflicting and entry["service_alignment_status"] != "pass" else "missed"
+            )
+            human_agent_recommended_coe = False
+            recommendation_evidence = None
+
+        missed_recommendation = recommendation_status in ("missed", "wrong_coe")
+        is_violation = primary_status == "fail" or missed_recommendation
+
+        note = None
+        if missed_recommendation:
+            agent_response_evidence = entry["agent_coe_evidence"] or next(
+                (s["evidence"] for s in entry["mapped_specialties"] if s.get("speaker") == "agent"),
+                None,
+            )
+            note = _build_missed_recommendation_note(
+                coe_key=entry["coe"],
+                patient_need=entry["patient_need"],
+                patient_need_evidence=entry["patient_need_evidence"],
+                mapped_specialties=entry["mapped_specialties"],
+                agent_response_evidence=agent_response_evidence,
+                wrong_coe=recommendation_status == "wrong_coe",
+                complaint_category=entry["complaint_category"] if entry["eligibility_source"] == "patient_approved_complaint" else None,
+            )
+
+        # coe_match_status is kept, mirroring recommendation_status
+        # exactly, ONLY for backward compatibility with existing callers
+        # that read this field name — recommendation_status is the new
+        # authoritative field; this is never a second, independently-
+        # computed value.
+        coe_match_status = recommendation_status
+
+        _applicable_statuses = [
+            s for s in (recommendation_status, entry["service_alignment_status"], primary_status)
+            if s and s != "not_applicable"
+        ]
+        context_status = (
+            "fail" if is_violation
+            else "uncertain" if any(s == "uncertain" for s in _applicable_statuses)
+            else "pass"
+        )
+
+        evaluations.append({
+            "coe": entry["coe"],
+            "resolved_coe": entry["resolved_coe"],
+            "context_sources": entry["context_sources"],
+            "complaints": entry["complaints"],
+            "specialties": entry["specialties"],
+            "mapped_specialties": entry["mapped_specialties"],
+            "campaign_evidence": entry["campaign_evidence"],
+            "agent_coe_evidence": entry["agent_coe_evidence"],
+            "patient_need": entry["patient_need"],
+            "patient_need_evidence": entry["patient_need_evidence"],
+            "eligibility_source": entry["eligibility_source"],
+            "complaint_category": entry["complaint_category"],
+            "complaint_evidence": entry["complaint_evidence"],
+            "canonical_specialty": entry["canonical_specialty"],
+            "specialty_evidence": entry["specialty_evidence"],
+            "eligibility_deterministic": entry["eligibility_deterministic"],
+            "eligibility_confidence": entry["eligibility_confidence"],
+            "doctors": entry["doctors"],
+            # offered_doctors: every distinct doctor named for this context
+            # (any role), in first-mention order — the full set the agent
+            # put in front of the patient. selected_initial_doctors: the
+            # subset actually validated as the initial booking (role ==
+            # "initial_primary" after evaluate_context_doctors' offered-
+            # vs-selected narrowing) — an approved doctor merely OFFERED
+            # but not selected/confirmed must never hide an unapproved
+            # SELECTED one (see evaluate_context_doctors' docstring).
+            "offered_doctors": [d["extracted_name"] for d in entry["doctors"]],
+            "selected_initial_doctors": [
+                d["extracted_name"] for d in entry["doctors"] if d["role"] == "initial_primary"
+            ],
+            "campaign_coe": entry["campaign_coe"],
+            "explicit_agent_recommended": entry["explicit_agent_recommended"],
+            "explicit_coe_recommendation_status": entry["explicit_coe_recommendation_status"],
+            "human_agent_recommended_coe": human_agent_recommended_coe,
+            "recommendation_required": recommendation_required,
+            "recommendation_status": recommendation_status,
+            "recommendation_evidence": recommendation_evidence,
+            "missed_recommendation": missed_recommendation,
+            "note": note,
+            "service_alignment_status": entry["service_alignment_status"],
+            "validated_coe": entry["validated_coe"],
             "coe_match_status": coe_match_status,
             "primary_doctor_status": primary_status,
-            "is_violation": primary_status == "fail",
+            "context_status": context_status,
+            "is_violation": is_violation,
         })
 
     return evaluations

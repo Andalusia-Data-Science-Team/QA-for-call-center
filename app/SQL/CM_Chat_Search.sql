@@ -64,7 +64,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
 ),
 TopConversations AS
 (
-    SELECT TOP (100) *
+    SELECT TOP (10) *
     FROM ConvSummary
     ORDER BY Start_DateTime DESC
 )
@@ -99,7 +99,7 @@ SELECT
 FROM TopConversations tc
 INNER JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[MessagesTotal] m
     ON m.ConversationId = tc.UniqueId
-where m.ConversationId = UPPER('725b6409-bd99-f111-9b33-000d3aa9d409')
+--where m.ConversationId = UPPER('09dc550a-a794-f111-9b33-000d3aa9d409')
 ORDER BY
     tc.Start_DateTime DESC,
     tc.UniqueId,
