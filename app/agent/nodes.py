@@ -294,45 +294,72 @@ async def _focused_llm_call(
     user_prompt: str,
     llm_client: LLMClient,
     state: AgentState,
+    max_json_retries: int = 2,
 ) -> tuple[dict | None, dict | None]:
     """
     Internal helper: call the LLM, log usage, parse JSON.
     Returns (parsed_dict, error_dict).  Exactly one of the two will be None.
+
+    A call that SUCCEEDS but returns malformed/truncated JSON (e.g. a
+    response that stops mid-string — "Unterminated string starting at:
+    ...") is a different failure mode than a raised exception (already
+    retried inside LLMClient.complete, with backoff, for network/API
+    errors) — the request itself completed, but the body it got back
+    wasn't valid JSON. This is usually a transient, non-reproducible
+    glitch rather than a persistent one, so it is worth a small number of
+    fresh retries here before giving up and routing the whole call to
+    handle_error. Each retry re-sends the SAME prompt (no prompt content
+    is implicated by a truncated/garbled response), and the FINAL error
+    (if every attempt fails) is logged in the exact same shape as before,
+    so nothing downstream needs to change.
     """
-    try:
-        raw_text, usage = await llm_client.complete(SYSTEM_PROMPT, user_prompt)
-    except Exception as exc:
-        logger.error("%s LLM call failed | call_id=%s | %s", node_name, call_id, exc)
-        return None, {
-            "error": f"{node_name}: LLM call failed: {exc}",
-            "error_node": node_name,
-            "node_trace": _trace(state, node_name),
-        }
+    last_parse_exc: json.JSONDecodeError | None = None
+    last_raw_text = ""
+    for attempt in range(1, max_json_retries + 2):  # 1 initial try + N retries
+        try:
+            raw_text, usage = await llm_client.complete(SYSTEM_PROMPT, user_prompt)
+        except Exception as exc:
+            logger.error("%s LLM call failed | call_id=%s | %s", node_name, call_id, exc)
+            return None, {
+                "error": f"{node_name}: LLM call failed: {exc}",
+                "error_node": node_name,
+                "node_trace": _trace(state, node_name),
+            }
 
-    logger.debug(
-        "%s | call_id=%s latency=%.0fms tokens_in=%s tokens_out=%s",
-        node_name,
-        call_id,
-        usage.get("latency_ms", 0),
-        usage.get("input_tokens") or usage.get("prompt_tokens"),
-        usage.get("output_tokens") or usage.get("completion_tokens"),
-    )
-
-    clean = _strip_markdown_fences(raw_text)
-    try:
-        data: dict = json.loads(clean)
-    except json.JSONDecodeError as exc:
-        logger.error(
-            "%s JSON parse error | call_id=%s snippet=%s | %s",
-            node_name, call_id, raw_text[:300], exc,
+        logger.debug(
+            "%s | call_id=%s latency=%.0fms tokens_in=%s tokens_out=%s",
+            node_name,
+            call_id,
+            usage.get("latency_ms", 0),
+            usage.get("input_tokens") or usage.get("prompt_tokens"),
+            usage.get("output_tokens") or usage.get("completion_tokens"),
         )
-        return None, {
-            "error": f"{node_name}: LLM returned invalid JSON: {exc}",
-            "error_node": node_name,
-            "node_trace": _trace(state, node_name),
-        }
 
-    return data, None
+        clean = _strip_markdown_fences(raw_text)
+        try:
+            data: dict = json.loads(clean)
+        except json.JSONDecodeError as exc:
+            last_parse_exc = exc
+            last_raw_text = raw_text
+            if attempt <= max_json_retries:
+                logger.warning(
+                    "%s JSON parse error (attempt %d/%d) — retrying | call_id=%s snippet=%s | %s",
+                    node_name, attempt, max_json_retries + 1, call_id, raw_text[:300], exc,
+                )
+                continue
+            break
+        else:
+            return data, None
+
+    logger.error(
+        "%s JSON parse error | call_id=%s snippet=%s | %s",
+        node_name, call_id, last_raw_text[:300], last_parse_exc,
+    )
+    return None, {
+        "error": f"{node_name}: LLM returned invalid JSON: {last_parse_exc}",
+        "error_node": node_name,
+        "node_trace": _trace(state, node_name),
+    }
 
 
 # ---------------------------------------------------------------------------
