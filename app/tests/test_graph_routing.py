@@ -138,6 +138,74 @@ def test_home_care_customer_location_does_not_execute_validate_location(monkeypa
     assert calls["count"] == 0
 
 
+# ── 8. Regression — an anomaly-scan/booking call with an unrelated campaign
+#      click, a "سوينا" agent turn (must not match "وين"), and an unrelated
+#      automatic closing message mentioning "عيادات" must never combine
+#      into a location signal or execute validate_location. ────────────────
+
+ANOMALY_SCAN_TRANSCRIPT = (
+    "Patient: BU-AHJ-Google-button-اضغط ارسال الآن واستفيد من عروض مستشفي اندلسية -\n"
+    "Patient: عايزة اعمل اشعة السونار الرباعي وحجز موعد\n"
+    "Agent: سوينا كشفية مع طبيب ؟\n"
+    "Patient: لا لسه\n"
+    "Agent: تمام هحجزلك موعد بكرة الساعة 5\n"
+    "Agent: نشكرك لتواصلك مع عيادات أندلسية صحة، نتمنى لك دوام الصحة والعافية\n"
+)
+
+
+def test_anomaly_scan_campaign_call_skips_location_validation_entirely(monkeypatch):
+    import app.service_hub.crm_location as crm_location
+
+    calls = {"count": 0}
+    monkeypatch.setattr(
+        crm_location, "fetch_ksa_locations",
+        lambda *a, **k: calls.__setitem__("count", calls["count"] + 1) or [],
+    )
+
+    assert _location_intent_router({"call": _call(ANOMALY_SCAN_TRANSCRIPT)}) == "skip_location"
+    result = _run(ANOMALY_SCAN_TRANSCRIPT)
+    assert "validate_location" not in result["node_trace"]
+    loc = result["location_validation"]
+    assert loc["outcome"] == "NOT_APPLICABLE"
+    assert loc["request_detected"] is False
+    assert loc["applicable"] is False
+    assert loc["is_violation"] is False
+    assert calls["count"] == 0
+
+
+# ── Regression — a generic "طبيب"/"دكتور" title followed by a purpose/
+#    action clause ("زيارة طبيب لكتابة وصفة") must never fabricate a
+#    doctor-name candidate or route to validate_doctor. ────────────────────
+
+NUTRITION_PRESCRIPTION_TRANSCRIPT = (
+    "Patient: الوالد يحتاج مغذيات...\n"
+    "Agent: هل متاح وصفة طبية بأنواع المغذيات اللي يحتاجها\n"
+    "Patient: لا ما اخذنا الوصفة...\n"
+    "Agent: بنحتاج وصفة بها اسم الادوية\n"
+    "Agent: اذا غير متوفر من الممكن نقوم بزيارة طبيب لكتابة وصفة والكشف وقياس العلامات الحيوية\n"
+    "Patient: كم تكلفة الزيارة المنزلية\n"
+    "Agent: 375 ريال غير شاملة الضريبة للطبيب العام\n"
+)
+
+
+def test_generic_prescription_visit_call_skips_doctor_validation_entirely(monkeypatch):
+    import app.service_hub.crm_doctors as crm_doctors
+
+    calls = {"count": 0}
+    monkeypatch.setattr(
+        crm_doctors, "fetch_doctors",
+        lambda *a, **k: calls.__setitem__("count", calls["count"] + 1) or [],
+    )
+
+    assert _doctor_intent_router({"call": _call(NUTRITION_PRESCRIPTION_TRANSCRIPT)}) == "skip_doctor"
+    result = _run(NUTRITION_PRESCRIPTION_TRANSCRIPT)
+    assert "validate_doctor" not in result["node_trace"]
+    doc = result["doctor_validation"]
+    assert doc["outcome"] == "NOT_APPLICABLE"
+    assert doc["is_violation"] is False
+    assert calls["count"] == 0
+
+
 # ── 8. Bank validation behavior remains unchanged ───────────────────────────
 
 def test_bank_validation_unaffected_by_location_routing_change():

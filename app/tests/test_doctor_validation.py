@@ -2051,3 +2051,132 @@ def test_multi_doctor_crm_fetched_once(monkeypatch):
     transcript = "Agent: Here are the options:\nDr Ahmed Ali\nDr Mohamed Hassan\nDr Khaled Adel\n"
     dv.validate_doctor_information(call(transcript), doctors)
     assert calls["count"] == 1
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Regression — a generic doctor title followed by a purpose/action clause
+# ("زيارة طبيب لكتابة وصفة" = "a doctor visit IN ORDER TO write a
+# prescription") must never fabricate a doctor-name candidate or trigger
+# doctor validation. See _LAM_PURPOSE_ACTION_WORDS/
+# _strip_lam_prefix_for_purpose_words, _NON_NAME_MISC_WORDS, and the
+# word-boundary fix on _ACTIVE_BOOKING_VERB_RE/_BOOKING_VERB_FRAGMENT
+# (bare "ممكن" must never match inside "الممكن").
+# ═════════════════════════════════════════════════════════════════════════
+
+NUTRITION_PRESCRIPTION_CLAUSE = (
+    "Agent: اذا غير متوفر من الممكن نقوم بزيارة طبيب لكتابة وصفة والكشف وقياس العلامات الحيوية"
+)
+
+NUTRITION_PRESCRIPTION_FULL_TRANSCRIPT = (
+    "Patient: الوالد يحتاج مغذيات...\n"
+    "Agent: هل متاح وصفة طبية بأنواع المغذيات اللي يحتاجها\n"
+    "Patient: لا ما اخذنا الوصفة...\n"
+    "Agent: بنحتاج وصفة بها اسم الادوية\n"
+    "Agent: اذا غير متوفر من الممكن نقوم بزيارة طبيب لكتابة وصفة والكشف وقياس العلامات الحيوية\n"
+    "Patient: كم تكلفة الزيارة المنزلية\n"
+    "Agent: 375 ريال غير شاملة الضريبة للطبيب العام\n"
+)
+
+
+def test_generic_prescription_visit_clause_produces_no_doctor_candidates():
+    """Regression test 1 — the exact reported clause: no patient or agent
+    doctor candidates, doctor_validation_needed is False, doctor_intent is
+    not_applicable, and no fabricated candidate leaks through."""
+    c = call(NUTRITION_PRESCRIPTION_CLAUSE)
+    patient_c, agent_c, _ignored = extract_doctor_turn_candidates(c)
+    assert patient_c == []
+    assert agent_c == []
+    assert doctor_validation_needed(c) is False
+
+    ctx = _ctx(NUTRITION_PRESCRIPTION_CLAUSE)
+    assert ctx["doctor_intent"] == "not_applicable"
+
+    all_candidates = " ".join(patient_c + agent_c)
+    for fragment in ("لكتابه", "كتابه", "وصفه"):
+        assert fragment not in all_candidates
+
+
+def test_generic_prescription_visit_full_transcript_is_not_applicable():
+    """Regression test 2 — the complete supplied transcript: no doctor
+    validation is needed, and the classifier reports a generic role (never
+    a fabricated named-doctor booking)."""
+    c = call(NUTRITION_PRESCRIPTION_FULL_TRANSCRIPT)
+    assert doctor_validation_needed(c) is False
+    ctx = _ctx(NUTRITION_PRESCRIPTION_FULL_TRANSCRIPT)
+    assert ctx["doctor_intent"] == "not_applicable"
+    assert ctx["doctor_role"] != "agent_recommended"
+
+
+@pytest.mark.parametrize("phrase", [
+    "زيارة طبيب لكتابة وصفة",
+    "طبيب لعمل الكشف",
+    "طبيب لإجراء التقييم",
+    "طبيب لقياس العلامات الحيوية",
+    "دكتور لتحديد الخطة",
+    "طبيب لكتابة التقرير",
+    "الطبيب العام",
+])
+def test_generic_purpose_clauses_produce_no_doctor_candidate(phrase):
+    """Regression test 3 — parameterized generic-purpose cases: none of
+    these must produce a doctor-name candidate."""
+    from app.service_hub.doctor_validation import _doctor_name_candidate
+
+    assert _doctor_name_candidate(phrase) is None
+    assert detect_doctor_mention(phrase) is False
+
+
+def test_mumkin_boundary_does_not_match_inside_alommkin():
+    """Regression test 4 — 'من الممكن نقوم بزيارة طبيب' must not treat
+    'الممكن' as a standalone 'ممكن' booking marker, and the doctor-booking
+    proximity regex must not match inside longer Arabic words either."""
+    from app.service_hub.doctor_validation import _ACTIVE_BOOKING_VERB_RE, _DOCTOR_BOOKING_ATTACH_RE
+
+    clause = "من الممكن نقوم بزيارة طبيب لكتابة وصفة"
+    assert _ACTIVE_BOOKING_VERB_RE.search(clause) is None
+    assert _DOCTOR_BOOKING_ATTACH_RE.search(clause) is None
+    # A genuine standalone "ممكن" must still match.
+    assert _ACTIVE_BOOKING_VERB_RE.search("ممكن نحجز مع الدكتور محمد أحمد") is not None
+
+
+# ── Positive controls — must keep triggering doctor validation ─────────────
+
+@pytest.mark.parametrize("transcript,expected_intent,expected_role", [
+    ("Patient: ممكن نحجز مع الدكتور محمد أحمد\n", "specific_doctor_booking", "patient_selected"),
+    ("Patient: أبغى موعد مع دكتورة سارة سليمان\n", "specific_doctor_booking", "patient_selected"),
+    ("Agent: أرشح لك الدكتور محمد الألفي\n", "specific_doctor_booking", "agent_recommended"),
+    # "هل الدكتور أحمد أفندي متخصص قلب؟" (same semantic intent — a patient
+    # inquiry about a doctor's specialty) is a PRE-EXISTING gap unrelated
+    # to this fix: "متخصص" (adjective form) is not yet a recognised
+    # _DOCTOR_FACTUAL_MARKERS synonym for "تخصص" (noun form) — verified
+    # via `git stash` in an earlier session that this is unaffected by
+    # this change either way. Using the already-proven-working noun-form
+    # phrasing here instead so this positive control actually exercises
+    # specific_doctor_inquiry.
+    ("Patient: ما تخصص الدكتور أحمد أفندي؟\n", "specific_doctor_inquiry", "doctor_inquiry"),
+])
+def test_positive_controls_still_trigger_doctor_validation(transcript, expected_intent, expected_role):
+    c = call(transcript)
+    ctx = _ctx(transcript)
+    assert ctx["doctor_intent"] == expected_intent
+    if expected_role is not None:
+        assert ctx["doctor_role"] == expected_role
+    assert doctor_validation_needed(c) is True
+
+
+def test_plausible_unknown_name_remains_doctor_unresolved():
+    """A plausible but unknown real name must still be eligible for
+    DOCTOR_UNRESOLVED — the fix must never convert a legitimate unnamed-
+    but-plausible doctor reference into NOT_APPLICABLE."""
+    result = validate("Patient: ابغى احجز مع الدكتور رائد منصور\n", doctors=ALL_DOCTORS)
+    assert result["outcome"] == "DOCTOR_UNRESOLVED"
+
+
+@pytest.mark.parametrize("name", ["لمياء", "ليلى", "لبنى"])
+def test_lam_prefixed_real_names_remain_extractable(name):
+    """Genuine names beginning with 'ل' must remain valid — the general
+    purpose-prefix stripping must never reclassify them as non-names."""
+    from app.service_hub.doctor_validation import _doctor_name_candidate
+
+    cand = _doctor_name_candidate(f"دكتورة {name} أحمد")
+    assert cand is not None
+    assert cand.split()[0].startswith("ل")

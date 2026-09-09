@@ -950,3 +950,289 @@ def test_no_regression_in_graph_level_skip_behavior():
     assert patient_intent is False
     assert agent_intent is False
     assert location_validation_needed(call("Agent: ممكن لوكيشن المنزل؟\nPatient: https://maps.google.com/?q=1,2")) is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Regression — false-positive location validation from an unrelated
+# campaign click + "سوينا" (contains "وين" as a SUBSTRING, not a word) +
+# an unrelated automatic closing message's generic "عيادات" mention.
+# See location_validation.py's module-level "TURN-SCOPED WEAK MARKERS"
+# section and validate_location_request's defensive NOT_APPLICABLE rule.
+# ═════════════════════════════════════════════════════════════════════════
+
+ANOMALY_SCAN_TRANSCRIPT = (
+    "Patient: BU-AHJ-Google-button-اضغط ارسال الآن واستفيد من عروض مستشفي اندلسية -\n"
+    "Patient: عايزة اعمل اشعة السونار الرباعي وحجز موعد\n"
+    "Agent: سوينا كشفية مع طبيب ؟\n"
+    "Patient: لا لسه\n"
+    "Agent: تمام هحجزلك موعد بكرة الساعة 5\n"
+    "Agent: نشكرك لتواصلك مع عيادات أندلسية صحة، نتمنى لك دوام الصحة والعافية\n"
+)
+
+
+def test_anomaly_scan_transcript_is_not_applicable():
+    """Regression test 1 — the reported false-positive: a campaign click
+    mentioning a generic "مستشفي" word, an unrelated "سوينا كشفية مع
+    طبيب؟" agent turn, and an unrelated automatic closing message
+    mentioning "عيادات" must never combine into a location request."""
+    patient_text, agent_text = _turns(ANOMALY_SCAN_TRANSCRIPT)
+    patient_intent, agent_intent = detect_location_intent(patient_text, agent_text)
+    assert patient_intent is False
+    assert agent_intent is False
+
+    result = validate(ANOMALY_SCAN_TRANSCRIPT)
+    assert result["outcome"] == "NOT_APPLICABLE"
+    assert result["request_detected"] is False
+    assert result["applicable"] is False
+    assert result["is_violation"] is False
+
+
+def test_anomaly_scan_transcript_routes_to_skip_and_never_fetches_crm(monkeypatch):
+    """Regression test 1 (routing) — the same transcript must route
+    straight to skip_location_validation: no CRM fetch, no branch
+    resolution, and a NOT_APPLICABLE/non-punitive result."""
+    import app.service_hub.crm_location as crm_location
+    from app.agent.nodes import validate_location_node
+
+    calls = {"count": 0}
+
+    def _record_and_fail(*_args, **_kwargs):
+        calls["count"] += 1
+        return []
+
+    monkeypatch.setattr(crm_location, "fetch_ksa_locations", _record_and_fail)
+
+    transcript = call(ANOMALY_SCAN_TRANSCRIPT)
+    assert location_validation_needed(transcript) is False
+    result = asyncio.run(validate_location_node({"call": transcript}))
+
+    assert calls["count"] == 0
+    assert result["location_validation"]["outcome"] == "NOT_APPLICABLE"
+    assert result["location_validation"]["applicable"] is False
+    assert result["location_validation"]["is_violation"] is False
+
+
+def test_sawwayna_does_not_match_ween():
+    """Regression test 2 — "سوينا" (we did/made) must never match the weak
+    marker "وين" (where) as a substring; word/token boundaries are
+    required."""
+    assert detect_location_request("سوينا كشفية مع طبيب؟") is False
+    assert detect_location_request("Agent: سوينا كشفية مع طبيب ؟") is False
+
+
+def test_weak_marker_and_place_noun_in_separate_turns_do_not_combine():
+    """Regression test 3 — a weak marker in one agent turn and a place
+    noun in a completely separate agent turn must never combine into one
+    location signal, even when detect_location_request runs on the whole
+    (newline-joined) agent-side text."""
+    agent_text = "سوينا كشفية مع طبيب ؟\nتمام هحجزلك موعد بكرة\nنشكرك لتواصلك مع عيادات أندلسية صحة"
+    assert detect_location_request(agent_text) is False
+    # Even a GENUINE weak marker (not the سوينا false match) in one turn
+    # must not combine with a place noun mentioned only in another turn.
+    agent_text_2 = "طيب وين نكمل بعد كده؟\nنشكرك لتواصلك مع عيادات أندلسية صحة"
+    assert detect_location_request(agent_text_2) is False
+
+
+def test_campaign_generic_hospital_mention_does_not_resolve_a_branch():
+    """Regression test 4 — a campaign message containing only a generic
+    "مستشفى"/"مستشفي" mention (no branch/location request, no explicit
+    branch identifier, no concrete address) must never trigger validation
+    or produce a resolved branch end-to-end. The bare word not being a
+    REQUEST at all (detect_location_request stays False) is what keeps
+    validate_location_request() from ever reaching branch resolution for
+    it in the first place (see the module's defensive NOT_APPLICABLE
+    rule) — resolve_branch_candidates() itself is a low-level, request-
+    context-free matcher, and is intentionally not the layer responsible
+    for this distinction (see test_ween_almustashfa_still_matches /
+    test_genuine_patient_request_with_no_address_remains_a_violation,
+    where the SAME generic word legitimately resolves a branch once an
+    actual location request is present)."""
+    campaign_text = "BU-AHJ-Google-button-اضغط ارسال الآن واستفيد من عروض مستشفي اندلسية"
+    assert detect_location_request(campaign_text) is False
+    transcript = f"Patient: {campaign_text}\nAgent: تمام هحجزلك موعد بكرة"
+    assert location_validation_needed(call(transcript)) is False
+    result = validate(transcript)
+    assert result["outcome"] == "NOT_APPLICABLE"
+    assert result["is_violation"] is False
+
+
+# ── Positive controls — genuine location requests must still trigger ───────
+
+def test_ween_almustashfa_still_matches():
+    assert detect_location_request("وين المستشفى؟") is True
+    assert detect_location_request("وين المستشفي؟") is True
+
+
+def test_feen_farh_sanabel_still_matches():
+    assert detect_location_request("فين فرع السنابل؟") is True
+
+
+def test_agent_proactive_location_share_still_matches():
+    assert detect_location_request("هشارك مع حضرتك لوكيشن فرع السنابل") is True
+
+
+def test_concrete_proactive_agent_address_still_triggers_and_passes():
+    result = validate(
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+    )
+    assert result["applicable"] is True
+    assert result["outcome"] == "PASS"
+    assert result["requested_branch"] == "مستشفى أندلسية جدة"
+
+
+def test_genuine_patient_request_with_no_address_remains_a_violation():
+    """Regression test 8 (requirement) — a genuine patient location
+    request must still be punitive when the agent gives no address at
+    all; the NOT_APPLICABLE defensive rule must never weaken this."""
+    result = validate("Patient: وين المستشفى؟\nAgent: تمام هحولك بس لحظة")
+    assert result["outcome"] == "NO_ADDRESS_PROVIDED"
+    assert result["request_detected"] is True
+    assert result["is_violation"] is True
+
+
+def test_validate_location_request_no_request_no_address_is_not_applicable():
+    """Requirement 6 direct-invocation test — requested=False (via empty
+    patient_text) and no genuine agent-provided address must return
+    NOT_APPLICABLE, and request_detected must faithfully stay False, never
+    hardcoded to True."""
+    transcript = call("Patient: عايزة اعمل اشعة السونار الرباعي\nAgent: تمام هحجزلك موعد بكرة")
+    patient_text, agent_text = _turns(transcript.transcript)
+    result = validate_location_request(
+        transcript, ALL_LOCATIONS, patient_text=patient_text, agent_text=agent_text,
+    )
+    assert result["outcome"] == "NOT_APPLICABLE"
+    assert result["request_detected"] is False
+    assert result["applicable"] is False
+    assert result["is_violation"] is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Regression — false INCOMPLETE_ADDRESS when the CRM's OWN
+# cr301_description has a baked-in "العنوان :" label (a real production
+# pattern), inflating validate_location_answer()'s denominator with
+# non-address label/identity tokens (the label itself, the branch's own
+# name, and region metadata) that the agent is never expected to repeat.
+# See _address_completeness_tokens() / ADDRESS COMPLETENESS VS BRANCH
+# IDENTITY in location_validation.py.
+# ═════════════════════════════════════════════════════════════════════════
+
+# A separate, dedicated fixture (never mutating the shared LOC_HOSPITAL
+# used by ~15 pre-existing tests) whose cr301_description bakes in the
+# "العنوان :" label prefix exactly as the reported production CRM record
+# does — this is what actually inflates the OLD scoring denominator with
+# a non-address label token.
+LOC_HOSPITAL_WITH_LABEL = {
+    "cr301_branchname": "مستشفى أندلسية جدة",
+    "cr301_area": "جدة", "cr301_country": "السعودية",
+    "cr301_description": "العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة",
+    "cr18c_region": "KSA", "statecodename": "Active",
+}
+LOCATIONS_WITH_LABELED_HOSPITAL = [
+    LOC_SULTAN, LOC_SANABEL, LOC_SARI, LOC_DENTAL_SULTAN, LOC_MACARONA, LOC_HOSPITAL_WITH_LABEL, LOC_CAIRO,
+]
+
+
+def _validate_labeled(transcript: str):
+    return validate(transcript, locations=LOCATIONS_WITH_LABELED_HOSPITAL)
+
+
+def test_exact_reported_regression_mistyped_label_still_passes():
+    """Regression test 1 — the exact reported case: CRM description bakes
+    in "العنوان :", the agent mistypes it as "لعنوان:" (missing ع). The
+    complete physical address is otherwise verbatim-correct; this must
+    PASS, not INCOMPLETE_ADDRESS."""
+    result = _validate_labeled(
+        "Agent: لعنوان: تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+    )
+    assert result["outcome"] == "PASS"
+    assert result["is_violation"] is False
+
+
+def test_complete_address_without_any_label_passes():
+    """Regression test 2 — the same complete address with NO "العنوان"
+    label at all must also PASS."""
+    result = _validate_labeled(
+        "Agent: تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+    )
+    assert result["outcome"] == "PASS"
+    assert result["is_violation"] is False
+
+
+def test_complete_address_without_branch_name_passes():
+    """Regression test 3 — the same complete address, never repeating
+    "مستشفى أندلسية جدة", must PASS once branch identity is already
+    resolved from the provided address content itself."""
+    result = _validate_labeled(
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+    )
+    assert result["outcome"] == "PASS"
+    assert result["requested_branch"] == "مستشفى أندلسية جدة"
+    assert "مستشفى" not in "العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+
+
+def test_complete_address_plus_map_url_passes_url_stays_separate():
+    """Regression test 4 — a complete address plus a Google Maps URL must
+    PASS; the URL is supplementary display evidence, never mixed into
+    textual scoring (see _split_address_and_map)."""
+    result = _validate_labeled(
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة\n"
+        "Agent: https://maps.google.com/?q=21.5,39.2"
+    )
+    assert result["outcome"] == "PASS"
+    assert result["is_violation"] is False
+
+
+def test_genuinely_incomplete_address_still_flagged():
+    """Regression test 5 — a genuinely incomplete address (a single street
+    fragment, missing the rest of the description) must still be flagged
+    as INCOMPLETE_ADDRESS, never a false PASS from an over-corrected fix.
+    Branch identity is established via the agent's own explicit "فرع
+    المستشفى" anchor (the same phrasing several pre-existing tests already
+    use), then the agent gives only a fragment of the real address."""
+    result = _validate_labeled(
+        "Agent: في فرع المستشفى الرئيسي فقط\nAgent: طريق الجامعة - جدة"
+    )
+    assert result["outcome"] == "INCOMPLETE_ADDRESS"
+    assert result["is_violation"] is True
+    assert result["match_confidence"] is not None
+    assert 0.25 <= result["match_confidence"] < 0.6
+
+
+def test_branch_name_alone_is_not_a_complete_physical_address():
+    """Regression test 6 — the branch name alone ("مستشفى أندلسية جدة",
+    with no street/district content at all) must never count as a
+    complete physical address."""
+    result = _validate_labeled("Agent: مستشفى أندلسية جدة")
+    assert result["outcome"] != "PASS"
+
+
+def test_wrong_branch_concrete_address_still_fails():
+    """Regression test 7 — a concrete, complete address belonging to a
+    DIFFERENT branch than the one explicitly requested must still fail as
+    WRONG_LOCATION; the fix must never make mismatched addresses pass.
+    The patient's explicit "فرع السنابل" anchor resolves branch identity;
+    the agent then answers with the (unrelated, but genuinely complete)
+    hospital address instead."""
+    result = validate(
+        "Patient: فين فرع السنابل؟\n"
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة",
+        locations=LOCATIONS_WITH_LABELED_HOSPITAL,
+    )
+    assert result["requested_branch"] == "عيادات أندلسية فرع السنابل"
+    assert result["outcome"] == "WRONG_LOCATION"
+    assert result["is_violation"] is True
+
+
+def test_address_completeness_tokens_exclude_name_and_region_and_label():
+    """Direct unit check on the new scoring-token source: the hospital's
+    address-completeness tokens must include real street/district detail
+    (عبدالله/سليمان/الجامعة) but never the branch's own name tokens
+    (مستشفي/اندلسيه), the region code (KSA), or the "العنوان" label."""
+    from app.service_hub.location_validation import _address_completeness_tokens
+
+    tokens = _address_completeness_tokens(LOC_HOSPITAL_WITH_LABEL, LOCATIONS_WITH_LABELED_HOSPITAL)
+    assert {"عبدالله", "سليمان", "الجامعه"} <= tokens
+    assert "مستشفي" not in tokens
+    assert "اندلسيه" not in tokens
+    assert "العنوان" not in tokens
+    assert "ksa" not in tokens

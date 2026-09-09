@@ -200,7 +200,7 @@ _GENERIC_SPECIALTY_WORDS = {
     "عظام", "اسنان", "أسنان", "اطفال", "أطفال", "نساء", "ولاده", "ولادة",
     "جلديه", "جلدية", "قلب", "مخ", "اعصاب", "أعصاب", "عيون", "انف", "أنف",
     "اذن", "أذن", "حنجره", "حنجرة", "باطنه", "باطنة", "مسالك", "بوليه",
-    "بولية", "نفسيه", "نفسية", "تغذيه", "تغذية", "جراحه", "جراحة", "عامه",
+    "بولية", "نفسيه", "نفسية", "تغذيه", "تغذية", "جراحه", "جراحة", "عام", "عامه",
     "عامة", "تجميل", "روماتيزم", "غدد", "صماء", "سكري", "اورام", "أورام",
     "طوارئ", "سمعيات", "تخاطب", "امراض", "أمراض",
     "تناسليه", "تناسلية", "كلي", "كلى", "مفاصل", "عمود", "فقري", "فقرى",
@@ -342,6 +342,20 @@ _NON_NAME_MISC_WORDS = {
     "حبوب", "اقراص", "أقراص", "مكمل", "مكملات",
     "جلسه", "جلسة", "جلسات", "التقييم", "تقييم", "الخطه", "خطه", "خطة",
     "بدايه", "بداية",
+    # Clinical/administrative ACTION or SERVICE nouns — the PURPOSE of a
+    # doctor visit ("طبيب لكتابة وصفة" = "a doctor IN ORDER TO write a
+    # prescription", "طبيب لعمل الكشف" = "...to do the exam", "طبيب لقياس
+    # العلامات الحيوية" = "...to measure vital signs"), never a person's
+    # name. These BARE (non-prefixed) forms cover the rare case the word
+    # appears with no attached "لـ" at all; the far more common PREFIXED
+    # form ("لكتابة"/"لعمل"/"لإجراء"/"لقياس"/"لتقرير") is recognised
+    # separately via _LAM_PURPOSE_ACTION_WORDS/
+    # _strip_lam_prefix_for_purpose_words below, without enumerating every
+    # prefixed surface form here too. "كشف"/"تحديد"/"خطة" are already
+    # covered elsewhere (_NON_NAME_ADMIN_WORDS/_NON_NAME_FIRST_WORDS/
+    # above) — only the words not already blocked are added here.
+    "كتابة", "كتابه", "وصفة", "وصفه", "عمل", "إجراء", "اجراء",
+    "قياس", "تقرير",
     # English function/connector words — real regression: an English
     # self-introduction ("this is Dr. Mohamed Ahmed FROM Andalusia") or a
     # bare "the doctor WILL DECIDE how many sessions..." extracted the
@@ -462,8 +476,52 @@ def _strip_lam_taa_prefix(word: str) -> str:
     of a name — real regression: "...للاخصائي لتتطلع عليها" ("...to the
     specialist, for [them] to review it") left "لتتطلع" as a stray one-word
     'name' once its trailing "عليها" (a preposition+pronoun fusion — see
-    _PREP_PRONOUN_FUSION_RE) was already correctly cut off."""
+    _PREP_PRONOUN_FUSION_RE) was already correctly cut off. Checked
+    against the FULL _NON_NAME_WORDS vocabulary (see _is_non_name_word) —
+    safe specifically because "لت..." is a narrow enough prefix that it
+    essentially never collides with an ordinary dative/benefactive "ل"
+    attached to some OTHER already-blocked word (contrast with
+    _strip_lam_prefix_for_purpose_words below, which is intentionally
+    checked against a much narrower vocabulary for exactly that reason)."""
     return word[1:] if word.startswith("لت") and len(word) >= 4 else word
+
+
+# Purpose/action nouns commonly attached via the "ل" (purpose, "in order
+# to/for") preposition directly after a generic doctor title — "لكتابة" =
+# "in order to write", "لعمل" = "in order to do/perform", "لإجراء" = "in
+# order to conduct", "لقياس" = "in order to measure". See
+# _strip_lam_prefix_for_purpose_words.
+_LAM_PURPOSE_ACTION_WORDS = {
+    "كتابة", "كتابه", "وصفة", "وصفه", "عمل", "إجراء", "اجراء",
+    "كشف", "قياس", "تقييم", "تحديد", "تقرير", "خطة", "خطه",
+}
+
+
+def _strip_lam_prefix_for_purpose_words(word: str) -> str:
+    """Strip ANY leading Arabic 'ل' from *word* — deliberately UNCONDITIONAL
+    (unlike _strip_lam_taa_prefix, which only fires for 'لت...') — but used
+    ONLY to check membership against the narrow _LAM_PURPOSE_ACTION_WORDS
+    set above, NEVER the full _NON_NAME_WORDS vocabulary (see
+    _is_non_name_word).
+
+    This separation is the actual fix for a real regression this
+    generalisation introduced during development: stripping a bare
+    leading 'ل' and checking it against the FULL blocklist also matches
+    the ordinary dative/benefactive "ل" ("لبكرة" = "for tomorrow", part
+    of "غير موعد الدكتور لبكرة" = "change the doctor's appointment to
+    tomorrow") purely because "بكرة" is ALSO separately blocked (as a
+    temporal/admin word) — that reclassified a perfectly ordinary
+    rescheduling clause as a role reference. Checking the general strip
+    ONLY against this small, closed purpose/action vocabulary (never the
+    admin/temporal/pronoun/preposition words also in _NON_NAME_WORDS)
+    avoids that collision entirely: "لبكرة" strips to "بكرة", which is
+    not in _LAM_PURPOSE_ACTION_WORDS, so it never matches here — only
+    "لكتابة"/"لعمل"/"لإجراء"/etc. do.
+
+    A genuine Arabic name beginning with 'ل' (e.g. "لمياء", "لبنى",
+    "ليلى") is unaffected either way: the stripped remainder ("مياء"/
+    "بنى"/"يلى") is not itself in _LAM_PURPOSE_ACTION_WORDS."""
+    return word[1:] if word.startswith("ل") and len(word) >= 3 else word
 
 
 def _strip_contracted_prefix(word: str) -> str:
@@ -493,6 +551,11 @@ def _is_non_name_word(word: str) -> bool:
     if not word:
         return False
     if _PREP_PRONOUN_FUSION_RE.match(word):
+        return True
+    # Checked against the NARROW purpose/action vocabulary only — see
+    # _strip_lam_prefix_for_purpose_words' docstring for why a general "ل"
+    # strip must never be checked against the full _NON_NAME_WORDS set.
+    if _strip_lam_prefix_for_purpose_words(word) in _LAM_PURPOSE_ACTION_WORDS:
         return True
     return bool(
         {
@@ -2926,10 +2989,20 @@ _EXISTING_RELATIONSHIP_RE = re.compile(
 # their own) or a completed/passive statement ("تم تأكيد حجزك"). This
 # distinction is what keeps "عندنا حجز مع الدكتور" (existing, stative) from
 # being misread as an active booking attempt.
+#
+# Every bare Arabic word-form alternative is wrapped in (?<![\w])...(?![\w])
+# (a Unicode-safe word-boundary equivalent to \b for Arabic) — real
+# regression: "من الممكن نقوم بزيارة طبيب..." matched bare "ممكن" as a
+# SUBSTRING of the unrelated word "الممكن" ("the possible/available [thing]"
+# — a subordinate-clause qualifier, not the patient/agent actively
+# requesting anything), which then wrongly fed a doctor-booking-attachment
+# match nearby. The same substring risk applies to "اجل"/"أجل" (inside
+# "لأجل" = "for the sake of") and every other bare short word here, so all
+# of them are boundaried the same way — never just the one reported word.
 _ACTIVE_BOOKING_VERB_RE = re.compile(
-    r"ابغى|أبغى|عايز[ةه]?|عاوز[ةه]?|محتاج[ةه]?|ممكن|"
-    r"(?<![\w])احجز(?![\w])|(?<![\w])أحجز(?![\w])|احجزلي|أحجزلي|"
-    r"اجل|أجل|غير\s*(?:ال)?موعد|الغ[يى]|"
+    r"(?<![\w])(?:ابغى|أبغى|عايز[ةه]?|عاوز[ةه]?|محتاج[ةه]?|ممكن|"
+    r"احجز|أحجز|احجزلي|أحجزلي|اجل|أجل)(?![\w])|"
+    r"غير\s*(?:ال)?موعد|(?<![\w])الغ[يى](?![\w])|"
     r"\bi\s+want\b|\bi\s+need\b|\bi'd\s+like\b|(?<![\w])book(?![\w])|"
     r"\bschedule\b|\breschedule\b|\bcancel\b|\bmove\s+it\b|\bchange\s+(?:it|my)\b|"
     # "get an appointment" is an ACTIVE request for a NEW booking ("Can I
@@ -2949,9 +3022,13 @@ _ACTIVE_BOOKING_VERB_RE = re.compile(
 # names the doctor's OWN appointment as the grammatical object of a
 # reschedule verb. A short proximity window (not the whole clause) keeps
 # this from crossing into an unrelated part of a longer sentence.
+# Same boundary treatment as _ACTIVE_BOOKING_VERB_RE above (and for the
+# same reason — "ممكن" must never match as a substring of "الممكن"): every
+# bare Arabic word-form alternative is wrapped in (?<![\w])...(?![\w]).
 _BOOKING_VERB_FRAGMENT = (
-    r"(?:ابغى|أبغى|عايز[ةه]?|عاوز[ةه]?|محتاج[ةه]?|ممكن|احجز|أحجز|احجزلي|أحجزلي|اجل|أجل|"
-    r"غير\s*(?:ال)?موعد|الغ[يى]|want|need|book|schedule|reschedule|cancel|"
+    r"(?:(?<![\w])(?:ابغى|أبغى|عايز[ةه]?|عاوز[ةه]?|محتاج[ةه]?|ممكن|"
+    r"احجز|أحجز|احجزلي|أحجزلي|اجل|أجل)(?![\w])|"
+    r"غير\s*(?:ال)?موعد|(?<![\w])الغ[يى](?![\w])|want|need|book|schedule|reschedule|cancel|"
     r"get\s+an?\s*appointment)"
 )
 _DOCTOR_TITLE_FRAGMENT = r"(?:دكتور[ةه]?|طبيب[ةه]?|(?<![\w])د(?:[./\\-])?(?![\w])|dr\.?|doctor)"

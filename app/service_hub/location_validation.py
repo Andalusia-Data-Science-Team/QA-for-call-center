@@ -70,8 +70,20 @@ _LOCATION_AMBIGUOUS = re.compile(r"موقع|لوكيشن|لوكشن|location", r
 # place-noun. "مكان" deliberately lives here, not in _LOCATION_STRONG: it's
 # too overloaded in colloquial Arabic ("عندي مكان فاضي" = "I have a free
 # slot", nothing to do with a branch) to trust on its own.
-_LOCATION_WEAK = re.compile(r"فين|وين|أين|اين|مكان|ازاي|كيف\s*(اروح|اوصل)", re.I)
-_PLACE_NOUN = re.compile(r"فرع|فرعكم|عياد[ةه]|عيادات|مستشفى|مستشفياتكم", re.I)
+#
+# Word-boundaried (\b): a bare substring match would let "وين" ("where")
+# false-positive inside an unrelated longer word like "سوينا" ("we did/
+# made") — a real regression. Python's \b already treats Arabic letters as
+# word characters, so this only requires the marker to be its own token,
+# never a fragment of a longer one.
+_LOCATION_WEAK = re.compile(r"\b(?:فين|وين|أين|اين|مكان|ازاي)\b|\bكيف\b\s*(?:اروح|اوصل)", re.I)
+# "ى" (alef maksura) vs "ي" (yeh): normalize_arabic_text() (see
+# app.services.text_helpers._normalize_arabic) always collapses ى -> ي, so
+# a literal "مستشفى" here would never match ANY normalised text — "مستشف[ىي]"
+# matches regardless of which spelling the source text used, and regardless
+# of whether normalisation already ran (see _BRANCH_ANCHOR_RE below, which
+# is deliberately applied to RAW, non-normalised text).
+_PLACE_NOUN = re.compile(r"فرع|فرعكم|عياد[ةه]|عيادات|مستشف[ىي]|مستشفياتكم", re.I)
 
 # "موقع/لوكيشن الفرع" (the location OF a named branch/clinic/hospital) is
 # unambiguously a facility-location statement, even when it also happens to
@@ -80,7 +92,7 @@ _PLACE_NOUN = re.compile(r"فرع|فرعكم|عياد[ةه]|عيادات|مست�
 # customer RECEIVING the branch's location, not the subject of it). This
 # check is tried before the exclusion below and overrides it.
 _LOCATION_OF_BRANCH_RE = re.compile(
-    r"(?:موقع|لوكيشن)\s+(?:ال)?(?:فرع|فرعكم|عياد[ةه]|عيادات|مستشفى|مستشفياتكم)", re.I,
+    r"(?:موقع|لوكيشن)\s+(?:ال)?(?:فرع|فرعكم|عياد[ةه]|عيادات|مستشف[ىي]|مستشفياتكم)", re.I,
 )
 
 # Category B (per spec): the CUSTOMER's own location being requested,
@@ -132,6 +144,30 @@ _MAP_URL_RE = re.compile(r"https?://\S+", re.I)
 _ADDRESS_LINE_RE = re.compile(r"شارع|حي\s|طريق|تقاطع|بلازا", re.I)
 
 
+def _weak_marker_and_place_noun_cooccur(raw_text: str) -> bool:
+    """True only when a weak location question word (see _LOCATION_WEAK)
+    and a place-noun (see _PLACE_NOUN) both appear on the SAME line.
+
+    Callers of detect_location_request() may pass several conversational
+    turns already joined with "\\n" (see split_transcript_by_speaker) —
+    normalize_arabic_text() itself then collapses those newlines into
+    plain spaces, which would silently erase turn boundaries if this
+    check ran on the fully-normalised, flattened text. Evaluating line by
+    line on the RAW text instead (normalising each line on its own) is
+    what stops a weak marker said in one turn from ever combining with an
+    unrelated place-noun mentioned in a completely different turn — e.g. a
+    "سوينا كشفية...؟" turn plus a later, unrelated automatic closing
+    message's generic "عيادات" must never combine into one location
+    signal."""
+    for line in (raw_text or "").splitlines():
+        norm_line = normalize_arabic_text(line)
+        if not norm_line:
+            continue
+        if _LOCATION_WEAK.search(norm_line) and _PLACE_NOUN.search(norm_line):
+            return True
+    return False
+
+
 def detect_location_request(text: str) -> bool:
     """Context-aware detection — avoids matching bare 'فرع'/'مكان' with no
     request context (false positives on ordinary mentions), and avoids
@@ -148,7 +184,7 @@ def detect_location_request(text: str) -> bool:
         if _LOCATION_OF_BRANCH_RE.search(norm):
             return True
         return not _CUSTOMER_LOCATION_RE.search(norm)
-    return bool(_LOCATION_WEAK.search(norm) and _PLACE_NOUN.search(norm))
+    return _weak_marker_and_place_noun_cooccur(text)
 
 
 def detect_location_intent(patient_text: str, agent_text: str) -> tuple[bool, bool]:
@@ -281,7 +317,7 @@ def _name_distinctive_tokens(record: dict[str, Any], pool: list[dict[str, Any]])
 # that wrong street's extra token count outrank the correct branch-name
 # mention. Anchoring to just the words right after the place-noun avoids that.
 _BRANCH_ANCHOR_RE = re.compile(
-    r"(?:فرع|فرعكم|عياد[ةه]|عيادات|مستشفى|مستشفياتكم)\s+"
+    r"(?:فرع|فرعكم|عياد[ةه]|عيادات|مستشف[ىي]|مستشفياتكم)\s+"
     r"(.+?)(?=\s+(?:في|شارع|حي|علي|على|عند|جنب|قريب)|[.,،؟!\n]|$)",
     re.I,
 )
@@ -415,9 +451,23 @@ def resolve_branch_by_address_content(
 
 # Structural/filler words that appear in nearly every Arabic street address
 # regardless of branch — they must not count as evidence of a match.
+#
+# Address LABEL words (العنوان/عنوان and the "لعنوان" typo that dropped the
+# leading ع) are included here too: they are prose scaffolding around an
+# address ("العنوان : ..."), never physical address content, and a CRM
+# record's OWN cr301_description sometimes bakes the label directly into
+# the stored value (a real production pattern) — if left untokenized-away,
+# that label becomes a "distinctive" token the agent is then wrongly
+# required to repeat verbatim, and a harmless typo/omission of it produces
+# a false INCOMPLETE_ADDRESS/WRONG_LOCATION even when the actual street/
+# district content is complete and correct. Handled as a general
+# vocabulary exclusion (same mechanism as "شارع"/"حي" above), not a
+# special case for one transcript — so any call, CRM record, or spelling
+# of the label benefits equally.
 _ADDRESS_FILLER = {
     "شارع", "حي", "الحي", "متفرع", "من", "بعد", "امام", "أمام", "تقاطع", "مع",
     "طريق", "في", "فى", "و", "ال", "بلازا", "مول", "مقابل", "بجوار", "خلف",
+    "العنوان", "عنوان", "لعنوان", "الادرس", "ادرس",
 }
 
 
@@ -426,17 +476,32 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in norm.split() if t and t not in _ADDRESS_FILLER and len(t) > 1]
 
 
-def _distinctive_tokens(record: dict[str, Any], all_locations: list[dict[str, Any]]) -> set[str]:
-    """Tokens from this branch's name/description/area that do NOT appear in
-    most other branches — i.e. actually distinguish it. Same ubiquity-based
-    generic-word filtering crm_offers.py uses for offer-name matching."""
-    own_text = " ".join(str(record.get(f) or "") for f in _LOC_CONTEXT_FIELDS)
+def _distinctive_tokens(
+    record: dict[str, Any],
+    all_locations: list[dict[str, Any]],
+    *,
+    fields: tuple[str, ...] = _LOC_CONTEXT_FIELDS,
+) -> set[str]:
+    """Tokens from this branch's OWN *fields* that do NOT appear in most
+    other branches' same fields — i.e. actually distinguish it. Same
+    ubiquity-based generic-word filtering crm_offers.py uses for offer-name
+    matching.
+
+    *fields* defaults to the full identity context (name+area+description+
+    region) — used for BRANCH RESOLUTION, where any of those may
+    legitimately help identify WHICH branch is meant. Pass a narrower
+    tuple (see _ADDRESS_ONLY_FIELDS/_address_completeness_tokens) to score
+    ADDRESS COMPLETENESS instead, which must never require the branch's
+    own name or region metadata — see the module's "ADDRESS COMPLETENESS
+    VS BRANCH IDENTITY" separation.
+    """
+    own_text = " ".join(str(record.get(f) or "") for f in fields)
     own_tokens = set(_tokenize(own_text))
     if not own_tokens or len(all_locations) < 3:
         return own_tokens  # too few records to compute ubiquity reliably
 
     other_token_sets = [
-        set(_tokenize(" ".join(str(r.get(f) or "") for f in _LOC_CONTEXT_FIELDS)))
+        set(_tokenize(" ".join(str(r.get(f) or "") for f in fields)))
         for r in all_locations
         if r is not record
     ]
@@ -448,6 +513,36 @@ def _distinctive_tokens(record: dict[str, Any], all_locations: list[dict[str, An
     return distinctive or own_tokens  # never end up with nothing to check
 
 
+# ── ADDRESS COMPLETENESS VS BRANCH IDENTITY ─────────────────────────────────
+# Two genuinely separate concerns (see the module's required-design split):
+#   1. Branch RESOLUTION may use name, area, and address evidence together
+#      to identify WHICH branch is meant — that's _distinctive_tokens'
+#      default (fields=_LOC_CONTEXT_FIELDS), unchanged.
+#   2. Address COMPLETENESS — validate_location_answer's scoring, once a
+#      branch is ALREADY resolved — must judge only meaningful PHYSICAL-
+#      ADDRESS detail: cr301_description content (plus cr301_area, for
+#      genuine district/city detail). It must never require the agent to
+#      repeat the branch's own NAME (a real regression: an agent who gave
+#      a complete, correct street address was penalised purely for not
+#      also saying "مستشفى أندلسية جدة") or region metadata (KSA/country
+#      code, never spoken in a natural address).
+_ADDRESS_ONLY_FIELDS: tuple[str, ...] = ("cr301_area", "cr301_description")
+
+
+def _address_completeness_tokens(record: dict[str, Any], all_locations: list[dict[str, Any]]) -> set[str]:
+    """Meaningful physical-address tokens for scoring completeness — see
+    ADDRESS COMPLETENESS VS BRANCH IDENTITY above. Deliberately NOT the
+    same as _address_detail_tokens (used only for the Trigger-B "did the
+    agent proactively volunteer a location" gate): that function also
+    subtracts any token shared with the branch's own NAME, which would
+    wrongly zero out a branch legitimately named after its own street
+    (e.g. "فرع صاري" sitting on "شارع صارى" — that shared word IS genuine
+    address content once we already know completeness is being judged,
+    and only the earlier Trigger-B gate needs the stricter "not just the
+    bare name" exclusion)."""
+    return _distinctive_tokens(record, all_locations, fields=_ADDRESS_ONLY_FIELDS)
+
+
 def _address_detail_tokens(record: dict[str, Any], all_locations: list[dict[str, Any]]) -> set[str]:
     """Tokens that are genuinely address DETAIL — distinctive words from
     cr301_description that are NOT also part of the branch's own NAME.
@@ -456,11 +551,13 @@ def _address_detail_tokens(record: dict[str, Any], all_locations: list[dict[str,
     named after its own street ("فرع السنابل" sitting on "شارع السنابل"), so
     that shared word alone must not count as "the agent gave an address" —
     only as naming the branch. Used specifically for the Trigger-B gate
-    (_agent_gives_address_details), not for scoring an already-applicable
-    answer (validate_location_answer keeps using the broader
-    _distinctive_tokens, where a legitimate street-name-equals-branch-name
-    match should still count in the agent's favour once we already know
-    validation applies).
+    (_agent_gives_address_details) — a DIFFERENT, narrower question
+    ("did the agent say ANYTHING address-shaped, unprompted") than address
+    COMPLETENESS scoring, which uses _address_completeness_tokens instead
+    (see ADDRESS COMPLETENESS VS BRANCH IDENTITY) and deliberately does
+    NOT subtract the branch's own name — once we already know validation
+    applies, a legitimate street-name-equals-branch-name match should
+    still count in the agent's favour.
     """
     name_tokens = set(_tokenize(str(record.get("cr301_branchname") or "")))
     desc_only = _distinctive_tokens(record, all_locations) - name_tokens
@@ -617,21 +714,30 @@ def _extract_agent_location_text(
 def validate_location_answer(
     branch: dict[str, Any], agent_text: str, all_locations: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Score the agent's combined address text against the resolved branch.
+    """Score the agent's combined address text against the resolved
+    branch's meaningful PHYSICAL-ADDRESS content only (see
+    _address_completeness_tokens / ADDRESS COMPLETENESS VS BRANCH
+    IDENTITY) — never the branch's own name or region metadata, so an
+    agent who gives a complete, correct street address is never penalised
+    merely for not also repeating the facility's name.
 
-    Returns {"overlap_ratio": float, "matched": [...], "distinctive": [...]}.
-    Thresholds (documented, not hidden): >=0.6 → sufficient match,
-    0.25-0.6 → partial/incomplete, <0.25 → effectively no match.
+    Returns {"overlap_ratio": float, "matched": [...], "distinctive": [...],
+    "missing": [...]} — "missing" (distinctive - matched) is diagnostic
+    only, surfaced so the comparison log can show exactly which
+    meaningful tokens were omitted. Thresholds (documented, not hidden):
+    >=0.6 → sufficient match, 0.25-0.6 → partial/incomplete, <0.25 →
+    effectively no match.
     """
-    distinctive = _distinctive_tokens(branch, all_locations)
+    distinctive = _address_completeness_tokens(branch, all_locations)
     agent_tokens = set(_tokenize(agent_text))
     if not distinctive:
-        return {"overlap_ratio": 0.0, "matched": [], "distinctive": []}
+        return {"overlap_ratio": 0.0, "matched": [], "distinctive": [], "missing": []}
     matched = distinctive & agent_tokens
     return {
         "overlap_ratio": len(matched) / len(distinctive),
         "matched": sorted(matched),
         "distinctive": sorted(distinctive),
+        "missing": sorted(distinctive - matched),
     }
 
 
@@ -723,6 +829,29 @@ def validate_location_request(
     # for display, but never stands in for — or gets mixed into — the
     # textual address used for resolution/scoring/provided_location below.
     agent_location_text, agent_map_url = _split_address_and_map(agent_location_text)
+
+    # Defensive safety net: the coarse top-level gate above
+    # (agent_gave_address_raw) is deliberately cheap/generous — it can
+    # pass on nothing more than incidental location-flavoured vocabulary
+    # spread across unrelated turns (a greeting, a campaign click, an
+    # automatic closing message). This LOCAL, turn-scoped extraction is
+    # authoritative: if the patient never actually asked AND nothing
+    # genuinely location-bearing was extracted from the agent's own turns
+    # (no address text, no map link), this was never really a location
+    # conversation — never a punitive NO_ADDRESS_PROVIDED/
+    # INCOMPLETE_ADDRESS/WRONG_LOCATION in that case. A genuine patient
+    # request with no agent answer is NEVER short-circuited here (see
+    # below), so this never weakens a real violation.
+    if not requested and not agent_location_text and not agent_map_url:
+        _loc_print()
+        _loc_print("outcome: NOT_APPLICABLE")
+        _loc_print("reason: no genuine location request or agent-provided address was found in context")
+        return _loc_result(
+            "NOT_APPLICABLE",
+            "No location/address request or agent-provided address was detected in context.",
+            request=requested,
+        )
+
     if agent_location_text or agent_map_url:
         loc_lines = agent_location_text.split("\n") if agent_location_text else []
         section_fields: dict[str, Any] = {}
@@ -905,7 +1034,7 @@ def validate_location_request(
         return _loc_result(
             "NO_ADDRESS_PROVIDED",
             "The patient asked for a location but the agent gave no address.",
-            request=True, applicable=True, branch=branch, overlap=0.0,
+            request=requested, applicable=True, branch=branch, overlap=0.0,
         )
 
     logger.info(
@@ -942,14 +1071,19 @@ def validate_location_request(
         reason = "The agent's address does not match the requested branch's known location — it belongs to a different branch."
 
     logger.info(
-        "location comparison | call_id=%s resolved_branch=%r crm_location=%r chat_location=%r match=%s outcome=%s",
+        "location comparison | call_id=%s resolved_branch=%r crm_location=%r chat_location=%r match=%s outcome=%s "
+        "expected_address_tokens=%s matched_address_tokens=%s missing_address_tokens=%s ratio=%.2f",
         call_id, branch.get("cr301_branchname"), branch.get("cr301_description"),
         agent_location_text, outcome == "PASS", outcome,
+        score["distinctive"], score["matched"], score["missing"], overlap,
     )
     _loc_print_section(
         "comparison",
         chat_normalized=normalize_arabic_text(agent_location_text),
         crm_normalized=normalize_arabic_text(str(branch.get("cr301_description") or "")),
+        expected_address_tokens=score["distinctive"],
+        matched_address_tokens=score["matched"],
+        missing_address_tokens=score["missing"],
         match_confidence=round(overlap, 2), match=(outcome == "PASS"),
     )
     _loc_print()
