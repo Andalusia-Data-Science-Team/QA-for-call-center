@@ -108,7 +108,7 @@ class _StubLLM:
         self._response = response
         self.last_user_prompt: str | None = None
 
-    async def complete(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
         self.last_user_prompt = user_prompt
         return json.dumps(self._response, ensure_ascii=False), {"prompt_tokens": 0, "completion_tokens": 0}
 
@@ -706,7 +706,7 @@ class _StubLLMPerDoctor:
         self._responses = responses_by_marker
         self.prompts: list[str] = []
 
-    async def complete(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
         self.prompts.append(user_prompt)
         for marker, response in self._responses.items():
             if marker in user_prompt:

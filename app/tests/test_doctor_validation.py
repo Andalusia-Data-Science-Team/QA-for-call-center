@@ -4,6 +4,8 @@ import pytest
 
 from app.models.input import CallTranscript
 from app.service_hub.doctor_validation import (
+    _resolve_specialty_category,
+    _specialty_core,
     authoritative_doctor_pool,
     classify_specific_doctor_intent,
     dedupe_doctors,
@@ -63,6 +65,22 @@ DOC_ALIAA = {
     "servhub_examinationage": "Age: 0 and above Gender : All",
     "cr301_walkinconsultationfees": 345,
 }
+# Same doctor record as DOC_ALIAA but with the CRM subspecialty spelled
+# "Phonatics" (the real, misspelled production value for Phoniatrics/
+# Speech Therapy) instead of "Audiological medicine" — used for the
+# Speech-vs-Phonatics regression below (see _SPECIALTY_CORE_EQUIVALENTS).
+DOC_ALIAA_PHONATICS = {
+    **DOC_ALIAA,
+    "cr301_doctorkey": "100110054",
+    "cr301_subspecialtyname": "Phonatics",
+    # Degree changed to "Consultant" purely so the regression tests below
+    # can claim a degree ("استشارية") to anchor/scope the specialty phrase
+    # extraction without an unrelated degree mismatch — irrelevant to the
+    # Speech/Phonatics fix itself.
+    "cr301_degreename": "Consultant",
+}
+
+
 DOC_RAMI = {
     "cr301_doctorkey": "200200055",
     "servhub_doctornameen": "Rami Samarkandi",
@@ -418,6 +436,56 @@ def test_correct_subspecialty_recorded_separately_from_specialty():
     assert result["outcome"] == "PASS"
 
 
+# ── Speech vs. Phonatics (CRM subspecialty spelling) ────────────────────────
+# Real regression: CRM stores the ENT subspecialty "Phonatics" (a
+# misspelling of Phoniatrics/Speech Therapy). An Agent claim of "نطق وتخاطب"
+# ("speech and language therapy") against that doctor was wrongly reported
+# as a FAILED specialty claim, since "Phonatics" was compared only against
+# the bare "E.N.T" specialty, never recognised as equivalent to "Speech".
+# See _SPECIALTY_CORE_EQUIVALENTS / _specialty_core().
+
+@pytest.mark.parametrize("crm_value", [
+    "Phonatics",
+    "Phoniatrics",
+    "Speech and Phonetics",
+    "Speech Therapy",
+    "Speech Language Pathology",
+    "Speech",
+])
+def test_speech_display_name_variants_share_one_canonical_core(crm_value):
+    assert _specialty_core(crm_value) == _specialty_core("Speech") == "speech"
+
+
+def test_ent_alone_does_not_match_speech_core():
+    """The equivalence is an explicit, exact-match table -- a bare 'E.N.T'
+    specialty must never itself collapse onto 'Speech' just because
+    Phonatics happens to be an ENT subspecialty."""
+    assert _specialty_core("E.N.T") != _specialty_core("Speech")
+
+
+def test_arabic_natq_wa_takhatub_resolves_to_speech_category():
+    assert _resolve_specialty_category("نطق وتخاطب") == "Speech"
+
+
+def test_ent_doctor_with_phonatics_subspecialty_passes_as_subspecialty():
+    """The exact reported case: specialty=E.N.T, subspecialty=Phonatics.
+    A 'نطق وتخاطب' claim must match the SUBSPECIALTY, not the general
+    E.N.T specialty, and must never surface a failed specialty field."""
+    result = validate("Agent: دكتورة علياء المدبولي استشارية نطق وتخاطب", doctors=[DOC_ALIAA_PHONATICS])
+    assert result["validated_fields"]["subspecialty"]["outcome"] == "PASS"
+    assert "specialty" not in result["validated_fields"] or result["validated_fields"].get("specialty", {}).get("outcome") != "FAIL"
+    assert result["outcome"] != "FAIL"
+
+
+def test_ent_doctor_without_speech_subspecialty_still_fails_natq_claim():
+    """Requirement 7: not every ENT doctor is a speech specialist --
+    DOC_ALIAA's real subspecialty ('Audiological medicine') is NOT
+    speech-equivalent, so the same 'نطق وتخاطب' claim must still
+    fail against it."""
+    result = validate("Agent: دكتورة علياء المدبولي استشارية نطق وتخاطب", doctors=[DOC_ALIAA])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+
+
 def test_correct_business_unit_recorded():
     result = validate("Agent: دكتور رامي سمرقندي في فرع AHJ")
     assert result["business_unit"] == "AHJ"
@@ -469,6 +537,179 @@ def test_optional_missing_field_does_not_cause_fail():
     result = validate("Agent: دكتور رامي سمرقندي معاه بورد سعودي", doctors=[DOC_RAMI])
     assert result["validated_fields"]["qualifications"]["outcome"] == "NEEDS_REVIEW"
     assert result["outcome"] != "FAIL"
+
+
+# =============================================================================
+# Optional (claim-driven) fields: degree, doctor_notes, qualifications,
+# examination_age, walkin_fee. Validated ONLY when the Agent explicitly
+# makes a claim about the resolved doctor; absent (never PASS/FAIL/
+# NEEDS_REVIEW, never counted toward fields_checked, never able to lower
+# the outcome) when no such claim exists. See doctor_validation.py's
+# _OPTIONAL_CLAIM_FIELDS / _log_skipped_optional_fields.
+# =============================================================================
+
+def test_no_optional_fields_mentioned_are_absent_and_do_not_affect_outcome():
+    """A resolved doctor with none of the 5 optional fields mentioned at
+    all: they must be absent from validated_fields (so they can never
+    increase fields_checked, i.e. len(validated_fields)), and the overall
+    outcome must still be PASS."""
+    result = validate("Patient: دكتور رامي سمرقندي موجود؟\nAgent: ايوه موجود", doctors=[DOC_RAMI])
+    for optional_field in ("degree", "doctor_notes", "qualifications", "examination_age", "walkin_fee"):
+        assert optional_field not in result["validated_fields"]
+    assert len(result["validated_fields"]) == 0
+    assert result["outcome"] == "PASS"
+    assert result["is_violation"] is False
+
+
+def test_all_five_optional_fields_validated_when_all_explicitly_mentioned():
+    """Each optional field is validated once explicitly claimed — all five
+    at once. The doctor's own name is repeated in each turn so every claim
+    stays correctly scoped to them (see _agent_turns_text_for_doctor).
+    Four of the five match real CRM data (PASS); DOC_KHAIRYA genuinely has
+    no CRM doctor_notes text at all, so that one is NEEDS_REVIEW — still
+    VALIDATED (present, with a determinate outcome), which is the point."""
+    transcript = (
+        "Agent: دكتورة خيرية محمد استشارية بورد سعودي في غدد الصماء والسكري للاطفال\n"
+        "Agent: دكتورة خيرية محمد يستقبل أطفال ولا يوجد لدينا عملية زراعة قوقعة الأذن\n"
+        "Agent: كشفية دكتورة خيرية محمد 400 ريال"
+    )
+    result = validate(transcript, doctors=[DOC_KHAIRYA])
+    for optional_field in ("degree", "doctor_notes", "qualifications", "examination_age", "walkin_fee"):
+        assert optional_field in result["validated_fields"], (optional_field, result["validated_fields"])
+    for optional_field in ("degree", "qualifications", "examination_age", "walkin_fee"):
+        assert result["validated_fields"][optional_field]["outcome"] == "PASS", (
+            optional_field, result["validated_fields"]
+        )
+    assert result["validated_fields"]["doctor_notes"]["outcome"] == "NEEDS_REVIEW"
+    assert result["outcome"] != "FAIL"
+
+
+def test_bare_title_alone_does_not_trigger_degree_validation():
+    """A bare دكتور/دكتورة/د/Dr title is not itself a degree claim."""
+    result = validate("Patient: دكتور رامي سمرقندي موجود؟\nAgent: ايوه موجود", doctors=[DOC_RAMI])
+    assert "degree" not in result["validated_fields"]
+
+
+def test_doctor_notes_claim_with_missing_crm_notes_needs_review():
+    """DOC_RAMI has no cr301_drnotes at all — an explicit restriction claim
+    about him must read as NEEDS_REVIEW, never PASS or a silent FAIL."""
+    result = validate("Agent: دكتور رامي سمرقندي لا يستقبل حالات الطوارئ", doctors=[DOC_RAMI])
+    assert result["validated_fields"]["doctor_notes"]["outcome"] == "NEEDS_REVIEW"
+    assert result["outcome"] != "FAIL"
+
+
+def test_unrelated_availability_text_does_not_trigger_doctor_notes():
+    """'لا يوجد مواعيد' ('no appointments available') is a SCHEDULING
+    statement, never a doctor-restriction note — must not be misread as a
+    notes claim."""
+    result = validate("Agent: دكتور رامي سمرقندي، للأسف لا يوجد مواعيد متاحة النهارده", doctors=[DOC_RAMI])
+    assert "doctor_notes" not in result["validated_fields"]
+
+
+def test_qualifications_absence_is_ignored():
+    """No qualifications claim at all — the field must be absent, not a
+    NEEDS_REVIEW or any other outcome."""
+    result = validate("Patient: دكتور رامي سمرقندي موجود؟\nAgent: ايوه موجود", doctors=[DOC_RAMI])
+    assert "qualifications" not in result["validated_fields"]
+
+
+def test_examination_age_absent_when_unmentioned():
+    result = validate("Patient: دكتورة خيرية محمد موجودة؟\nAgent: ايوه موجودة", doctors=[DOC_KHAIRYA])
+    assert "examination_age" not in result["validated_fields"]
+
+
+def test_examination_age_range_claim_within_crm_range_passes():
+    """DOC_KHAIRYA's CRM age range is 0-16; a claimed 5-15 range fits
+    comfortably within it."""
+    result = validate("Agent: دكتورة خيرية محمد يستقبل من 5 لحد 15 سنة", doctors=[DOC_KHAIRYA])
+    assert result["validated_fields"]["examination_age"]["outcome"] == "PASS"
+
+
+def test_examination_age_range_claim_outside_crm_range_fails():
+    """A claimed upper bound of 25 contradicts DOC_KHAIRYA's actual CRM
+    ceiling of 16 — an evidenced contradiction, must FAIL and affect the
+    overall outcome."""
+    result = validate("Agent: دكتورة خيرية محمد يستقبل من 5 لحد 25 سنة", doctors=[DOC_KHAIRYA])
+    assert result["validated_fields"]["examination_age"]["outcome"] == "FAIL"
+    assert result["outcome"] == "FAIL"
+
+
+def test_examination_age_needs_review_when_crm_data_missing():
+    """DOC_MOHAMED_A has no servhub_examinationage at all — an explicit age
+    claim must read as NEEDS_REVIEW, never a silently-accepted PASS."""
+    result = validate("Agent: دكتور محمد سالم يستقبل أطفال", doctors=[DOC_MOHAMED_A])
+    assert result["validated_fields"]["examination_age"]["outcome"] == "NEEDS_REVIEW"
+    assert result["outcome"] != "FAIL"
+
+
+def test_unrelated_offer_price_does_not_trigger_walkin_fee():
+    """An unrelated offer/procedure price mentioned near the doctor's name
+    must never be captured as the doctor's own walk-in consultation fee —
+    only a price near a fee-context keyword (كشفية/كشف/consultation) counts."""
+    result = validate("Agent: دكتورة خيرية محمد، عندنا عرض على الأشعة ب 500 ريال", doctors=[DOC_KHAIRYA])
+    assert "walkin_fee" not in result["validated_fields"]
+
+
+def test_identity_and_eligibility_checks_are_unconditional():
+    """Identity/Active-status/supported-BU eligibility must FAIL regardless
+    of whether the Agent made ANY optional-field claim at all."""
+    inactive = validate("Agent: دكتور نبيل متقاعد موجود", doctors=[DOC_INACTIVE])
+    assert inactive["outcome"] == "FAIL"
+    assert inactive["validated_fields"] == {}
+
+    unsupported_bu = validate("Agent: دكتور فريد خارج النطاق موجود", doctors=[DOC_UNSUPPORTED_BU])
+    assert unsupported_bu["outcome"] == "FAIL"
+    assert unsupported_bu["validated_fields"] == {}
+
+
+def test_wrong_explicit_business_unit_fails():
+    """Real regression: the business_unit claim previously could ONLY ever
+    match the doctor's own BU literal code and could never actually FAIL.
+    An explicit, WRONG branch claim must now produce FAIL."""
+    result = validate("Agent: دكتور رامي سمرقندي في فرع سلطان", doctors=[DOC_RAMI])
+    assert result["validated_fields"]["business_unit"]["outcome"] == "FAIL"
+    assert result["outcome"] == "FAIL"
+    assert result["is_violation"] is True
+
+
+def test_correct_explicit_business_unit_passes():
+    result = validate("Agent: دكتور رامي سمرقندي في جدة", doctors=[DOC_RAMI])
+    assert result["validated_fields"]["business_unit"]["outcome"] == "PASS"
+    assert result["outcome"] == "PASS"
+
+
+def test_multi_doctor_optional_claims_do_not_leak_between_doctors():
+    """A qualifications claim explicitly scoped to ONE recommended doctor
+    (in a follow-up turn naming them again) must never be attributed to a
+    DIFFERENT doctor in the same multi-doctor recommendation set."""
+    doctors = [
+        {
+            **DOC_MOHAMED_ADEL, "cr301_doctorkey": "leak1",
+            "servhub_doctornameen": "Ahmed Ali", "cr301_doctornamear": "احمد علي",
+            "cr301_qualificationsandexperiencear": "حاصل على بورد سعودي",
+        },
+        {
+            **DOC_MOHAMED_ADEL, "cr301_doctorkey": "leak2",
+            "servhub_doctornameen": "Mohamed Hassan", "cr301_doctornamear": "محمد حسان",
+        },
+    ]
+    transcript = (
+        "Agent: Here are the options:\nDr Ahmed Ali\nDr Mohamed Hassan\n"
+        "Agent: Dr Ahmed Ali بورد سعودي\n"
+    )
+    result = validate(transcript, doctors=doctors)
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["ahmed ali"]["validated_fields"]["qualifications"]["outcome"] == "PASS"
+    assert "qualifications" not in by_name["mohamed hassan"]["validated_fields"]
+
+
+def test_extract_examination_age_claim_range_direct():
+    """Direct unit check: a specific age-range claim is a recognised shape,
+    distinct from a bare minimum-age claim."""
+    from app.service_hub.doctor_validation import _extract_examination_age_claim
+
+    assert _extract_examination_age_claim("يستقبل من 5 لحد 15 سنة") == "range:5-15"
+    assert _extract_examination_age_claim("يستقبل من عمر 5 سنين") == "from:5"
 
 
 # ── Semantic-validation applicability gate (deterministic side only —

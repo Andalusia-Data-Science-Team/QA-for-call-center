@@ -34,6 +34,15 @@ class Settings(BaseSettings):
 
     # ── Performance ───────────────────────────────────────────────────────────
     llm_max_tokens: int = 2048
+    # infer_overall_scoring (app.agent.nodes) synthesises EVERY other node's
+    # output (behavioral/compliance/script/bank/location/doctor/doctor-scope/
+    # COE summaries) into one JSON response — a much larger prompt AND
+    # expected response than any other focused node budgets against with the
+    # shared llm_max_tokens cap. A response cut off mid-string by hitting
+    # that cap is not a transient/retryable failure: resending the identical
+    # prompt against the identical cap truncates in the same place every
+    # time, so this node gets its own, higher ceiling instead.
+    llm_scoring_max_tokens: int = 4096
     llm_timeout_seconds: float = 60.0
 
      

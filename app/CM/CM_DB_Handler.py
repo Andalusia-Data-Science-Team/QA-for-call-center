@@ -4,7 +4,33 @@ import json
 from pathlib import Path
 import os
 import re
+import time
 from datetime import datetime
+
+# Substrings (matched case-insensitively) that identify a TRANSIENT
+# network/connection failure — worth retrying with a fresh connection —
+# as opposed to a real SQL error (bad syntax, permissions, a missing
+# object) that would fail identically on every retry. pyodbc surfaces
+# both kinds as the same generic ProgrammingError/Error, so the only way
+# to tell them apart is the driver's own message text. Real regression:
+# a cross-server (linked-server) query occasionally failed with
+# "[SQL Server]TCP Provider: The wait operation timed out. (258)" — the
+# remote provider's TCP session dying mid-query — and surfaced straight
+# to the caller as a hard failure with no retry at all.
+_TRANSIENT_DB_ERROR_MARKERS = (
+    "wait operation timed out",     # TCP Provider: The wait operation timed out (258)
+    "timeout expired",              # HYT00-style command-timeout message
+    "communication link failure",
+    "server is not found or not accessible",
+)
+
+
+def _is_transient_db_error(exc: Exception) -> bool:
+    """Best-effort classification of *exc* as a transient, retry-worthy
+    connection/network failure — see _TRANSIENT_DB_ERROR_MARKERS."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_DB_ERROR_MARKERS)
+
 
 class CMDatabaseHandler:
     """Handler for connecting to SQL Server and executing queries"""
@@ -99,49 +125,74 @@ class CMDatabaseHandler:
             print(f"✗ Connection failed: {e}")
             return False
     
-    def execute_query_from_file(self, query_file, params=None):
+    def execute_query_from_file(self, query_file, params=None, max_retries=2, retry_delay_seconds=2.0):
         """
         Execute SQL query from a file and return results as DataFrame
-        
+
         Args:
             query_file: Path to SQL file
             params: Dictionary of parameters for query substitution
-            
+            max_retries: How many times to retry the query itself after a
+                TRANSIENT connection/network failure (see
+                _is_transient_db_error) — e.g. a cross-server query's TCP
+                session dying mid-execution. Each retry reconnects first,
+                since the dead connection cannot be reused. A genuine SQL
+                error (bad syntax, permissions, a missing object) is never
+                retried — it would just fail identically every time.
+            retry_delay_seconds: Base delay between retries; doubles each
+                attempt (1x, 2x, 4x, ...).
+
         Returns:
             pandas DataFrame with query results
         """
         if not self.connection:
             raise ConnectionError("No active database connection")
-        
-        try:
-            with open(query_file, 'r') as f:
-                query = f.read()
-            
-            print(f"Executing query from: {query_file}")
-            
-            # Substitute parameters if provided
-            if params:
-                for key, value in params.items():
-                    # Convert None to NULL string for SQL, otherwise wrap in quotes
-                    if value is None:
-                        sql_value = "NULL"
-                    elif isinstance(value, (int, float)):
-                        sql_value = str(value)
-                    else:
-                        # Escape single quotes in string values
-                        sql_value = f"'{str(value).replace(chr(39), chr(39)+chr(39))}'"
-                    
-                    # Replace only :ParameterName patterns (not @ParameterName which are variable names)
-                    query = re.sub(rf':\s*{re.escape(key)}\b', sql_value, query, flags=re.IGNORECASE)
-                
-                print(f"Parameters substituted: {list(params.keys())}")
-            
-            df = pd.read_sql(query, self.connection)
-            print(f"✓ Query executed successfully. Retrieved {len(df)} rows.")
-            return df
-        except Exception as e:
-            print(f"✗ Query execution failed: {e}")
-            raise
+
+        with open(query_file, 'r') as f:
+            query = f.read()
+
+        print(f"Executing query from: {query_file}")
+
+        # Substitute parameters if provided
+        if params:
+            for key, value in params.items():
+                # Convert None to NULL string for SQL, otherwise wrap in quotes
+                if value is None:
+                    sql_value = "NULL"
+                elif isinstance(value, (int, float)):
+                    sql_value = str(value)
+                else:
+                    # Escape single quotes in string values
+                    sql_value = f"'{str(value).replace(chr(39), chr(39)+chr(39))}'"
+
+                # Replace only :ParameterName patterns (not @ParameterName which are variable names)
+                query = re.sub(rf':\s*{re.escape(key)}\b', sql_value, query, flags=re.IGNORECASE)
+
+            print(f"Parameters substituted: {list(params.keys())}")
+
+        for attempt in range(1, max_retries + 2):  # 1 initial try + N retries
+            try:
+                df = pd.read_sql(query, self.connection)
+                print(f"✓ Query executed successfully. Retrieved {len(df)} rows.")
+                return df
+            except Exception as e:
+                is_last_attempt = attempt > max_retries
+                if is_last_attempt or not _is_transient_db_error(e):
+                    print(f"✗ Query execution failed: {e}")
+                    raise
+                delay = retry_delay_seconds * (2 ** (attempt - 1))
+                print(
+                    f"✗ Transient query failure (attempt {attempt}/{max_retries + 1}) — "
+                    f"reconnecting and retrying in {delay:.1f}s: {e}"
+                )
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass  # the connection is already dead; nothing to clean up
+                time.sleep(delay)
+                if not self.connect():
+                    print("✗ Reconnect failed — giving up without retrying further.")
+                    raise
     
     def save_to_excel(self, dataframe, output_file=None, sheet_name='Sheet1'):
         """

@@ -143,6 +143,34 @@ _MAP_URL_RE = re.compile(r"https?://\S+", re.I)
 # which turn actually carries it.
 _ADDRESS_LINE_RE = re.compile(r"شارع|حي\s|طريق|تقاطع|بلازا", re.I)
 
+# A line that is a bare "label:" registration-form field with nothing
+# filled in after the colon (e.g. "الحي السكني:", a residential-district
+# form PROMPT, not an actual district name) — matched so it can be
+# EXCLUDED from _ADDRESS_LINE_RE scanning below. Without this, the label
+# text alone can accidentally contain a structural address word ("حي")
+# and get mistaken for genuine content even though nothing was ever
+# filled in. General by construction: any empty "<label>:" line is
+# excluded, regardless of which label/field it is — not a name-specific
+# exception for this one field.
+_EMPTY_LABEL_LINE_RE = re.compile(r"^[^:：]{1,60}[:：]\s*$")
+
+
+def _address_line_bearing(text: str) -> bool:
+    """True when *text* contains a genuine structural address phrase (see
+    _ADDRESS_LINE_RE) on some line — skipping lines that are just an empty
+    "<label>:" registration-form field (see _EMPTY_LABEL_LINE_RE), so an
+    unfilled form prompt like "الحي السكني:" is never mistaken for a real
+    "حي <district name>" address mention. Checked per RAW line rather than
+    the fully flattened/normalised text: normalize_arabic_text() strips
+    colons and joins lines with spaces, which would erase the very
+    "label with nothing after it" structure this check depends on."""
+    for line in (text or "").splitlines():
+        if _EMPTY_LABEL_LINE_RE.match(line.strip()):
+            continue
+        if _ADDRESS_LINE_RE.search(normalize_arabic_text(line)):
+            return True
+    return False
+
 
 def _weak_marker_and_place_noun_cooccur(raw_text: str) -> bool:
     """True only when a weak location question word (see _LOCATION_WEAK)
@@ -429,7 +457,7 @@ def resolve_branch_by_address_content(
 
     scored: list[tuple[int, float, dict]] = []
     for record in pool:
-        distinctive = _distinctive_tokens(record, locations)
+        distinctive = _distinctive_tokens(record, pool)
         if not distinctive:
             continue
         overlap = distinctive & query_tokens
@@ -565,15 +593,38 @@ def _address_detail_tokens(record: dict[str, Any], all_locations: list[dict[str,
 
 
 def _agent_gives_address_details(agent_text: str, all_locations: list[dict[str, Any]]) -> bool:
-    """Trigger-B gate: does the agent's text contain genuine address DETAIL
-    (distinctive street/district tokens from SOME branch's description that
-    aren't just that branch's own name), not merely a bare branch-name
-    mention? Naming a branch alone ("فرع السنابل") must not, on its own,
-    count as proactively giving its location."""
+    """Trigger-B gate: does the agent's text contain CREDIBLE physical-
+    address evidence, not merely a bare branch-name/facility mention or a
+    single incidental token that happens to also appear somewhere in ONE
+    CRM record's description?
+
+    A real regression showed a plain greeting ("...من مستشفى أندلسية
+    جدة...") accepted as address evidence purely because it shared ONE
+    word with an unrelated record — naming a branch alone ("فرع السنابل")
+    must not, on its own, count as proactively giving its location, and
+    neither must a lone coincidental token (an agent's own name, a generic
+    greeting word). Credible evidence is any of:
+      1. A populated structural address phrase (_address_line_bearing) —
+         شارع/حي/طريق/تقاطع/بلازا wording with actual content, not just an
+         empty registration-form label.
+      2. At least TWO distinctive address-detail tokens
+         (_address_detail_tokens) from the SAME CRM record.
+      3. A short answer whose meaningful tokens strongly (>=60%) overlap
+         one record's address-detail tokens — the same bar
+         _agent_mentions_known_location already applies for turn
+         extraction, so a real (if terse) answer like "شارع صارى" still
+         counts, but a long, unrelated turn that merely brushes past one
+         shared word does not."""
+    if _address_line_bearing(agent_text):
+        return True
     agent_tokens = set(_tokenize(agent_text))
     if not agent_tokens:
         return False
-    return any(_address_detail_tokens(loc, all_locations) & agent_tokens for loc in all_locations)
+    for loc in all_locations:
+        overlap = _address_detail_tokens(loc, all_locations) & agent_tokens
+        if len(overlap) >= 2 or (overlap and len(overlap) / len(agent_tokens) >= 0.6):
+            return True
+    return False
 
 
 def _agent_mentions_known_location(text: str, all_locations: list[dict[str, Any]]) -> bool:
@@ -693,11 +744,10 @@ def _extract_agent_location_text(
     candidate_runs = [run for run in runs if run[0][0] > trigger_index] or runs
 
     def _is_location_bearing(t: str) -> bool:
-        norm = normalize_arabic_text(t)
         return bool(
             detect_location_request(t)
             or _agent_mentions_known_location(t, locations)
-            or _ADDRESS_LINE_RE.search(norm)
+            or _address_line_bearing(t)
         )
 
     for run in candidate_runs:
@@ -786,6 +836,14 @@ def validate_location_request(
     """
     call_id = call.call_id
     requested = detect_location_request(patient_text)
+    # KSA-only pool, computed once up front and reused everywhere below
+    # (this gate, extraction, resolution-by-content, and completeness
+    # scoring) — a non-KSA record (e.g. an Egypt branch) must never make an
+    # incidental shared word look like distinctive address evidence, or
+    # dilute the ubiquity count enough to make a common KSA city/word look
+    # uniquely distinctive. Mirrors the filtering resolve_branch_candidates
+    # already applies to branch-NAME resolution.
+    ksa_pool = _ksa_pool(locations)
     # Coarse applicability gate — deliberately based on the RAW, whole
     # agent-side text (same signal the location-intent layer already uses
     # at the node level): is location even being discussed in this call at
@@ -799,7 +857,7 @@ def validate_location_request(
     # الأمير سلطان") still correctly does not count. This gate does NOT
     # decide what gets compared — see agent_location_text below for that.
     agent_gave_address_raw = bool(agent_text.strip()) and (
-        detect_location_request(agent_text) or _agent_gives_address_details(agent_text, locations)
+        detect_location_request(agent_text) or _agent_gives_address_details(agent_text, ksa_pool)
     )
     _loc_print(f"Location validation started | call_id={call_id}")
     _loc_print(f"intent: patient_request={requested} agent_provided={agent_gave_address_raw}")
@@ -808,7 +866,6 @@ def validate_location_request(
         _loc_print("outcome: NOT_APPLICABLE")
         return _loc_result("NOT_APPLICABLE", "No location/address request or agent-provided address was detected.", request=False)
 
-    ksa_pool = _ksa_pool(locations)
     logger.info(
         "location CRM records | call_id=%s fetched=%d ksa_considered=%d",
         call_id, len(locations), len(ksa_pool),
@@ -824,7 +881,7 @@ def validate_location_request(
     # agent transcript, and (b) a real CRM address mentioned in an
     # unrelated later turn being picked up as if it answered an earlier,
     # different request.
-    agent_location_text = _extract_agent_location_text(call, locations, patient_text)
+    agent_location_text = _extract_agent_location_text(call, ksa_pool, patient_text)
     # A map link (if any) stays associated with this same location block
     # for display, but never stands in for — or gets mixed into — the
     # textual address used for resolution/scoring/provided_location below.
@@ -999,7 +1056,7 @@ def validate_location_request(
     # belongs to the branch it names.
     branch = candidates[0]
     if resolution_source == "provided_address":
-        distinctive_terms = _distinctive_tokens(branch, locations)
+        distinctive_terms = _distinctive_tokens(branch, ksa_pool)
     else:
         distinctive_terms = _name_distinctive_tokens(branch, ksa_pool or locations)
     matched_terms = sorted(distinctive_terms & set(_tokenize(query_used)))
@@ -1046,13 +1103,13 @@ def validate_location_request(
         call_id, normalize_arabic_text(str(branch.get("cr301_description") or "")), normalize_arabic_text(agent_location_text),
     )
 
-    score = validate_location_answer(branch, agent_location_text, locations)
+    score = validate_location_answer(branch, agent_location_text, ksa_pool)
     overlap = score["overlap_ratio"]
     # Recomputed against the EXTRACTED local text (not the raw whole-call
     # gate above) — this is what actually decides NO_ADDRESS_PROVIDED vs
     # WRONG_LOCATION for the resolved branch specifically.
     agent_gave_address = bool(
-        detect_location_request(agent_location_text) or _agent_gives_address_details(agent_location_text, locations)
+        detect_location_request(agent_location_text) or _agent_gives_address_details(agent_location_text, ksa_pool)
     )
     if overlap >= 0.6:
         outcome = "PASS"
@@ -1068,7 +1125,21 @@ def validate_location_request(
         reason = "The patient asked for a location but the agent's reply contains no address information."
     else:
         outcome = "WRONG_LOCATION"
-        reason = "The agent's address does not match the requested branch's known location — it belongs to a different branch."
+        # Only claim the address "belongs to a different branch" when that
+        # is actually supported by evidence — i.e. the agent's own address
+        # CONTENT independently resolves to some OTHER real KSA branch. An
+        # address-shaped answer that simply fails to match the requested
+        # branch, with no other branch it credibly belongs to either, is
+        # still a violation — just not one attributable to a specific
+        # other facility.
+        other_branch = [
+            b for b in resolve_branch_by_address_content(agent_location_text, locations, ksa_only=True)
+            if b is not branch
+        ]
+        if other_branch:
+            reason = "The agent's address does not match the requested branch's known location — it belongs to a different branch."
+        else:
+            reason = "The agent's address does not match the requested branch's known location."
 
     logger.info(
         "location comparison | call_id=%s resolved_branch=%r crm_location=%r chat_location=%r match=%s outcome=%s "

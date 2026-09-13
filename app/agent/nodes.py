@@ -39,6 +39,7 @@ from sqlalchemy import create_engine, text as sa_text
 from arabic_reshaper import reshape
 
 from app.agent.state import AgentState
+from app.config import settings
 from app.models.input import CallTranscript
 from app.models.output import QAAnalysisResult
 from app.prompts.qa_prompt import (
@@ -295,10 +296,17 @@ async def _focused_llm_call(
     llm_client: LLMClient,
     state: AgentState,
     max_json_retries: int = 2,
+    max_tokens: int | None = None,
 ) -> tuple[dict | None, dict | None]:
     """
     Internal helper: call the LLM, log usage, parse JSON.
     Returns (parsed_dict, error_dict).  Exactly one of the two will be None.
+
+    *max_tokens* overrides settings.llm_max_tokens for this node's calls —
+    e.g. infer_overall_scoring passes settings.llm_scoring_max_tokens,
+    since it synthesises every other node's output into one response and
+    needs more headroom than the shared default. Leave it None (the
+    shared default) for every other, narrower node.
 
     A call that SUCCEEDS but returns malformed/truncated JSON (e.g. a
     response that stops mid-string — "Unterminated string starting at:
@@ -311,13 +319,18 @@ async def _focused_llm_call(
     handle_error. Each retry re-sends the SAME prompt (no prompt content
     is implicated by a truncated/garbled response), and the FINAL error
     (if every attempt fails) is logged in the exact same shape as before,
-    so nothing downstream needs to change.
+    so nothing downstream needs to change. NOTE: this does NOT help when
+    the truncation is caused by the response hitting *max_tokens* itself
+    (usage's completion/output tokens landing right at the cap) — resending
+    the identical prompt against the identical cap truncates in the same
+    place every time; that failure mode is fixed by raising the cap (see
+    *max_tokens* above), not by retrying.
     """
     last_parse_exc: json.JSONDecodeError | None = None
     last_raw_text = ""
     for attempt in range(1, max_json_retries + 2):  # 1 initial try + N retries
         try:
-            raw_text, usage = await llm_client.complete(SYSTEM_PROMPT, user_prompt)
+            raw_text, usage = await llm_client.complete(SYSTEM_PROMPT, user_prompt, max_tokens=max_tokens)
         except Exception as exc:
             logger.error("%s LLM call failed | call_id=%s | %s", node_name, call_id, exc)
             return None, {
@@ -771,7 +784,8 @@ async def infer_overall_scoring(
     )
 
     data, err = await _focused_llm_call(
-        "infer_overall_scoring", call.call_id, user_prompt, llm_client, state
+        "infer_overall_scoring", call.call_id, user_prompt, llm_client, state,
+        max_tokens=settings.llm_scoring_max_tokens,
     )
     if err:
         return err

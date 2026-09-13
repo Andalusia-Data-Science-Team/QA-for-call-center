@@ -87,8 +87,13 @@ _ARABIC_CHAR_MAP: dict[str, str] = {
     # Alef maqsura already handled above (ى → ي)
 }
 
-# Regex that strips Arabic diacritics (tashkeel / harakat)
-_DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]")
+# Regex that strips Arabic diacritics (tashkeel / harakat) and the tatweel/
+# kashida elongation character (ـ, U+0640). Tatweel is purely a visual
+# justification stroke inserted between letters (e.g. "جـده" for "جده",
+# "أنـدلـسيـة" for "أندلسية") — it carries no phonetic or semantic content,
+# so two spellings that differ only by tatweel placement must normalise
+# identically, the same way diacritics already do.
+_DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED\u0640]")
 
 
 # Regex that strips Arabic doctor-name prefixes such as:
@@ -124,7 +129,8 @@ def _normalize_arabic(text: str | None) -> str | None:
 
     Steps applied:
       1. Strip leading/trailing whitespace.
-      2. Remove diacritics (tashkeel / harakat).
+      2. Remove diacritics (tashkeel / harakat) and the tatweel/kashida
+         elongation character (ـ, U+0640).
       3. Collapse alef variants (أ إ آ ٱ) → ا
          teh-marbuta (ة) → ه
          yeh variants (ى ئ) → ي

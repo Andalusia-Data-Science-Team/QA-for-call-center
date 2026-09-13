@@ -29,7 +29,7 @@ class _StubLLMClient:
     output; that's irrelevant to these tests, which only assert on the
     node_trace/state produced up through and around loc_bank_ready."""
 
-    async def complete(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
         return "{}", {"prompt_tokens": 0, "completion_tokens": 0}
 
 

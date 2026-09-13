@@ -54,7 +54,7 @@ from app.services.text_helpers import normalize_arabic_text, split_transcript_by
 # docstring below and app.service_hub.bank_validation's own comment beside
 # _APP_BU_TO_CRM_BU for the full rationale (verified against real Dynamics
 # 365 data: CRM rows use "AHJ", never the app-level "LIVE" label).
-from app.service_hub.bank_validation import _APP_BU_TO_CRM_BU
+from app.service_hub.bank_validation import _APP_BU_TO_CRM_BU, resolve_business_unit
 # Reuse the project's single canonical Arabic/English specialty-alias
 # table rather than a second, duplicate copy of it — see
 # _resolve_specialty_category's docstring below.
@@ -202,7 +202,7 @@ _GENERIC_SPECIALTY_WORDS = {
     "اذن", "أذن", "حنجره", "حنجرة", "باطنه", "باطنة", "مسالك", "بوليه",
     "بولية", "نفسيه", "نفسية", "تغذيه", "تغذية", "جراحه", "جراحة", "عام", "عامه",
     "عامة", "تجميل", "روماتيزم", "غدد", "صماء", "سكري", "اورام", "أورام",
-    "طوارئ", "سمعيات", "تخاطب", "امراض", "أمراض",
+    "طوارئ", "سمعيات", "تخاطب", "نطق", "امراض", "أمراض",
     "تناسليه", "تناسلية", "كلي", "كلى", "مفاصل", "عمود", "فقري", "فقرى",
     "صدر", "تنفس", "ربو", "سمنه", "سمنة", "تكميم", "قسطره", "قسطرة",
     # Imaging/procedures/labs — mirrors the same core vocabulary already
@@ -1795,7 +1795,7 @@ def _canon_degree_value(value: str | None) -> str:
 _SPECIALTY_ALIAS_SUPPLEMENT: dict[str, str] = {
     "غدد صماء": "Endocrinology",
     "تغذية": "Nutrition", "تغذيه": "Nutrition",
-    "تخاطب": "Speech",
+    "تخاطب": "Speech", "نطق وتخاطب": "Speech", "علاج النطق": "Speech",
 }
 
 # Qualifier words stripped when reducing a specialty DISPLAY NAME (either
@@ -1807,18 +1807,42 @@ _SPECIALTY_ALIAS_SUPPLEMENT: dict[str, str] = {
 # "Pediatrics") compare equal instead of failing on wording alone.
 _SPECIALTY_CORE_QUALIFIER_WORDS = {"general", "medical", "clinical"}
 
+# Exact-equivalence CRM display-name variants for the SAME "Speech"
+# specialty/subspecialty. Real CRM data spells this subspecialty several
+# different ways — including "Phonatics", a misspelling of "Phoniatrics"
+# that nonetheless is the literal value stored in production — none of
+# which share a common qualifier-word prefix/suffix the generic reduction
+# above would strip. Deliberately an EXPLICIT, exact-match table keyed on
+# the already-reduced core string (never fuzzy string similarity, which
+# risks merging genuinely unrelated specialties) — e.g. this must NOT make
+# a bare "E.N.T" match "Speech" just because Phonatics is an ENT
+# subspecialty; only these specific spellings are equivalent.
+_SPECIALTY_CORE_EQUIVALENTS: dict[str, str] = {
+    "speech": "speech",
+    "speech therapy": "speech",
+    "speech and phonetics": "speech",
+    "speech language pathology": "speech",
+    "phonatics": "speech",  # CRM spelling (misspelling of "Phoniatrics")
+    "phonetics": "speech",
+    "phoniatrics": "speech",
+}
+
 
 def _specialty_core(display_name: str | None) -> str:
     """Reduce a specialty/subspecialty display name to a comparable
     lowercase 'core' token — see module comment above. Reuses
     normalize_arabic_text (already lowercases, strips punctuation
     including the "E.N.T" vs "E.N.T." dot difference, collapses
-    whitespace) rather than a bespoke normaliser."""
+    whitespace) rather than a bespoke normaliser. The result is then run
+    through _SPECIALTY_CORE_EQUIVALENTS so every CRM spelling of "Speech"
+    (including "Phonatics") collapses onto the same comparable value on
+    both sides of a claim/CRM comparison."""
     normalized = normalize_arabic_text(display_name)
     if not normalized:
         return ""
     words = [w for w in normalized.split() if w not in _SPECIALTY_CORE_QUALIFIER_WORDS]
-    return " ".join(words) if words else normalized
+    core = " ".join(words) if words else normalized
+    return _SPECIALTY_CORE_EQUIVALENTS.get(core, core)
 
 
 def _resolve_specialty_category(text: str | None) -> str | None:
@@ -1906,35 +1930,65 @@ def parse_examination_age(raw: str | None) -> tuple[int, float] | None:
 
 
 # Agent age-eligibility claims: "يستقبل من عمر N" / "يستقبل أطفال" /
-# "لا يستقبل أقل من N" / "من عمر N فأكثر".
+# "لا يستقبل أقل من N" / "من عمر N فأكثر" / an explicit SPECIFIC range
+# ("من 5 لحد 15 سنة"). Checked in this order — RANGE before FROM — since
+# a range claim never contains the word "عمر" FROM_RE requires, so the two
+# patterns never compete for the same text; ordering here is purely
+# documentation of that intent, not a tie-break.
+_AGE_CLAIM_RANGE_RE = re.compile(r"من\s*(\d{1,3})\s*(?:الي|الى|إلى|لحد|حتى)\s*(\d{1,3})", re.I)
 _AGE_CLAIM_FROM_RE = re.compile(r"من\s*عمر\s*(\d{1,3})", re.I)
 _AGE_CLAIM_NOT_UNDER_RE = re.compile(r"لا\s*يستقبل\s*اقل\s*من\s*(\d{1,3})|لا\s*يستقبل\s*تحت\s*(\d{1,3})", re.I)
 _AGE_CLAIM_CHILDREN_RE = re.compile(r"يستقبل\s*اطفال|يستقبل\s*أطفال", re.I)
 _AGE_CLAIM_ADULTS_ONLY_RE = re.compile(r"يستقبل\s*(?:كبار|بالغين)\s*فقط|فوق\s*ال?18", re.I)
 
+# Ordered (pattern, tag-builder) pairs — the single source of truth for
+# BOTH _extract_examination_age_claim (the canonical tag) and
+# _examination_age_claim_raw_match (the raw matched text for logging), so
+# the two can never drift out of sync with each other.
+_AGE_CLAIM_PATTERNS: list[tuple[re.Pattern, "Callable[[re.Match], str]"]] = [
+    (_AGE_CLAIM_RANGE_RE, lambda m: f"range:{m.group(1)}-{m.group(2)}"),
+    (_AGE_CLAIM_FROM_RE, lambda m: f"from:{m.group(1)}"),
+    (_AGE_CLAIM_NOT_UNDER_RE, lambda m: f"from:{m.group(1) or m.group(2)}"),
+    (_AGE_CLAIM_CHILDREN_RE, lambda _m: "children"),
+    (_AGE_CLAIM_ADULTS_ONLY_RE, lambda _m: "adults_only"),
+]
+
 
 def _extract_examination_age_claim(text: str) -> str | None:
-    """Returns a normalised claim tag ('children' | 'adults_only' | a
-    specific 'from:N' string) or None when the Agent made no age-
-    eligibility claim at all."""
+    """Returns a normalised claim tag ('children' | 'adults_only' |
+    'from:N' | 'range:N-M') or None when the Agent made no age-eligibility
+    claim at all — see _AGE_CLAIM_PATTERNS for the recognised shapes."""
     norm = normalize_arabic_text(text)
-    if _AGE_CLAIM_FROM_RE.search(norm):
-        return f"from:{_AGE_CLAIM_FROM_RE.search(norm).group(1)}"
-    if _AGE_CLAIM_NOT_UNDER_RE.search(norm):
-        m = _AGE_CLAIM_NOT_UNDER_RE.search(norm)
-        return f"from:{m.group(1) or m.group(2)}"
-    if _AGE_CLAIM_CHILDREN_RE.search(norm):
-        return "children"
-    if _AGE_CLAIM_ADULTS_ONLY_RE.search(norm):
-        return "adults_only"
+    for pattern, tag in _AGE_CLAIM_PATTERNS:
+        m = pattern.search(norm)
+        if m:
+            return tag(m)
     return None
 
 
-# Walk-in consultation fee claims: "كشفية الدكتور 300 ريال" / "SAR 300" /
-# "٣٠٠ ريال" — tolerate formatting differences, not materially different
-# amounts.
+def _examination_age_claim_raw_match(text: str) -> str | None:
+    """The raw matched substring behind _extract_examination_age_claim's
+    canonical tag — diagnostic-only, mirrors _degree_claim_raw_match."""
+    norm = normalize_arabic_text(text)
+    for pattern, _tag in _AGE_CLAIM_PATTERNS:
+        m = pattern.search(norm)
+        if m:
+            return m.group()
+    return None
+
+
+# Walk-in consultation fee claims: "كشفية الدكتور 300 ريال" — a fee-context
+# keyword (كشفية/كشف/consultation) MUST be present near the number, in
+# EITHER order. A bare "<number> ريال" with no such keyword anywhere near
+# it is deliberately never matched: real regression — an unrelated offer
+# price, a procedure cost, or a booking deposit mentioned in the same
+# scoped text ("عندنا عرض على الأشعة ب 500 ريال") was previously captured
+# as if it were the doctor's own walk-in fee, purely because it was some
+# number followed by "ريال" somewhere in scope.
 _FEE_CLAIM_RE = re.compile(
-    r"(?:كشفي[ةه]|consultation|كشف)\D{0,15}([0-9٠-٩]{2,5})|([0-9٠-٩]{2,5})\s*(?:ريال|sar|رس)", re.I,
+    r"(?:كشفي[ةه]|consultation|كشف)\D{0,20}([0-9٠-٩]{2,5})"
+    r"|([0-9٠-٩]{2,5})\D{0,10}(?:كشفي[ةه]|consultation\s*fee)",
+    re.I,
 )
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
@@ -1951,6 +2005,14 @@ def _extract_fee_claim(text: str) -> float | None:
         return None
 
 
+def _fee_claim_raw_match(text: str) -> str | None:
+    """The raw matched substring behind _extract_fee_claim's parsed float —
+    diagnostic-only, mirrors _degree_claim_raw_match."""
+    norm = normalize_arabic_text(text)
+    m = _FEE_CLAIM_RE.search(norm)
+    return m.group() if m else None
+
+
 # Scope-of-service / qualifications / doctor-notes claims: these are open
 # free text, so — rather than a fixed keyword table — a claim is any Agent
 # sentence introduced by one of these trigger phrases, and it's validated
@@ -1962,7 +2024,11 @@ def _extract_fee_claim(text: str) -> float | None:
 # share a vocabulary; a single resolved doctor's own reference text doesn't).
 _SCOPE_CLAIM_TRIGGER_RE = re.compile(r"يعالج|يعمل|متخصص\s*في|يجري|يقوم\s*ب", re.I)
 _QUALIFICATION_CLAIM_TRIGGER_RE = re.compile(r"بورد|زمالة|زماله|دكتوراه|خبرة|خبره|ماجستير|دبلوم", re.I)
-_NOTES_CLAIM_TRIGGER_RE = re.compile(r"لا\s*يستقبل|لا\s*يوجد|فقط\s*يوم|حالات\s*جديده|new\s*cases\s*only", re.I)
+_NOTES_CLAIM_TRIGGER_RE = re.compile(
+    r"لا\s*يستقبل|لا\s*يوجد(?!\s*(?:مواعيد|معاد|موعد|حجز|مكان|متاح))|فقط\s*يوم|"
+    r"حالات\s*جديده|new\s*cases\s*only",
+    re.I,
+)
 
 
 def _claim_text_if_triggered(text: str, trigger_re: re.Pattern) -> str | None:
@@ -2028,6 +2094,48 @@ def has_detailed_scope_evidence(scope_ref: dict[str, Any] | None) -> bool:
 
 def _field(claimed: Any, outcome: str, reference: Any = None) -> dict[str, Any]:
     return {"claimed": claimed, "outcome": outcome, "reference": reference}
+
+
+def _log_field_validation(
+    field: str, *, raw_claim: Any, canonical_claim: Any,
+    crm_reference: Any, canonical_crm: Any, outcome: str,
+) -> None:
+    """Uniform per-field validation diagnostic, printed for every field
+    that was ACTUALLY validated (never for an optional field the Agent
+    never mentioned — see _log_skipped_optional_fields for that side).
+    Generalises the rich diagnostic block degree validation already used
+    to every validated field, so a production PASS/FAIL/NEEDS_REVIEW is
+    never an unexplained verdict for ANY field, not just degree/specialty."""
+    print(
+        f"[doctor] field validation:\n"
+        f"[doctor]     field={field!r}\n"
+        f"[doctor]     claimed_raw={raw_claim!r}\n"
+        f"[doctor]     claimed_canonical={canonical_claim!r}\n"
+        f"[doctor]     crm_reference={crm_reference!r}\n"
+        f"[doctor]     crm_canonical={canonical_crm!r}\n"
+        f"[doctor]     result={outcome}",
+        flush=True,
+    )
+
+
+# The Agent-claim-driven fields (Part: "Optional fields") — validated ONLY
+# when the Agent explicitly makes a claim about the resolved doctor, never
+# added to validated_fields (and so never counted toward fields_checked,
+# never able to lower the overall outcome) when absent. Kept as a single
+# named tuple so the "which fields are optional" list and the skipped-
+# fields diagnostic below can never silently drift apart.
+_OPTIONAL_CLAIM_FIELDS = ("degree", "doctor_notes", "qualifications", "examination_age", "walkin_fee")
+
+
+def _log_skipped_optional_fields(validated: dict[str, Any]) -> None:
+    """Concise diagnostic listing which optional (claim-driven) fields were
+    never mentioned at all for this doctor — printed alongside, never
+    instead of, the per-field validation logs above. Purely observational:
+    skipped fields are never added to validated_fields and never affect
+    fields_checked or the aggregated outcome."""
+    skipped = [f for f in _OPTIONAL_CLAIM_FIELDS if f not in validated]
+    if skipped:
+        print(f"[doctor] optional_fields_not_mentioned={skipped}", flush=True)
 
 
 def _result(
@@ -2307,29 +2415,36 @@ def _resolve_and_validate_one_doctor(
     # ── Field-by-field validation of ONLY the Agent's actual claims ────────
     validated: dict[str, Any] = {}
 
-    # Degree/rank claim: scoped to THIS resolved doctor's own turn(s) —
-    # never a blind scan of the whole call's agent_text, which could
-    # attribute an explicit rank claim about a DIFFERENT doctor mentioned
-    # elsewhere in the same (possibly multi-doctor) conversation to this
-    # one. A bare دكتور/دكتورة/د/Dr title is never itself a degree claim
-    # (see _DEGREE_CLAIM_PATTERNS — it only recognises explicit
-    # professional ranks like استشاري/اخصائي/استاذ/GP/نائب/مقيم) — that
-    # stays true here unchanged; this only fixes WHICH text is scanned.
-    _degree_anchor_name = resolved_query or (query_candidates[0] if query_candidates else None)
-    _degree_scope_text = _agent_turns_text_for_doctor(call, _degree_anchor_name) if _degree_anchor_name else agent_text
-    degree_claim = _extract_degree_claim(_degree_scope_text)
+    # Every optional (claim-driven) field below — degree, business_unit,
+    # doctor_notes, scope_of_service, qualifications, examination_age,
+    # walkin_fee — is scoped to THIS resolved doctor's own agent turn(s),
+    # computed ONCE and shared, never a blind scan of the whole call's
+    # agent_text: in a multi-doctor conversation an explicit claim about a
+    # DIFFERENT recommended doctor must never be attributed to this one
+    # (Section 17). Falls back to the whole agent_text only when no anchor
+    # name is available at all (e.g. a pure Trigger-B/no-candidates path).
+    _doctor_scope_anchor_name = resolved_query or (query_candidates[0] if query_candidates else None)
+    _doctor_scope_text = (
+        _agent_turns_text_for_doctor(call, _doctor_scope_anchor_name)
+        if _doctor_scope_anchor_name else agent_text
+    )
+
+    # Degree/rank claim. A bare دكتور/دكتورة/د/Dr title is never itself a degree
+    # claim (see _DEGREE_CLAIM_PATTERNS — it only recognises explicit
+    # professional ranks like استشاري/اخصائي/استاذ/GP/نائب/مقيم).
+    degree_claim = _extract_degree_claim(_doctor_scope_text)
     if degree_claim is not None:
         crm_degree = _canon_degree_value(doctor.get("cr301_degreename"))
         ok = bool(crm_degree) and degree_claim == crm_degree
-        validated["degree"] = _field(degree_claim, "PASS" if ok else "FAIL", doctor.get("cr301_degreename"))
-        print(
-            f"[doctor] field validation:\n"
-            f"[doctor]     field='degree'\n"
-            f"[doctor]     claimed_raw={_degree_claim_raw_match(_degree_scope_text)!r}\n"
-            f"[doctor]     claimed_canonical={_DEGREE_CANON_DISPLAY.get(degree_claim, degree_claim)!r}\n"
-            f"[doctor]     crm_degree={doctor.get('cr301_degreename')!r}\n"
-            f"[doctor]     result={'PASS' if ok else 'FAIL'}",
-            flush=True,
+        degree_outcome = "PASS" if ok else "FAIL"
+        validated["degree"] = _field(degree_claim, degree_outcome, doctor.get("cr301_degreename"))
+        _log_field_validation(
+            "degree",
+            raw_claim=_degree_claim_raw_match(_doctor_scope_text),
+            canonical_claim=_DEGREE_CANON_DISPLAY.get(degree_claim, degree_claim),
+            crm_reference=doctor.get("cr301_degreename"),
+            canonical_crm=crm_degree,
+            outcome=degree_outcome,
         )
 
     # Specialty claim: scoped to THIS resolved doctor's own turn(s) — never
@@ -2432,43 +2547,18 @@ def _resolve_and_validate_one_doctor(
             flush=True,
         )
 
-    bu_claim_text = normalize_arabic_text(agent_text)
-    claimed_bu = doctor.get("cr18c_buname") if doctor.get("cr18c_buname") and str(doctor.get("cr18c_buname")).lower() in bu_claim_text else None
-    if claimed_bu:
-        validated["business_unit"] = _field(claimed_bu, "PASS", doctor.get("cr18c_buname"))
-
-    notes_claim = _claim_text_if_triggered(agent_text, _NOTES_CLAIM_TRIGGER_RE)
-    if notes_claim is not None:
-        crm_notes = doctor.get("cr301_drnotes")
-        if not crm_notes:
-            validated["doctor_notes"] = _field(notes_claim, "NEEDS_REVIEW", None)
-        else:
-            ok = _overlap_supports_claim(notes_claim, crm_notes)
-            validated["doctor_notes"] = _field(notes_claim, "PASS" if ok else "FAIL", crm_notes)
-
-    scope_claim = _claim_text_if_triggered(agent_text, _SCOPE_CLAIM_TRIGGER_RE)
-    if scope_claim is not None:
-        crm_scope = doctor.get("cr301_scopeofservicear") or doctor.get("cr301_scopeofservice")
-        if not crm_scope:
-            validated["scope_of_service"] = _field(scope_claim, "NEEDS_REVIEW", None)
-        else:
-            ok = _overlap_supports_claim(scope_claim, doctor.get("cr301_scopeofservicear"), doctor.get("cr301_scopeofservice"))
-            validated["scope_of_service"] = _field(scope_claim, "PASS" if ok else "FAIL", crm_scope)
-
-    qual_claim = _claim_text_if_triggered(agent_text, _QUALIFICATION_CLAIM_TRIGGER_RE)
-    if qual_claim is not None:
-        crm_qual = doctor.get("cr301_qualificationsandexperiencear") or doctor.get("cr301_qualificationsandexperience")
-        if not crm_qual:
-            validated["qualifications"] = _field(qual_claim, "NEEDS_REVIEW", None)
-        else:
-            ok = _overlap_supports_claim(qual_claim, doctor.get("cr301_qualificationsandexperiencear"), doctor.get("cr301_qualificationsandexperience"))
-            validated["qualifications"] = _field(qual_claim, "PASS" if ok else "FAIL", crm_qual)
-
-    age_claim = _extract_examination_age_claim(agent_text)
+    # Examination age: optional, but HIGH PRIORITY when mentioned — checked
+    # (and logged, with full diagnostics) right after specialty, before the
+    # lower-priority free-text optional fields below (doctor_notes/
+    # scope_of_service/qualifications) and before walkin_fee.
+    age_claim = _extract_examination_age_claim(_doctor_scope_text)
     if age_claim is not None:
         parsed = parse_examination_age(doctor.get("servhub_examinationage"))
         if parsed is None:
-            validated["examination_age"] = _field(age_claim, "NEEDS_REVIEW", doctor.get("servhub_examinationage"))
+            # Missing/unparseable CRM age data — never silently accepted,
+            # never a hard FAIL either: no authoritative range to confirm
+            # OR contradict the claim against.
+            age_outcome = "NEEDS_REVIEW"
         else:
             min_age, max_age = parsed
             if age_claim == "children":
@@ -2478,24 +2568,110 @@ def _resolve_and_validate_one_doctor(
             elif age_claim.startswith("from:"):
                 claimed_from = float(age_claim.split(":", 1)[1])
                 ok = abs(claimed_from - min_age) <= 1  # tolerate off-by-one boundary phrasing
+            elif age_claim.startswith("range:"):
+                claimed_lo_s, claimed_hi_s = age_claim.split(":", 1)[1].split("-")
+                claimed_lo, claimed_hi = float(claimed_lo_s), float(claimed_hi_s)
+                ok = claimed_lo >= min_age - 1 and (max_age == float("inf") or claimed_hi <= max_age + 1)
             else:
-                ok = True
-            validated["examination_age"] = _field(age_claim, "PASS" if ok else "FAIL", doctor.get("servhub_examinationage"))
+                # Defensive only: every tag _extract_examination_age_claim
+                # can actually return is handled above. An unrecognised tag
+                # must never silently PASS.
+                ok = None
+            age_outcome = "NEEDS_REVIEW" if ok is None else ("PASS" if ok else "FAIL")
+        validated["examination_age"] = _field(age_claim, age_outcome, doctor.get("servhub_examinationage"))
+        _log_field_validation(
+            "examination_age",
+            raw_claim=_examination_age_claim_raw_match(_doctor_scope_text),
+            canonical_claim=age_claim,
+            crm_reference=doctor.get("servhub_examinationage"),
+            canonical_crm=(f"{parsed[0]}-{parsed[1]}" if parsed else None),
+            outcome=age_outcome,
+        )
 
-    fee_claim = _extract_fee_claim(agent_text)
+    # Business-unit/branch claim: resolved from free text via the project's
+    # one canonical BU-alias table (app.models.input.BUSINESS_UNIT_KEYWORD_MAP,
+    # via resolve_business_unit), never just a literal search for the
+    # doctor's OWN BU code in the chat — that could only ever confirm a
+    # match and could never catch a genuinely WRONG stated branch.
+    _claimed_bu_app_code = resolve_business_unit(_doctor_scope_text)
+    if _claimed_bu_app_code is not None:
+        claimed_bu_crm = canonical_doctor_bu(_claimed_bu_app_code)
+        crm_bu = doctor.get("cr18c_buname")
+        ok = bool(crm_bu) and bool(claimed_bu_crm) and claimed_bu_crm.strip().upper() == str(crm_bu).strip().upper()
+        bu_outcome = "PASS" if ok else "FAIL"
+        validated["business_unit"] = _field(claimed_bu_crm, bu_outcome, crm_bu)
+        _log_field_validation(
+            "business_unit",
+            raw_claim=_claimed_bu_app_code,
+            canonical_claim=claimed_bu_crm,
+            crm_reference=crm_bu,
+            canonical_crm=crm_bu,
+            outcome=bu_outcome,
+        )
+
+    notes_claim = _claim_text_if_triggered(_doctor_scope_text, _NOTES_CLAIM_TRIGGER_RE)
+    if notes_claim is not None:
+        crm_notes = doctor.get("cr301_drnotes")
+        if not crm_notes:
+            notes_outcome = "NEEDS_REVIEW"
+        else:
+            notes_outcome = "PASS" if _overlap_supports_claim(notes_claim, crm_notes) else "FAIL"
+        validated["doctor_notes"] = _field(notes_claim, notes_outcome, crm_notes)
+        _log_field_validation(
+            "doctor_notes", raw_claim=notes_claim, canonical_claim=notes_claim,
+            crm_reference=crm_notes, canonical_crm=crm_notes, outcome=notes_outcome,
+        )
+
+    scope_claim = _claim_text_if_triggered(_doctor_scope_text, _SCOPE_CLAIM_TRIGGER_RE)
+    if scope_claim is not None:
+        crm_scope = doctor.get("cr301_scopeofservicear") or doctor.get("cr301_scopeofservice")
+        if not crm_scope:
+            scope_outcome = "NEEDS_REVIEW"
+        else:
+            ok = _overlap_supports_claim(scope_claim, doctor.get("cr301_scopeofservicear"), doctor.get("cr301_scopeofservice"))
+            scope_outcome = "PASS" if ok else "FAIL"
+        validated["scope_of_service"] = _field(scope_claim, scope_outcome, crm_scope)
+        _log_field_validation(
+            "scope_of_service", raw_claim=scope_claim, canonical_claim=scope_claim,
+            crm_reference=crm_scope, canonical_crm=crm_scope, outcome=scope_outcome,
+        )
+
+    qual_claim = _claim_text_if_triggered(_doctor_scope_text, _QUALIFICATION_CLAIM_TRIGGER_RE)
+    if qual_claim is not None:
+        crm_qual = doctor.get("cr301_qualificationsandexperiencear") or doctor.get("cr301_qualificationsandexperience")
+        if not crm_qual:
+            qual_outcome = "NEEDS_REVIEW"
+        else:
+            ok = _overlap_supports_claim(qual_claim, doctor.get("cr301_qualificationsandexperiencear"), doctor.get("cr301_qualificationsandexperience"))
+            qual_outcome = "PASS" if ok else "FAIL"
+        validated["qualifications"] = _field(qual_claim, qual_outcome, crm_qual)
+        _log_field_validation(
+            "qualifications", raw_claim=qual_claim, canonical_claim=qual_claim,
+            crm_reference=crm_qual, canonical_crm=crm_qual, outcome=qual_outcome,
+        )
+
+    fee_claim = _extract_fee_claim(_doctor_scope_text)
     if fee_claim is not None:
         crm_fee = doctor.get("cr301_walkinconsultationfees")
         if crm_fee in (None, ""):
-            validated["walkin_fee"] = _field(fee_claim, "NEEDS_REVIEW", None)
+            fee_outcome = "NEEDS_REVIEW"
         else:
             try:
                 ok = abs(float(fee_claim) - float(crm_fee)) < 1
             except (TypeError, ValueError):
                 ok = False
-            validated["walkin_fee"] = _field(fee_claim, "PASS" if ok else "FAIL", crm_fee)
+            fee_outcome = "PASS" if ok else "FAIL"
+        validated["walkin_fee"] = _field(fee_claim, fee_outcome, crm_fee)
+        _log_field_validation(
+            "walkin_fee",
+            raw_claim=_fee_claim_raw_match(_doctor_scope_text), canonical_claim=fee_claim,
+            crm_reference=crm_fee, canonical_crm=(float(crm_fee) if crm_fee not in (None, "") else crm_fee),
+            outcome=fee_outcome,
+        )
 
     if validated:
         _doc_print_section("field validation", **{k: v["outcome"] for k, v in validated.items()})
+    _log_skipped_optional_fields(validated)
 
     outcomes = [v["outcome"] for v in validated.values()]
     if "FAIL" in outcomes:

@@ -101,3 +101,50 @@ project's existing philosophy (see `bank_validation.py`'s
 `_BANK_NAME_CANON`, an explicitly extensible, non-exhaustive alias table)
 of preferring a documented, extensible starting point over an attempt at
 total coverage that would inevitably still miss real phrasing anyway.
+
+## Unconditional checks vs. optional (claim-driven) fields
+
+Once a doctor is resolved, two different validation contracts apply:
+
+**Always validated, regardless of what the Agent said:**
+- Identity/name resolution against CRM.
+- Record eligibility (`statuscodename == "Active"` + a supported
+  `cr18c_buname` — `cr301_opdflag` stays informational only, never an
+  eligibility filter).
+- Specialty/subspecialty and business_unit and scope_of_service ARE
+  claim-driven (validated only when the Agent actually made that specific
+  claim), but they are not part of the "5 optional fields" contract below
+  — e.g. a stated business-unit/branch claim can PASS or genuinely FAIL
+  (see `resolve_business_unit`/`canonical_doctor_bu` in
+  `_resolve_and_validate_one_doctor`), it just never appears at all when
+  no BU/branch was mentioned.
+
+**Optional (claim-driven) fields** — `_OPTIONAL_CLAIM_FIELDS` in
+`doctor_validation.py` — validated ONLY when the Agent explicitly makes a
+claim about the resolved doctor:
+- `degree` (rank: consultant/specialist/professor/GP/resident/registrar/
+  senior registrar — a bare دكتور/دكتورة/د/Dr title is never itself a claim)
+- `doctor_notes`
+- `qualifications`
+- `examination_age` — high priority: checked (and logged with full
+  diagnostics) immediately after specialty, before the lower-priority
+  free-text optional fields (`doctor_notes`/`scope_of_service`/
+  `qualifications`) and before `walkin_fee`. Recognises minimum-age,
+  children/adults-only, and a SPECIFIC age-range claim
+  (`"من 5 لحد 15 سنة"` → `range:5-15`), each checked against the CRM
+  range parsed by `parse_examination_age`.
+- `walkin_fee`
+
+When absent, an optional field is never added to `validated_fields`
+(so it never counts toward `fields_checked`, and can never lower the
+outcome). A concise diagnostic line — `optional_fields_not_mentioned=[...]`
+— lists exactly which of the 5 were skipped, printed by
+`_log_skipped_optional_fields` alongside (never instead of) the per-field
+`_log_field_validation` diagnostic for every field that WAS checked.
+
+All per-doctor claim extraction (degree, business_unit, doctor_notes,
+scope_of_service, qualifications, examination_age, walkin_fee) is scoped
+to THIS resolved doctor's own agent turn(s) via
+`_agent_turns_text_for_doctor` — never a blind scan of the whole call's
+agent-side text — so a claim about a DIFFERENT doctor in a multi-doctor
+recommendation set is never attributed to this one.

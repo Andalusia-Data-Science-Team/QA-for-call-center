@@ -1236,3 +1236,171 @@ def test_address_completeness_tokens_exclude_name_and_region_and_label():
     assert "اندلسيه" not in tokens
     assert "العنوان" not in tokens
     assert "ksa" not in tokens
+
+
+# =============================================================================
+# Regression — empty registration-form fields must not be extracted as
+# addresses, and a bare branch-name greeting must not be misclassified as
+# WRONG_LOCATION. See location_validation.py's _address_line_bearing /
+# _agent_gives_address_details / _ksa_pool-consistency fixes.
+# =============================================================================
+
+def test_empty_registration_field_is_not_extracted_as_address():
+    """An empty registration-form field ('الحي السكني:', a residential-district
+    PROMPT with nothing filled in after the colon) must never be treated as
+    genuine address content just because the label text itself contains the
+    structural marker 'حي'. Outcome must be NO_ADDRESS_PROVIDED, and the
+    template must never surface as provided_location."""
+    transcript = (
+        "Patient: فين المستشفى؟\n"
+        "Agent: لفتح ملف برجاء توضيح\n"
+        "الاسم الرباعي:\n"
+        "الحي السكني:\n"
+        "رقم الهاتف:\n"
+        "الجنسيه:\n"
+        "العمر:"
+    )
+    result = validate(transcript)
+    assert result["outcome"] == "NO_ADDRESS_PROVIDED"
+    assert not result["provided_location"]
+
+
+def test_empty_field_line_alone_is_never_address_line_bearing():
+    """Direct unit check on the general rule: ANY empty '<label>:' line is
+    excluded, not just this one field's exact text (no exact-string
+    exception)."""
+    from app.service_hub.location_validation import _address_line_bearing
+
+    assert _address_line_bearing("الحي السكني:") is False
+    assert _address_line_bearing("الشارع الرئيسي:") is False
+    # A POPULATED label (real content after the colon) must still qualify.
+    assert _address_line_bearing("الحي السكني: المحمدية") is True
+
+
+@pytest.mark.parametrize("genuine_address_phrase", [
+    "حي المحمدية",
+    "الحي المحمدية",
+    "شارع الأمير سلطان",
+    "طريق الجامعة",
+    "تقاطع شارع عبدالله سليمان",
+])
+def test_genuine_address_phrases_still_qualify_as_address_line_bearing(genuine_address_phrase):
+    """The empty-label fix must not overcorrect — real address phrasing
+    (with or without the definite article, street/road/intersection
+    wording) must still be recognised."""
+    from app.service_hub.location_validation import _address_line_bearing
+
+    assert _address_line_bearing(genuine_address_phrase) is True
+
+
+def test_hospital_greeting_without_address_is_no_address_not_wrong_location():
+    """Real regression: a hospital greeting/branch mention ('من مستشفى
+    أندلسية جدة') with no street/district content must read as
+    NO_ADDRESS_PROVIDED, never WRONG_LOCATION — a branch/city mention
+    identifies the facility but is not physical-address evidence. A
+    non-KSA CRM record sharing an incidental word ('محمد') with the
+    agent's own name must not change that (see _ksa_pool consistency)."""
+    transcript = (
+        "Patient: عنوان المستشفى؟\n"
+        "Agent: السلام عليكم مع حضرتك محمد، من مستشفى أندلسية جدة، أتشرف بالاسم والاستفسار"
+    )
+    result = validate(transcript, locations=ALL_LOCATIONS + [LOC_WITH_COINCIDENTAL_NAME])
+    assert result["outcome"] == "NO_ADDRESS_PROVIDED"
+    assert result["outcome"] != "WRONG_LOCATION"
+
+
+def test_hospital_greeting_with_tatweel_same_behavior():
+    """Section 4: the exact same greeting, but with tatweel (ـ) inserted
+    into 'أندلسية'/'جدة' — must normalise identically and produce the
+    same outcome as the bare-spelling greeting above."""
+    transcript = (
+        "Patient: عنوان المستشفى؟\n"
+        "Agent: السلام عليكم مع حضرتك محمد، من مستشفى أنـدلـسيـة جـدة، أتشرف بالاسم والاستفسار"
+    )
+    result = validate(transcript, locations=ALL_LOCATIONS + [LOC_WITH_COINCIDENTAL_NAME])
+    assert result["outcome"] == "NO_ADDRESS_PROVIDED"
+    assert result["outcome"] != "WRONG_LOCATION"
+
+
+def test_tatweel_normalizes_same_as_bare_form():
+    """Direct normalisation assertions (Section 4): tatweel (ـ, U+0640)
+    must be stripped so a tatweel-elongated spelling normalises identically
+    to its bare form."""
+    from app.services.text_helpers import normalize_arabic_text
+
+    assert normalize_arabic_text("جـده") == normalize_arabic_text("جده")
+    assert normalize_arabic_text("أنـدلـسيـة") == normalize_arabic_text("اندلسية")
+
+
+def test_incidental_name_token_is_not_address_evidence():
+    """Section 9: a single coincidental token (an agent's own name, 'محمد')
+    that also happens to occur in some OTHER CRM record's address must not,
+    by itself, count as the agent giving physical-address evidence —
+    _agent_gives_address_details() requires credible evidence (a populated
+    address phrase, >=2 distinctive tokens from ONE record, or a strong
+    short-answer match), not a single overlapping word from any record."""
+    from app.service_hub.location_validation import _agent_gives_address_details
+
+    greeting = "السلام عليكم مع حضرتك محمد، من مستشفى أندلسية جدة، أتشرف بالاسم والاستفسار"
+    assert _agent_gives_address_details(greeting, ALL_LOCATIONS + [LOC_WITH_COINCIDENTAL_NAME]) is False
+
+
+def test_city_only_answer_is_incomplete_with_non_ksa_record_present():
+    """Section 3/5: 'city-only' must not pass, and a non-KSA record fetched
+    alongside the KSA pool must never make a common KSA city look
+    distinctive (or otherwise change the outcome)."""
+    result = validate(
+        "Patient: فين فرع السنابل؟\nAgent: جدة",
+        locations=ALL_LOCATIONS + [LOC_WITH_COINCIDENTAL_NAME],
+    )
+    assert result["outcome"] != "PASS"
+
+
+def test_genuine_partial_address_remains_incomplete():
+    """Section 6: a real but incomplete address (district only, no street)
+    must remain INCOMPLETE_ADDRESS, not regress to NO_ADDRESS_PROVIDED or
+    PASS."""
+    result = validate("Patient: عنوان فرع الأمير سلطان؟\nAgent: حي المحمدية")
+    assert result["outcome"] == "INCOMPLETE_ADDRESS"
+    assert result["is_violation"] is True
+
+
+def test_complete_address_still_passes_with_non_ksa_record_present():
+    """Section 7: a genuinely complete, correct address must still PASS
+    even when a non-KSA record is present in the fetched set (bug 3 must
+    not accidentally suppress a real match)."""
+    result = validate(
+        "Patient: عنوان فرع الأمير سلطان؟\nAgent: شارع الأمير سلطان حي المحمدية جدة",
+        locations=ALL_LOCATIONS + [LOC_WITH_COINCIDENTAL_NAME],
+    )
+    assert result["outcome"] == "PASS"
+
+
+def test_wrong_branch_complete_address_stays_wrong_location_with_attributable_reason():
+    """Section 8: a concrete, complete address belonging to a DIFFERENT,
+    explicitly requested branch must remain WRONG_LOCATION — and because
+    the address content itself independently resolves to that other real
+    branch, the reason may credibly say it belongs to a different branch."""
+    result = validate(
+        "Patient: فين فرع السنابل؟\n"
+        "Agent: العنوان : تقاطع شارع عبدالله سليمان مع طريق الجامعة أمام مول الجامعة بلازا - جدة"
+    )
+    assert result["requested_branch"] == "عيادات أندلسية فرع السنابل"
+    assert result["outcome"] == "WRONG_LOCATION"
+    assert result["is_violation"] is True
+    assert "different branch" in result["reason"]
+
+
+def test_wrong_location_reason_does_not_overclaim_when_unattributable():
+    """Section 8 (reason wording): when the agent's address-shaped answer
+    does not itself resolve (by content) to any OTHER identifiable KSA
+    branch, the WRONG_LOCATION reason must only say it doesn't match the
+    requested branch — never claim it belongs to a different branch
+    without evidence for that."""
+    result = validate(
+        "Patient: فين فرع السنابل؟\n"
+        "Agent: شارع غير موجود اطلاقا"
+    )
+    assert result["outcome"] == "WRONG_LOCATION"
+    assert result["is_violation"] is True
+    assert "different branch" not in result["reason"]

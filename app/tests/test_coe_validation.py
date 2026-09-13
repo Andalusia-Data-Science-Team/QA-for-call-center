@@ -88,7 +88,7 @@ class _StubLLM:
         self.called = False
         self.last_user_prompt: str | None = None
 
-    async def complete(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
         self.called = True
         self.last_user_prompt = user_prompt
         return json.dumps(self._response, ensure_ascii=False), {"prompt_tokens": 0, "completion_tokens": 0}
@@ -1461,7 +1461,7 @@ def test_llm_call_failure_degrades_safely_without_crashing_pipeline(monkeypatch)
     c = call(transcript)
 
     class _FailingLLM:
-        async def complete(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+        async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
             raise RuntimeError("simulated LLM outage")
 
     state = {"call": c, "node_trace": []}
@@ -1484,7 +1484,7 @@ def test_coe_intent_router_routes_correctly():
 
 
 class _StubLLMClient:
-    async def complete(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
         return "{}", {"prompt_tokens": 0, "completion_tokens": 0}
 
 

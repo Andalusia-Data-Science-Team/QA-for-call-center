@@ -36,9 +36,16 @@ class LLMClient:
 
     # ── Public interface ──────────────────────────────────────────────────────
 
-    async def complete(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def complete(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         """
         Send a completion request and return (raw_text, usage_metadata).
+
+        *max_tokens* overrides settings.llm_max_tokens for this call only —
+        e.g. infer_overall_scoring (app.agent.nodes) needs more headroom
+        than the shared default, since it synthesises every other node's
+        output into one response. Omit it (None) to use the shared default.
 
         Retries up to settings.llm_max_retries times with exponential backoff.
         Raises LLMError if all attempts fail.
@@ -47,7 +54,7 @@ class LLMClient:
         for attempt in range(1, settings.llm_max_retries + 1):
             try:
                 start = time.perf_counter()
-                text, usage = await self._call(system_prompt, user_prompt)
+                text, usage = await self._call(system_prompt, user_prompt, max_tokens)
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 logger.info(
                     "LLM call succeeded | provider=%s model=%s attempt=%d latency=%.0fms "
@@ -82,20 +89,24 @@ class LLMClient:
 
     # Provider dispatcher
 
-    async def _call(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def _call(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         if self.provider == "anthropic":
-            return await self._call_anthropic(system_prompt, user_prompt)
+            return await self._call_anthropic(system_prompt, user_prompt, max_tokens)
         elif self.provider == "openai":
-            return await self._call_openai(system_prompt, user_prompt)
+            return await self._call_openai(system_prompt, user_prompt, max_tokens)
         elif self.provider == "huggingface":
-            return await self._call_huggingface(system_prompt, user_prompt)
+            return await self._call_huggingface(system_prompt, user_prompt, max_tokens)
         elif self.provider == "openrouter":
-            return await self._call_openrouter(system_prompt, user_prompt)
+            return await self._call_openrouter(system_prompt, user_prompt, max_tokens)
         raise LLMError(f"Unknown provider: {self.provider}")
 
     # Anthropic
 
-    async def _call_anthropic(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def _call_anthropic(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             import anthropic
         except ImportError as e:
@@ -109,7 +120,7 @@ class LLMClient:
 
         response = await client.messages.create(
             model=self.model,
-            max_tokens=settings.llm_max_tokens,
+            max_tokens=max_tokens or settings.llm_max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -123,7 +134,9 @@ class LLMClient:
 
     # OpenAI
 
-    async def _call_openai(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def _call_openai(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             from openai import AsyncOpenAI
         except ImportError as e:
@@ -137,7 +150,7 @@ class LLMClient:
 
         response = await client.chat.completions.create(
             model=self.model,
-            max_tokens=settings.llm_max_tokens,
+            max_tokens=max_tokens or settings.llm_max_tokens,
             response_format={"type": "json_object"},  # JSON mode
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -154,7 +167,9 @@ class LLMClient:
 
     # HuggingFace
 
-    async def _call_huggingface(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    async def _call_huggingface(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             from huggingface_hub import AsyncInferenceClient
         except ImportError as e:
@@ -175,7 +190,7 @@ class LLMClient:
             response = await client.chat_completion(
                 model=self.model,
                 messages=messages,
-                max_tokens=settings.llm_max_tokens,
+                max_tokens=max_tokens or settings.llm_max_tokens,
             )
         except Exception as exc:
             raise LLMError(f"HuggingFace API call failed: {exc}") from exc
@@ -189,8 +204,10 @@ class LLMClient:
             "completion_tokens": getattr(response.usage, "completion_tokens", None),
         }
         return text, usage
-    
-    async def _call_openrouter(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+
+    async def _call_openrouter(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             import aiohttp
         except ImportError as e:
@@ -214,7 +231,7 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": settings.llm_max_tokens,
+            "max_tokens": max_tokens or settings.llm_max_tokens,
             "temperature": 0,
         }
 
