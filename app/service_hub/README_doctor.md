@@ -52,14 +52,32 @@ uses for `NO_OFFER_AVAILABLE`.
 
 ## Authoritative filtering
 
-Primary BU authority is `cr18c_buname` (NOT `cr301_businessunitname` — real
-CRM data has been observed to disagree between the two on the same row).
-Supported scope: `{AKW, AHJ, HJH, ALW, ADC, LCH, AFW}`. A doctor must also
-be `statuscodename == "Active"`. Doctor identity is resolved against the
+Primary BU authority for RECORD ELIGIBILITY is `cr18c_buname` (NOT
+`cr301_businessunitname` — real CRM data has been observed to disagree
+between the two on the same row, e.g. `cr301_businessunitname="MKR"` while
+`cr18c_buname="ADC"` for the same doctor). Supported scope:
+`{AKW, AHJ, HJH, ALW, ADC, LCH, AFW}`. A doctor must also be
+`statuscodename == "Active"`. Doctor identity is resolved against the
 FULL deduplicated pool first (so a doctor who exists but fails one of
 these conditions can still be recognised and reported as a `FAIL`, not a
 bare "no such doctor"), then these conditions are checked as part of the
 result.
+
+This eligibility policy is a separate question from whether a chat-stated
+BU **claim** about an already-eligible doctor is correct — see
+`_match_doctor_business_unit`/`_doctor_business_units` in
+`doctor_validation.py`: a BU claim PASSes when it matches EITHER
+`cr301_businessunitname` OR `cr18c_buname`, since the two fields are not
+required to agree with each other, and a disagreement between them is
+never itself a reason to fail a claim that matches one of them. The
+per-field `business_unit` validation result additionally reports
+`matched_crm_field` (which of the two fields matched) and
+`crm_business_units` (both raw values), and the same two-field rule also
+applies to BU-scoped doctor resolution (`bu_scoped_pool` and the BU
+tie-break in `_resolve_and_validate_one_doctor`) — the call's own detected
+BU can pick out a candidate via either of that candidate's two BU fields.
+Record eligibility itself is untouched by any of this: it still runs on
+`cr18c_buname` alone, exactly as above.
 
 `cr301_opdflag` is deliberately **not** part of this gate — a doctor who
 isn't flagged OPD (e.g. a home-care or other non-OPD service context) can
@@ -117,7 +135,8 @@ Once a doctor is resolved, two different validation contracts apply:
   — e.g. a stated business-unit/branch claim can PASS or genuinely FAIL
   (see `resolve_business_unit`/`canonical_doctor_bu` in
   `_resolve_and_validate_one_doctor`), it just never appears at all when
-  no BU/branch was mentioned.
+  no BU/branch was mentioned. A BU claim PASSes against either of the
+  doctor's two CRM BU fields — see "Authoritative filtering" above.
 
 **Optional (claim-driven) fields** — `_OPTIONAL_CLAIM_FIELDS` in
 `doctor_validation.py` — validated ONLY when the Agent explicitly makes a

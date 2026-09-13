@@ -4,6 +4,7 @@ import pytest
 
 from app.models.input import CallTranscript
 from app.service_hub.doctor_validation import (
+    _match_doctor_business_unit,
     _resolve_specialty_category,
     _specialty_core,
     authoritative_doctor_pool,
@@ -676,6 +677,154 @@ def test_correct_explicit_business_unit_passes():
     result = validate("Agent: دكتور رامي سمرقندي في جدة", doctors=[DOC_RAMI])
     assert result["validated_fields"]["business_unit"]["outcome"] == "PASS"
     assert result["outcome"] == "PASS"
+
+
+# ── Two-field BU claim matching (cr301_businessunitname OR cr18c_buname) ────
+# Real regression: cr18c_buname is the authoritative field for record
+# ELIGIBILITY (is it Active + in the 7 supported BUs at all), but a chat BU
+# CLAIM must PASS when it matches EITHER of the doctor's two CRM BU fields —
+# the fields are not required to agree with each other, and a disagreement
+# between them is never itself a reason to fail a claim that matches one.
+
+DOC_BU_DISAGREE_CR301_MATCH = {
+    **DOC_RAMI, "cr301_doctorkey": "700700101",
+    "servhub_doctornameen": "Laila Fahad", "cr301_doctornamear": "ليلى فهد",
+    "cr18c_buname": "ADC", "cr301_businessunitname": "MKR",
+}
+DOC_BU_DISAGREE_CR18C_MATCH = {
+    **DOC_RAMI, "cr301_doctorkey": "700700102",
+    "servhub_doctornameen": "Nasser Fouad", "cr301_doctornamear": "ناصر فؤاد",
+    "cr18c_buname": "AKW", "cr301_businessunitname": "LCH",
+}
+DOC_BU_AGREE = {
+    **DOC_RAMI, "cr301_doctorkey": "700700103",
+    "servhub_doctornameen": "Rana Emad", "cr301_doctornamear": "رنا عماد",
+    "cr18c_buname": "ALW", "cr301_businessunitname": "ALW",
+}
+
+
+def test_bu_claim_matches_only_cr301_businessunitname_passes():
+    """Items 1 & 4: the two CRM BU fields disagree (cr301_businessunitname=
+    "MKR" vs cr18c_buname="ADC"), and the claim matches cr301_businessunitname
+    only — must PASS, and report which field matched."""
+    result = validate("Agent: دكتورة ليلى فهد في المكرونة", doctors=[DOC_BU_DISAGREE_CR301_MATCH])
+    bu_field = result["validated_fields"]["business_unit"]
+    assert bu_field["outcome"] == "PASS"
+    assert bu_field["matched_crm_field"] == "cr301_businessunitname"
+    assert bu_field["reference"] == "MKR"
+    assert bu_field["crm_business_units"] == {"cr301_businessunitname": "MKR", "cr18c_buname": "ADC"}
+    assert result["outcome"] == "PASS"
+
+
+def test_bu_claim_matches_only_cr18c_buname_passes():
+    """Items 2 & 5: the two CRM BU fields disagree (cr301_businessunitname=
+    "LCH" vs cr18c_buname="AKW"), and the claim matches cr18c_buname only —
+    must PASS, and report which field matched."""
+    result = validate("Agent: دكتور ناصر فؤاد في صحة الطفل", doctors=[DOC_BU_DISAGREE_CR18C_MATCH])
+    bu_field = result["validated_fields"]["business_unit"]
+    assert bu_field["outcome"] == "PASS"
+    assert bu_field["matched_crm_field"] == "cr18c_buname"
+    assert bu_field["reference"] == "AKW"
+    assert result["outcome"] == "PASS"
+
+
+def test_bu_claim_matches_both_agreeing_fields_passes():
+    """Item 3: both CRM BU fields already agree on the claimed BU — still a
+    clean PASS."""
+    result = validate("Agent: دكتورة رنا عماد في صحة المرأة", doctors=[DOC_BU_AGREE])
+    bu_field = result["validated_fields"]["business_unit"]
+    assert bu_field["outcome"] == "PASS"
+    assert bu_field["matched_crm_field"] == "cr301_businessunitname"
+
+
+def test_bu_claim_matches_neither_field_fails():
+    """Item 6: the claimed BU matches neither of the doctor's two CRM BU
+    fields — a genuine FAIL, not masked by the two-field OR rule."""
+    result = validate("Agent: دكتورة ليلى فهد في صحة الطفل", doctors=[DOC_BU_DISAGREE_CR301_MATCH])
+    bu_field = result["validated_fields"]["business_unit"]
+    assert bu_field["outcome"] == "FAIL"
+    assert bu_field["matched_crm_field"] is None
+    assert result["outcome"] == "FAIL"
+
+
+def test_bu_match_helper_case_and_whitespace_insensitive():
+    """Item 7: "mkr", "MKR", and " MKR " must all be recognised as the same
+    BU code by the comparison helper."""
+    record = {"cr301_businessunitname": "MKR", "cr18c_buname": "ADC"}
+    assert _match_doctor_business_unit("mkr", record) == "cr301_businessunitname"
+    assert _match_doctor_business_unit("MKR", record) == "cr301_businessunitname"
+    assert _match_doctor_business_unit(" MKR ", record) == "cr301_businessunitname"
+
+
+def test_bu_match_helper_rejects_partial_bu_strings():
+    """Item 8: comparison is exact, never substring/fuzzy — "MK" must not
+    match "MKR" in either direction."""
+    assert _match_doctor_business_unit("MK", {"cr301_businessunitname": "MKR", "cr18c_buname": "ADC"}) is None
+    assert _match_doctor_business_unit("MKR", {"cr301_businessunitname": "MK", "cr18c_buname": "ADC"}) is None
+
+
+def test_observed_scenario_bu_claim_passes_while_degree_still_fails():
+    """Item 9 — the exact reported regression: cr301_businessunitname="MKR"
+    and cr18c_buname="ADC" disagree; the Agent's BU claim ("المكرونة" ->
+    "MKR") matches cr301_businessunitname and must PASS, while an unrelated,
+    genuinely wrong degree claim (Specialist claimed, GP on file) must still
+    FAIL — the two-field BU fix must never mask a real failing field, and
+    the call's own detected BU ("MKR") must resolve this doctor via the
+    BU-scoped pool (bu_scoped=True in resolution_source)."""
+    doctor = {
+        **DOC_RAMI, "cr301_doctorkey": "700700104",
+        "servhub_doctornameen": "Sara Naji", "cr301_doctornamear": "سارة ناجي",
+        "cr301_degreename": "GP",
+        "cr18c_buname": "ADC", "cr301_businessunitname": "MKR",
+    }
+    c = CallTranscript(
+        call_id="bu-observed", agent_name="Agent", Patient_Phone="501234567",
+        call_date="2026-08-27", call_duration_seconds=1, department="Scheduling",
+        business_unit="MKR", transcript="Agent: دكتورة سارة ناجي اخصائي في المكرونة",
+    )
+    result = validate_doctor_information(c, [doctor])
+    bu_field = result["validated_fields"]["business_unit"]
+    assert bu_field["outcome"] == "PASS"
+    assert bu_field["matched_crm_field"] == "cr301_businessunitname"
+    assert result["validated_fields"]["degree"]["outcome"] == "FAIL"
+    assert result["outcome"] == "FAIL"
+    assert "bu_scoped" in (result.get("resolution_source") or "")
+
+
+def test_multi_doctor_bu_claims_do_not_leak_between_doctors():
+    """Item 10: a multi-doctor recommendation set must evaluate each doctor
+    against that doctor's OWN two BU fields independently — a claim scoped
+    to one recommended doctor must never be attributed to (or matched
+    against) a different doctor's BU fields."""
+    doctors = [
+        {
+            **DOC_MOHAMED_ADEL, "cr301_doctorkey": "buleak1",
+            "servhub_doctornameen": "Omar Nabil", "cr301_doctornamear": "عمر نبيل",
+            "cr18c_buname": "ADC", "cr301_businessunitname": "MKR",
+        },
+        {
+            **DOC_MOHAMED_ADEL, "cr301_doctorkey": "buleak2",
+            "servhub_doctornameen": "Huda Samir", "cr301_doctornamear": "هدى سمير",
+            "cr18c_buname": "AKW", "cr301_businessunitname": "LCH",
+        },
+    ]
+    transcript = (
+        "Agent: Here are the options:\nDr Omar Nabil\nDr Huda Samir\n"
+        "Agent: Dr Omar Nabil في المكرونة\n"
+        "Agent: Dr Huda Samir في صحة الطفل\n"
+    )
+    result = validate(transcript, doctors=doctors)
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    omar_bu = by_name["omar nabil"]["validated_fields"]["business_unit"]
+    huda_bu = by_name["huda samir"]["validated_fields"]["business_unit"]
+    assert omar_bu["outcome"] == "PASS"
+    assert omar_bu["matched_crm_field"] == "cr301_businessunitname"
+    assert huda_bu["outcome"] == "PASS"
+    assert huda_bu["matched_crm_field"] == "cr18c_buname"
+    # No cross-contamination: Omar's evidence never carries Huda's BU values
+    # (or vice-versa).
+    assert omar_bu["crm_business_units"] == {"cr301_businessunitname": "MKR", "cr18c_buname": "ADC"}
+    assert huda_bu["crm_business_units"] == {"cr301_businessunitname": "LCH", "cr18c_buname": "AKW"}
 
 
 def test_multi_doctor_optional_claims_do_not_leak_between_doctors():

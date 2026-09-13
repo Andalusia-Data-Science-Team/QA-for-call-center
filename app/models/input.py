@@ -66,6 +66,12 @@ BUSINESS_UNIT_KEYWORD_MAP: dict[str, str] = {
     "ALW": "ALW",
     "AHJ": "LIVE",
     "AFW": "AFW",
+    "CHT": "LCH",
+    "CHT" : "ALW",
+    "LCH" : "ALW",
+    "ADC" : "JDC",
+    "ADC" : "MKR",
+    "JDC" : "MKR",
 
     # Attribution/tag forms
     "BU-AKW": "AKW",

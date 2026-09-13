@@ -94,10 +94,17 @@ def _doc_print_section(title: str, **fields: Any) -> None:
 DOCTOR_FAILURES = {"FAIL"}
 
 # ── Authoritative filtering (Part B) ────────────────────────────────────────
-# cr18c_buname is the primary BU authority for this feature — NOT
-# cr301_businessunitname, which real CRM data has been observed to disagree
-# with on the same row (e.g. cr301_businessunitname="AHJ" while
-# cr18c_buname="AKW" for the same doctor). Only these 7 BUs are in scope.
+# cr18c_buname is the primary BU authority for RECORD ELIGIBILITY/
+# searchability (is_supported_doctor_bu / authoritative_doctor_pool below) —
+# NOT cr301_businessunitname, which real CRM data has been observed to
+# disagree with on the same row (e.g. cr301_businessunitname="AHJ" while
+# cr18c_buname="AKW" for the same doctor). Only these 7 BUs are in scope for
+# THAT policy. This is a separate question from whether a chat-stated BU
+# CLAIM about an already-eligible doctor matches — see
+# _doctor_business_units/_match_doctor_business_unit below, which
+# deliberately check BOTH fields for that, precisely BECAUSE the two fields
+# can disagree: a claim matching either one is genuine evidence, and a
+# disagreement between the two CRM fields alone must never fail it.
 _SUPPORTED_DOCTOR_BUS = {"AKW", "AHJ", "HJH", "ALW", "ADC", "LCH", "AFW"}
 
 
@@ -115,14 +122,69 @@ def canonical_doctor_bu(bu: str | None) -> str | None:
     mapping here. A BU whose app-level and CRM codes already match 1:1
     (AKW/ALW/AFW/...) simply passes through unchanged.
 
-    Doctor Validation's own CRM records (cr18c_buname) always use the CRM
-    code, so every comparison against them — building bu_scoped_pool, the
-    BU tie-break, is_supported_doctor_bu — must run on this canonical
-    value, never on the raw conversation-level business_unit."""
+    Doctor Validation's own CRM records (cr18c_buname/cr301_businessunitname)
+    always use the CRM code, so every comparison against them — building
+    bu_scoped_pool, the BU tie-break, is_supported_doctor_bu — must run on
+    this canonical value, never on the raw conversation-level business_unit."""
     if not bu:
         return None
     bu_upper = str(bu).strip().upper()
     return _APP_BU_TO_CRM_BU.get(bu_upper, bu_upper)
+
+
+def _normalize_bu(value: Any) -> str | None:
+    """Trim + uppercase a raw business-unit value for COMPARISON purposes
+    only ("mkr", "MKR", " MKR " must all be recognised as the same code) —
+    never used to alter what gets stored/returned as a reference value.
+    Returns None for empty/missing input so callers can treat "no BU on
+    this field" and "BU present but didn't match" distinctly."""
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    return text or None
+
+
+def _doctor_business_units(record: dict[str, Any]) -> set[str]:
+    """Every normalized BU code carried on *record*, drawn from EITHER of
+    the two CRM business-unit fields a doctor record exposes
+    (cr301_businessunitname, cr18c_buname). The two fields are NOT required
+    to agree with each other (see _SUPPORTED_DOCTOR_BUS' comment above for
+    the real-data disagreement this generalises from) — this set is the
+    single place that OR condition lives, so no call site duplicates it.
+
+    NEVER used to decide record eligibility/searchability — that remains
+    cr18c_buname alone (is_supported_doctor_bu / authoritative_doctor_pool),
+    a deliberately separate, narrower policy this set does not replace."""
+    return {
+        normalized
+        for normalized in (
+            _normalize_bu(record.get("cr301_businessunitname")),
+            _normalize_bu(record.get("cr18c_buname")),
+        )
+        if normalized
+    }
+
+
+def _match_doctor_business_unit(claimed_bu: Any, record: dict[str, Any]) -> str | None:
+    """Does *claimed_bu* (already canonicalised to the CRM code space via
+    canonical_doctor_bu) match EITHER of *record*'s two CRM BU fields?
+    Comparison is exact, case-insensitive, and whitespace-trimmed only —
+    deliberately never substring/fuzzy, so "MK" must never match "MKR".
+
+    Returns the NAME of the CRM field that matched
+    ("cr301_businessunitname" or "cr18c_buname" — cr301 is checked first,
+    so a doctor whose two fields disagree but both happen to equal the
+    claim reports a single, deterministic field), or None when there is no
+    match at all (including when claimed_bu is empty/None). A disagreement
+    between the doctor's own two CRM fields is, by itself, never a reason
+    to fail a claim that matches ONE of them."""
+    claimed_norm = _normalize_bu(claimed_bu)
+    if not claimed_norm:
+        return None
+    for field_name in ("cr301_businessunitname", "cr18c_buname"):
+        if _normalize_bu(record.get(field_name)) == claimed_norm:
+            return field_name
+    return None
 
 
 def _is_active(record: dict[str, Any]) -> bool:
@@ -2092,8 +2154,14 @@ def has_detailed_scope_evidence(scope_ref: dict[str, Any] | None) -> bool:
     return bool((scope_ref.get("scope_of_service") or "").strip() or (scope_ref.get("scope_of_service_ar") or "").strip())
 
 
-def _field(claimed: Any, outcome: str, reference: Any = None) -> dict[str, Any]:
-    return {"claimed": claimed, "outcome": outcome, "reference": reference}
+def _field(claimed: Any, outcome: str, reference: Any = None, **evidence: Any) -> dict[str, Any]:
+    """Build one validated-field evidence dict. The three positional keys
+    (claimed/outcome/reference) are the original, load-bearing shape every
+    existing caller/consumer relies on — always present, in this order.
+    **evidence adds extra, field-specific evidence keys (e.g. business_unit's
+    matched_crm_field/crm_business_units) backward-compatibly: additive
+    only, never renaming or removing the three keys above."""
+    return {"claimed": claimed, "outcome": outcome, "reference": reference, **evidence}
 
 
 def _log_field_validation(
@@ -2306,12 +2374,14 @@ def _resolve_and_validate_one_doctor(
                 # Last-resort BU tie-break (belt-and-suspenders alongside
                 # the BU-scoped resolution attempt above, which already
                 # handles the common case): if the call's own detected BU
-                # is known and matches EXACTLY ONE tied candidate, prefer
-                # it over reporting AMBIGUOUS_DOCTOR — never applied when
-                # the BU is unknown or matches more than one candidate.
+                # is known and matches EXACTLY ONE tied candidate on EITHER
+                # of that candidate's two CRM BU fields (see
+                # _match_doctor_business_unit), prefer it over reporting
+                # AMBIGUOUS_DOCTOR — never applied when the BU is unknown or
+                # matches more than one candidate.
                 bu_matches = (
-                    [c for c in candidates if normalize_arabic_text(str(c.get("cr18c_buname") or "")) == normalize_arabic_text(str(call_bu))]
-                    if is_supported_doctor_bu(call_bu) else []
+                    [c for c in candidates if _match_doctor_business_unit(call_bu, c) is not None]
+                    if call_bu else []
                 )
                 if len(bu_matches) == 1:
                     logger.info(
@@ -2593,20 +2663,47 @@ def _resolve_and_validate_one_doctor(
     # via resolve_business_unit), never just a literal search for the
     # doctor's OWN BU code in the chat — that could only ever confirm a
     # match and could never catch a genuinely WRONG stated branch.
+    #
+    # PASSes when the claim matches EITHER of the doctor's two CRM BU
+    # fields (cr301_businessunitname OR cr18c_buname) — see
+    # _match_doctor_business_unit. Real CRM data has doctors where these
+    # two fields disagree; a claim matching just one of them is still a
+    # genuine, correct claim, and the disagreement itself must never turn
+    # that into a FAIL. This is claim validation only — it never touches
+    # record eligibility/searchability, which stays cr18c_buname-only (see
+    # authoritative_doctor_pool).
     _claimed_bu_app_code = resolve_business_unit(_doctor_scope_text)
     if _claimed_bu_app_code is not None:
         claimed_bu_crm = canonical_doctor_bu(_claimed_bu_app_code)
-        crm_bu = doctor.get("cr18c_buname")
-        ok = bool(crm_bu) and bool(claimed_bu_crm) and claimed_bu_crm.strip().upper() == str(crm_bu).strip().upper()
-        bu_outcome = "PASS" if ok else "FAIL"
-        validated["business_unit"] = _field(claimed_bu_crm, bu_outcome, crm_bu)
-        _log_field_validation(
-            "business_unit",
-            raw_claim=_claimed_bu_app_code,
-            canonical_claim=claimed_bu_crm,
-            crm_reference=crm_bu,
-            canonical_crm=crm_bu,
-            outcome=bu_outcome,
+        _crm_bu_cr301 = doctor.get("cr301_businessunitname")
+        _crm_bu_cr18c = doctor.get("cr18c_buname")
+        matched_crm_field = _match_doctor_business_unit(claimed_bu_crm, doctor)
+        bu_outcome = "PASS" if matched_crm_field else "FAIL"
+        # Reference value: the doctor's own value on whichever CRM field
+        # matched the claim; falls back to cr18c_buname (the eligibility-
+        # authoritative field elsewhere in this module) when nothing
+        # matched, so a FAIL still shows a concrete CRM value to compare
+        # the claim against.
+        crm_reference = doctor.get(matched_crm_field) if matched_crm_field else _crm_bu_cr18c
+        validated["business_unit"] = _field(
+            claimed_bu_crm, bu_outcome, crm_reference,
+            matched_crm_field=matched_crm_field,
+            crm_business_units={
+                "cr301_businessunitname": _crm_bu_cr301,
+                "cr18c_buname": _crm_bu_cr18c,
+            },
+        )
+        print(
+            f"[doctor] field validation:\n"
+            f"[doctor]     field={'business_unit'!r}\n"
+            f"[doctor]     claimed_raw={_claimed_bu_app_code!r}\n"
+            f"[doctor]     claimed_canonical={claimed_bu_crm!r}\n"
+            f"[doctor]     crm_cr301_businessunitname={_crm_bu_cr301!r}\n"
+            f"[doctor]     crm_cr18c_buname={_crm_bu_cr18c!r}\n"
+            f"[doctor]     matched_crm_field={matched_crm_field!r}\n"
+            f"[doctor]     crm_reference={crm_reference!r}\n"
+            f"[doctor]     result={bu_outcome}",
+            flush=True,
         )
 
     notes_claim = _claim_text_if_triggered(_doctor_scope_text, _NOTES_CLAIM_TRIGGER_RE)
@@ -2870,18 +2967,18 @@ def validate_doctor_information(
     # Business-Unit-scoped resolution FIRST: the call's already-detected BU
     # (CallTranscript.business_unit — the same authoritative signal
     # verify_appointment_in_db uses) is a reliable, independent hint of
-    # which physical location this conversation belongs to. When it names a
-    # doctor-supported BU, prefer a candidate within that BU over the
-    # general multi-BU pool — this is what correctly picks the AHJ record
-    # for "محمد الألفي" when the call is known to be AHJ, and is also what
-    # prevents the "same physical doctor exists under two different doctor
-    # keys at different BUs" real-data quirk (see README_doctor.md) from
-    # ever reaching AMBIGUOUS_DOCTOR when the call's own BU already
-    # disambiguates it. Never narrows resolution when the call's BU is
-    # unknown/unsupported, or when the BU-scoped search finds nothing — it
-    # always falls through to the existing full-pool search below, so this
-    # can only ever RESOLVE a case the old logic left ambiguous, never
-    # break a case the old logic already resolved correctly.
+    # which physical location this conversation belongs to. When it matches
+    # a candidate, prefer that candidate over the general multi-BU pool —
+    # this is what correctly picks the AHJ record for "محمد الألفي" when the
+    # call is known to be AHJ, and is also what prevents the "same physical
+    # doctor exists under two different doctor keys at different BUs"
+    # real-data quirk (see README_doctor.md) from ever reaching
+    # AMBIGUOUS_DOCTOR when the call's own BU already disambiguates it.
+    # Never narrows resolution when the call's BU is unknown, or when the
+    # BU-scoped search finds nothing — it always falls through to the
+    # existing full-pool search below, so this can only ever RESOLVE a case
+    # the old logic left ambiguous, never break a case the old logic
+    # already resolved correctly.
     #
     # canonical_doctor_bu() runs FIRST: the conversation's own business_unit
     # may carry an application-level alias (e.g. "LIVE") that never
@@ -2891,14 +2988,23 @@ def validate_doctor_information(
     # pool every time. All BU comparisons below (bu_scoped_pool, the
     # tie-break in _resolve_and_validate_one_doctor) use ONLY the
     # canonical, CRM-comparable value from here on.
+    #
+    # Matching is against EITHER of a candidate's two CRM BU fields
+    # (cr301_businessunitname OR cr18c_buname — see
+    # _match_doctor_business_unit), not cr18c_buname alone: a doctor row
+    # can carry a BU on cr301_businessunitname that the call's own BU
+    # signal matches even when it isn't one of the 7 codes
+    # is_supported_doctor_bu recognises for record-eligibility purposes —
+    # that eligibility gate already ran (authoritative_pool is built from
+    # it) and is untouched here; this is purely which ALREADY-eligible
+    # candidate the call's BU picks out.
     call_bu = getattr(call, "business_unit", None)
     canonical_bu = canonical_doctor_bu(call_bu)
     bu_scoped_pool: list[dict[str, Any]] = []
-    if is_supported_doctor_bu(canonical_bu):
-        canonical_bu_norm = normalize_arabic_text(str(canonical_bu))
+    if canonical_bu:
         bu_scoped_pool = [
             r for r in authoritative_pool
-            if normalize_arabic_text(str(r.get("cr18c_buname") or "")) == canonical_bu_norm
+            if _match_doctor_business_unit(canonical_bu, r) is not None
         ]
 
     _resolve_kwargs: dict[str, Any] = dict(
