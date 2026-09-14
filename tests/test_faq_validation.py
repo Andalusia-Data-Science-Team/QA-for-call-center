@@ -6,9 +6,13 @@ import pytest
 from app.FAQs.faq_validation import (
     detect_faq_escalation,
     lookup_faq_record,
+    missing_faq_evaluation,
+    normalize_faq_evaluation,
     normalize_faq_phone,
     normalize_faq_text,
 )
+from app.models.input import CallTranscript
+from app.prompts.qa_prompt import build_faq_validation_prompt
 
 
 FAQ_HEADERS = [
@@ -153,3 +157,126 @@ def test_lookup_returns_unavailable_when_csv_does_not_exist(tmp_path):
     )
     assert result["status"] == "unavailable"
     assert result["record"] is None
+
+def test_missing_faq_record_is_deterministic_c2b_017():
+    result = missing_faq_evaluation("No same-day FAQ record.")
+
+    assert result["faq_status"] == "violation"
+    assert result["summary"] == "No same-day FAQ record."
+    assert result["faq_flags"] == [
+        {
+            "type": "C2B",
+            "severity": "moderate",
+            "description": "C2B_017: FAQ request was not recorded on the call date.",
+            "transcript_excerpt": "N/A",
+        }
+    ]
+
+
+def test_normalize_faq_evaluation_enforces_rules_and_deduplicates_evidence():
+    evaluation = normalize_faq_evaluation(
+        {
+            "faq_status": "violation",
+            "summary": "FAQ values conflict with the chat.",
+            "field_checks": [
+                {
+                    "field": "Response",
+                    "matches": False,
+                    "expected": "No response yet",
+                    "actual": "Completed",
+                    "rule_id": "C2C_023",
+                    "reason": "The agent said the request was still pending.",
+                    "transcript_excerpt": "لسه تحت الإجراء",
+                },
+                {
+                    "field": "Response",
+                    "matches": False,
+                    "expected": "No response yet",
+                    "actual": "Completed",
+                    "rule_id": "C2C_023",
+                    "reason": "The agent said the request was still pending.",
+                    "transcript_excerpt": "لسه تحت الإجراء",
+                },
+                {
+                    "field": "Escalation",
+                    "matches": False,
+                    "expected": "Required",
+                    "actual": "Not performed",
+                    "rule_id": "C2C_024",
+                    "reason": "Required escalation was not performed.",
+                    "transcript_excerpt": "لن أرفع طلب",
+                },
+                {
+                    "field": "BU",
+                    "matches": False,
+                    "expected": "AHJ",
+                    "actual": "MKR",
+                    "rule_id": "C9_UNKNOWN",
+                    "reason": "The business unit is wrong.",
+                    "transcript_excerpt": "فرع حي الجامعة",
+                },
+            ],
+        }
+    )
+
+    assert [flag["type"] for flag in evaluation["faq_flags"]] == [
+        "C2C",
+        "C2C",
+        "C2B",
+    ]
+    assert [flag["severity"] for flag in evaluation["faq_flags"]] == [
+        "critical",
+        "critical",
+        "moderate",
+    ]
+    assert [flag["description"].split(":", 1)[0] for flag in evaluation["faq_flags"]] == [
+        "C2C_023",
+        "C2C_024",
+        "C2B_021",
+    ]
+
+
+def test_faq_prompt_contains_call_record_fields_and_existing_rules():
+    call = CallTranscript(
+        call_id="call-faq-1",
+        agent_name="Mahmoud Atef Helmy",
+        agent_email="mahmoud.atef@andalusiagroup.net",
+        Patient_Phone="0555123456",
+        call_date="2026-09-14",
+        call_duration_seconds=120,
+        department="Helpdesk",
+        business_unit="LIVE",
+        transcript=(
+            "Patient: أنا عبد الرحمن وأستفسر عن التقرير الطبي\n"
+            "Agent: تم رفع الطلب للقسم المختص"
+        ),
+    )
+    record = faq_row(
+        ID="44",
+        CustomerName="عبد الرحمن",
+        Response="سيتم الرد لاحقاً",
+        **{"End Call Result": "In Progress"},
+    )
+
+    prompt = build_faq_validation_prompt(
+        call,
+        {"status": "found", "record": record},
+        compliance_pillars="C2B_017 existing-regulation excerpt",
+    )
+
+    for column in (
+        "AgentName",
+        "AgentEmail",
+        "mobile_phone",
+        "Date",
+        "CustomerName",
+        "BU",
+        "Inquiry",
+        "Response",
+        "End Call Result",
+    ):
+        assert column in prompt
+    for rule_id in ("C2B_017", "C2B_021", "C2C_023", "C2C_024"):
+        assert rule_id in prompt
+    assert "mahmoud.atef@andalusiagroup.net" in prompt
+    assert "C2B_017 existing-regulation excerpt" in prompt

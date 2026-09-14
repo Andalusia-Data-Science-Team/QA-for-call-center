@@ -25,6 +25,14 @@ FAQ_REQUIRED_COLUMNS = frozenset(
     }
 )
 
+FAQ_RULES = {
+    "C2B_017": ("C2B", "moderate"),
+    "C2B_021": ("C2B", "moderate"),
+    "C2C_023": ("C2C", "critical"),
+    "C2C_024": ("C2C", "critical"),
+}
+
+
 
 _ARABIC_CHAR_TRANSLATION = str.maketrans(
     {
@@ -218,4 +226,99 @@ def lookup_faq_record(
             "faq_id": selected["record"].get("ID"),
         },
         "message": "Same-day FAQ record found.",
+    }
+
+
+def missing_faq_evaluation(message: str) -> dict[str, Any]:
+    """Build the required missing-record violation without an LLM call."""
+    return {
+        "faq_status": "violation",
+        "summary": message,
+        "field_checks": [],
+        "faq_flags": [
+            {
+                "type": "C2B",
+                "severity": "moderate",
+                "description": "C2B_017: FAQ request was not recorded on the call date.",
+                "transcript_excerpt": "N/A",
+            }
+        ],
+    }
+
+
+def normalize_faq_evaluation(data: dict[str, Any]) -> dict[str, Any]:
+    """Enforce allowed YAML rule mappings and the public flag schema."""
+    field_checks = [
+        check for check in (data.get("field_checks") or []) if isinstance(check, dict)
+    ]
+    normalized_flags: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_flag(
+        rule_id: str,
+        field: object,
+        reason: object,
+        excerpt: object,
+    ) -> None:
+        if len(normalized_flags) >= 4:
+            return
+        resolved_rule = rule_id if rule_id in FAQ_RULES else "C2B_021"
+        flag_type, severity = FAQ_RULES[resolved_rule]
+        field_name = str(field or "FAQ record").strip()
+        evidence = str(excerpt or "N/A").strip() or "N/A"
+        explanation = str(reason or "does not match the call facts").strip()
+        key = (
+            resolved_rule,
+            normalize_faq_text(field_name),
+            normalize_faq_text(evidence),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        normalized_flags.append(
+            {
+                "type": flag_type,
+                "severity": severity,
+                "description": (
+                    f"{resolved_rule}: FAQ mismatch in {field_name}: {explanation}"
+                ),
+                "transcript_excerpt": evidence,
+            }
+        )
+
+    for check in field_checks:
+        if check.get("matches") is not False:
+            continue
+        add_flag(
+            str(check.get("rule_id") or "C2B_021").strip(),
+            check.get("field"),
+            check.get("reason"),
+            check.get("transcript_excerpt"),
+        )
+
+    for raw_flag in data.get("faq_flags") or []:
+        if not isinstance(raw_flag, dict):
+            continue
+        description = str(raw_flag.get("description") or "")
+        match = re.search(r"\b(C2[BC]_\d{3})\b", description)
+        add_flag(
+            str(raw_flag.get("rule_id") or (match.group(1) if match else "C2B_021")),
+            raw_flag.get("field") or "FAQ record",
+            description or "does not match the call facts",
+            raw_flag.get("transcript_excerpt"),
+        )
+
+    if data.get("faq_status") == "violation" and not normalized_flags:
+        add_flag(
+            "C2B_021",
+            "FAQ record",
+            "The model reported a violation without a valid field-level rule.",
+            "N/A",
+        )
+
+    return {
+        "faq_status": "violation" if normalized_flags else "match",
+        "summary": str(data.get("summary") or "").strip(),
+        "field_checks": field_checks,
+        "faq_flags": normalized_flags,
     }
