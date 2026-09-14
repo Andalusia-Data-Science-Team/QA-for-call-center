@@ -59,6 +59,16 @@ from app.service_hub.bank_validation import _APP_BU_TO_CRM_BU, resolve_business_
 # table rather than a second, duplicate copy of it — see
 # _resolve_specialty_category's docstring below.
 from app.service_hub.offer_search import _AR_ALIAS
+# The shared, formal EN<->AR specialty/subspecialty NAME taxonomy —
+# distinct from (and merged with, never duplicating) offer_search._AR_ALIAS
+# above; see app.service_hub.specialty_taxonomy's own module docstring for
+# why the two tables are kept separate.
+from app.service_hub.specialty_taxonomy import (
+    SPECIALTY_EN_TO_AR,
+    SPECIALTY_TAXONOMY_ALIASES,
+    canonicalize_specialty_name,
+    is_pediatric_specialty,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,8 +268,15 @@ def dedupe_doctors(doctors: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # extensible (mirrors bank_validation.py's _BANK_NAME_CANON — a non-
 # exhaustive alias table, not a closed enum) rather than exhaustive.
 _GENERIC_SPECIALTY_WORDS = {
-    # Specialties/subspecialties
-    "عظام", "اسنان", "أسنان", "اطفال", "أطفال", "نساء", "ولاده", "ولادة",
+    # Specialties/subspecialties — "حشو"/"حشوات" (dental fillings) added so
+    # a claim like "الحشوات" is recognised as a SPECIALTY/SERVICE phrase
+    # (see _first_specialty_phrase_in_text -> doctor_context_specialty),
+    # even though it has no entry of its own in the specialty-alias tables
+    # (_AR_ALIAS/_SPECIALTY_ALIAS_SUPPLEMENT/specialty_taxonomy) — it is
+    # deliberately left OUT of those, so such a claim reaches the CRM
+    # scope-of-service fallback (see _match_specialty_against_scope)
+    # instead of coarsely resolving to "Dental Services".
+    "عظام", "اسنان", "أسنان", "حشو", "حشوات", "اطفال", "أطفال", "نساء", "ولاده", "ولادة",
     "جلديه", "جلدية", "قلب", "مخ", "اعصاب", "أعصاب", "عيون", "انف", "أنف",
     "اذن", "أذن", "حنجره", "حنجرة", "باطنه", "باطنة", "مسالك", "بوليه",
     "بولية", "نفسيه", "نفسية", "تغذيه", "تغذية", "جراحه", "جراحة", "عام", "عامه",
@@ -297,6 +314,23 @@ _GENERIC_SPECIALTY_WORDS = {
     "orthopedic", "female", "male", "consultant", "specialist",
     "physiotherapist", "pediatrician", "cardiologist", "dermatologist",
     "surgeon", "physician",
+}
+
+# Extended with every taxonomy specialty/subspecialty name's own FIRST
+# word (EN and AR, from the shared app.service_hub.specialty_taxonomy
+# table) — lets a literal specialty/subspecialty NAME an Agent states
+# verbatim (e.g. "Pediatric Cardiology", "NICU", "Pedodontic", "طب أسنان
+# الأطفال") be recognised as a specialty/service phrase the same way the
+# hardcoded colloquial words above already are (see _rejected_candidate_
+# reason / _first_specialty_phrase_in_text — this is what feeds
+# doctor_context_specialty / _scoped_specialty_text in the first place),
+# even though it is not itself one of those hand-picked conversational
+# words. Computed once from the shared taxonomy, never a second,
+# hand-maintained list of specialty names to keep in sync.
+_GENERIC_SPECIALTY_WORDS |= {
+    normalize_arabic_text(name).split()[0]
+    for name in SPECIALTY_TAXONOMY_ALIASES
+    if normalize_arabic_text(name)
 }
 
 # Function/generic words that must NOT be mistaken for the start of a
@@ -1908,51 +1942,271 @@ def _specialty_core(display_name: str | None) -> str:
 
 
 def _resolve_specialty_category(text: str | None) -> str | None:
-    """Canonical Arabic/English specialty-phrase -> EN category name.
-    Longest-alias-wins across BOTH app.service_hub.offer_search._AR_ALIAS
-    (the primary, reused, shared table) and _SPECIALTY_ALIAS_SUPPLEMENT
-    (this module's small set of gaps in that table) merged together,
-    exactly mirroring offer_search.resolve_specialty's own longest-match
-    algorithm — a plain "try offer_search first, else try the supplement"
-    would let an unrelated, merely-longer word elsewhere in the same
-    phrase (e.g. "اطفال" in "غدد صماء اطفال") win over the correct,
-    shorter match from the OTHER table. Returns None (not "") when no
-    alias — including an ambiguous, contextless word like bare "ليزر",
-    deliberately absent from offer_search's own unambiguous alias table —
-    matches at all, so callers can distinguish "no claim" from "claim
-    contradicts CRM"."""
+    """Canonical Arabic/English specialty-phrase -> EN category name, in
+    this precedence order:
+
+      1. Exact full specialty name — the WHOLE (normalised) text IS a
+         known specialty name, in either language, from the shared
+         app.service_hub.specialty_taxonomy table. Checked first via
+         canonicalize_specialty_name (an EXACT, never substring, lookup)
+         so a literal, unambiguous name (e.g. "Pediatric Cardiology",
+         "Pedodontic", "NICU") is never out-ranked by an unrelated longer
+         phrase, and — critically — never accidentally collapsed onto a
+         shorter, different, related specialty the way a pure substring
+         comparison could (see specialty_taxonomy.canonicalize_specialty_
+         name's own docstring for why pediatric specialties must stay
+         distinct from their adult equivalents).
+      2. Exact normalized alias — a whole-string (not substring) match
+         against the legacy alias tables (app.service_hub.offer_search.
+         _AR_ALIAS + _SPECIALTY_ALIAS_SUPPLEMENT below).
+      3. Longest unambiguous phrase — the original longest-alias-wins
+         SUBSTRING search, now also searching specialty_taxonomy's own EN/
+         AR names (merged in as SPECIALTY_TAXONOMY_ALIASES) so a taxonomy
+         entry embedded in a longer sentence is still found, not just a
+         bare exact match. A plain "try one table, else try the other"
+         would let an unrelated, merely-longer word elsewhere in the same
+         phrase (e.g. "اطفال" in "غدد صماء اطفال") win over the correct,
+         shorter match from a DIFFERENT table, so every table is always
+         merged into ONE search, never tried in sequence.
+
+    Returns None (not "") when nothing matches at all — including an
+    ambiguous, contextless word like bare "ليزر", deliberately absent from
+    offer_search's own unambiguous alias table, or a genuine service
+    phrase with no top-level category of its own at all (e.g. "الحشوات") —
+    so callers can distinguish "no coarse category resolved" from "claim
+    contradicts CRM", and can still fall back to matching the RAW claim
+    text against CRM scope-of-service (see _match_specialty_against_scope)
+    even when this function itself returns None."""
     if not text:
         return None
     norm = normalize_arabic_text(text)
     if not norm:
         return None
+
+    exact = canonicalize_specialty_name(norm)
+    if exact:
+        return exact
+
+    merged_aliases = {**_AR_ALIAS, **_SPECIALTY_ALIAS_SUPPLEMENT}
+    for alias, category in merged_aliases.items():
+        if normalize_arabic_text(alias) == norm:
+            return category
+
     best_len, best_category = 0, None
-    for alias, category in {**_AR_ALIAS, **_SPECIALTY_ALIAS_SUPPLEMENT}.items():
+    for alias, category in {**merged_aliases, **SPECIALTY_TAXONOMY_ALIASES}.items():
         alias_norm = normalize_arabic_text(alias)
         if alias_norm and alias_norm in norm and len(alias_norm) > best_len:
             best_len, best_category = len(alias_norm), category
     return best_category
 
 
-def _specialty_claim_result(claim_category: str, *crm_values: str | None) -> bool | None:
-    """True/False once at least one non-empty CRM value was actually
-    compared; None when every one of *crm_values* is empty (no evidence
-    to confirm OR contradict the claim — see _resolve_and_validate_one_
-    doctor's NEEDS_REVIEW handling, never a silent FAIL just because CRM
-    lacks data). Comparison is core-token substring match, checked in
-    BOTH directions so a more verbose category name on either side (CRM's
-    "Medical Oncology" vs the claim's "Oncology", or offer_search's
-    "General Pediatrics" vs CRM's bare "Pediatrics") still safely matches
-    — never fuzzy string similarity, which risks forcing two genuinely
-    unrelated specialties together."""
-    claim_core = _specialty_core(claim_category)
+# Marker words/phrases that put a specialty CLAIM (or a CRM display value
+# not itself found in specialty_taxonomy) in pediatric context — used ONLY
+# as a safety signal for _pediatric_flag below, never to resolve a
+# specialty category on its own. Deliberately non-exhaustive, same
+# philosophy as every other marker/blocklist in this module.
+_PEDIATRIC_CONTEXT_MARKERS = {
+    "اطفال", "أطفال", "طفل", "طفله", "طفلة", "رضيع", "رضع", "وليد", "مواليد",
+    "pediatric", "paediatric", "infant", "infants", "newborn", "neonatal", "neonate",
+}
+_PEDIATRIC_CONTEXT_PHRASES = ("حديثي الولاده", "حديثي الولادة")
+
+
+def _mentions_pediatric_context(text: str | None) -> bool:
+    """Best-effort check: does *text* mention a pediatric/infant/neonatal
+    marker anywhere in it? Used to recognise a genuinely pediatric claim
+    even when it was resolved to a non-pediatric-flagged category (e.g.
+    "غدد صماء أطفال" resolves to plain "Endocrinology" — see
+    _resolve_specialty_category — but the raw claim text still says
+    "أطفال"), so _pediatric_flag doesn't have to rely on the resolved
+    category alone."""
+    if not text:
+        return False
+    norm = normalize_arabic_text(text)
+    if not norm:
+        return False
+    if set(norm.split()) & _PEDIATRIC_CONTEXT_MARKERS:
+        return True
+    return any(phrase in norm for phrase in _PEDIATRIC_CONTEXT_PHRASES)
+
+
+def _pediatric_flag(canonical_name: str | None, *raw_texts: str | None) -> bool:
+    """Is this side of a specialty comparison pediatric? True when the
+    canonical taxonomy name itself is pediatric-flagged (is_pediatric_
+    specialty), OR when any of *raw_texts* (the raw claim text / raw CRM
+    display value, whichever is relevant) mentions a pediatric marker —
+    see _mentions_pediatric_context. Combining both signals lets a claim
+    like "غدد صماء أطفال" (whose RESOLVED category, "Endocrinology", isn't
+    itself a pediatric taxonomy entry) still be recognised as pediatric
+    from its own wording."""
+    if canonical_name and is_pediatric_specialty(canonical_name):
+        return True
+    return any(_mentions_pediatric_context(t) for t in raw_texts)
+
+
+def _specialty_values_match(
+    claim_category: str | None, raw_claim_text: str | None, crm_value: str | None,
+) -> bool | None:
+    """Does ONE CRM specialty/subspecialty value match the claim? Returns
+    None when there is nothing to compare (empty CRM value, or no claim
+    signal at all) — never a silent False just because data is missing.
+
+    1. Pediatric guard: if exactly one side is pediatric (see
+       _pediatric_flag — the canonical taxonomy flag OR a raw pediatric
+       marker word) and the other is not, this is an automatic mismatch —
+       "Pediatric Cardiology" must never match plain "Cardiology" and
+       vice-versa, no matter how the rest of the comparison below would
+       otherwise treat them.
+    2. Otherwise, compare the CANONICAL EN names when the shared taxonomy
+       resolved BOTH sides (canonicalize_specialty_name) — this is what
+       correctly bridges e.g. an English "Pedodontic" claim against an
+       Arabic CRM value "طب أسنان الأطفال": their raw text shares no
+       characters at all, only their canonical name does. Falls back to
+       the raw resolved category / raw CRM value when the taxonomy didn't
+       resolve one side, so specialties outside the new taxonomy (Speech/
+       Phonatics, GIT, Oncology's Medical-Oncology spelling, ...) keep
+       comparing exactly as before.
+    3. The actual comparison is _specialty_core's qualifier-stripped
+       CORE-TOKEN SUBSTRING match, checked in both directions — never
+       fuzzy string similarity — so a more verbose name on either side
+       (CRM's "Medical Oncology" vs claim "Oncology", taxonomy-bridged
+       "Pedodontic" vs "Pedodontic") still safely matches once step 1 has
+       already ruled out a pediatric/adult mismatch.
+    """
+    if not crm_value:
+        return None
+    if not claim_category and not raw_claim_text:
+        return None
+
+    claim_canonical = canonicalize_specialty_name(claim_category) if claim_category else None
+    crm_canonical = canonicalize_specialty_name(crm_value)
+
+    claim_pediatric = _pediatric_flag(claim_canonical, raw_claim_text, claim_category)
+    crm_pediatric = _pediatric_flag(crm_canonical, crm_value)
+    if claim_pediatric != crm_pediatric:
+        return False
+
+    left = claim_canonical or claim_category
+    right = crm_canonical or crm_value
+    claim_core = _specialty_core(left)
     if not claim_core:
         return None
-    cores = [_specialty_core(v) for v in crm_values]
-    cores = [c for c in cores if c]
-    if not cores:
+    crm_core = _specialty_core(right)
+    if not crm_core:
         return None
-    return any(claim_core in c or c in claim_core for c in cores)
+    return claim_core in crm_core or crm_core in claim_core
+
+
+def _specialty_claim_result(
+    claim_category: str | None, raw_claim_text: str | None, *crm_values: str | None,
+) -> bool | None:
+    """True/False once at least one non-empty CRM value was actually
+    compared (see _specialty_values_match for the per-value comparison);
+    None when every one of *crm_values* is empty (no evidence to confirm
+    OR contradict the claim — see _resolve_and_validate_one_doctor's
+    NEEDS_REVIEW handling, never a silent FAIL just because CRM lacks
+    data)."""
+    results = [_specialty_values_match(claim_category, raw_claim_text, v) for v in crm_values if v]
+    if not results:
+        return None
+    return any(r is True for r in results)
+
+
+# ── Scope-of-service fallback (Step 3 of specialty/subspecialty matching) ──
+# Words that must NEVER, on their own, count as a scope-of-service match —
+# they are common enough in almost any clinical scope text that a bare
+# single-word "match" would be meaningless (Part: "Do not pass solely
+# because both strings contain generic medical vocabulary"). A MULTI-word
+# candidate phrase containing one of these is still fine (e.g. "علاج
+# الحشوات" — only a candidate phrase that reduces to JUST one of these
+# words, alone, is rejected). Deliberately non-exhaustive, same philosophy
+# as every other marker list in this module.
+_SCOPE_FALLBACK_GENERIC_WORDS = {
+    "طب", "طبيب", "طبيبه", "جراحه", "جراحة", "اطفال", "أطفال", "علاج",
+    "عياده", "عيادة", "خدمات", "خدمه", "خدمة", "مرض", "امراض", "أمراض",
+    "عام", "عامه", "عامة", "قسم",
+    "general", "medicine", "surgery", "treatment", "clinic", "services",
+    "care", "department",
+}
+
+
+def _is_generic_scope_phrase(normalized_phrase: str) -> bool:
+    """True when *normalized_phrase* (already normalize_arabic_text'd)
+    reduces to NOTHING but generic words (see _SCOPE_FALLBACK_GENERIC_
+    WORDS) — including the single-word case explicitly named in the
+    requirements ("طب", "جراحة", "أطفال", "علاج" must never match by
+    themselves). A genuinely short but SPECIFIC phrase (e.g. "الحشوات")
+    is unaffected."""
+    words = normalized_phrase.split()
+    return bool(words) and all(w in _SCOPE_FALLBACK_GENERIC_WORDS for w in words)
+
+
+def _scope_fallback_candidate_phrases(raw_claim_text: str | None, specialty_claim: str | None) -> list[str]:
+    """Every phrase worth searching for in CRM scope-of-service text, most
+    specific first: the raw Agent claim text itself (so a service phrase
+    with no top-level category at all, e.g. "الحشوات", is still checked),
+    then — when a coarse category WAS resolved — that category's own EN
+    name and its taxonomy-mapped Arabic equivalent (so a claim that
+    resolved to e.g. "Endocrinology" can also be confirmed via CRM scope
+    text written in Arabic). Order only matters for the reported
+    matched_phrase/evidence; a match on ANY of these is equally valid."""
+    phrases: list[str] = []
+    if raw_claim_text:
+        phrases.append(raw_claim_text)
+    if specialty_claim:
+        phrases.append(specialty_claim)
+        ar_equivalent = SPECIALTY_EN_TO_AR.get(specialty_claim)
+        if ar_equivalent:
+            phrases.append(ar_equivalent)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for phrase in phrases:
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            unique.append(phrase)
+    return unique
+
+
+def _match_specialty_against_scope(
+    raw_claim_text: str | None, specialty_claim: str | None, doctor: dict[str, Any],
+) -> dict[str, Any]:
+    """Step 3 of specialty/subspecialty validation (see _resolve_and_
+    validate_one_doctor): ONLY tried after specialty/subspecialty
+    comparison found no match — searches the resolved doctor's own CRM
+    scope-of-service text (cr301_scopeofservicear first, then
+    cr301_scopeofservice — see module Required-lookup-order) for evidence
+    of the claim, so a genuine service phrase that isn't itself a top-level
+    specialty category (e.g. "الحشوات" — dental fillings) can still be
+    confirmed against a doctor's own DETAILED scope text.
+
+    Considers, in this order, the raw Agent claim text, the resolved
+    category's own EN name, and its taxonomy-mapped Arabic equivalent (see
+    _scope_fallback_candidate_phrases) — never a bare word-overlap check
+    (that risks a false PASS from shared generic vocabulary alone): a
+    candidate phrase must appear as a genuine NORMALIZED SUBSTRING of the
+    scope text, and a candidate that reduces to nothing but a generic word
+    (_is_generic_scope_phrase — "طب"/"جراحة"/"أطفال"/"علاج" alone, ...) is
+    never accepted, matching or not.
+
+    Returns {"matched": bool, "source": field name or None, "matched_
+    phrase": the phrase that matched or None, "reference": the raw scope
+    text it matched in, or None}."""
+    candidate_phrases = _scope_fallback_candidate_phrases(raw_claim_text, specialty_claim)
+    for field_name in ("cr301_scopeofservicear", "cr301_scopeofservice"):
+        scope_text = doctor.get(field_name)
+        norm_scope = normalize_arabic_text(scope_text)
+        if not norm_scope:
+            continue
+        for phrase in candidate_phrases:
+            norm_phrase = normalize_arabic_text(phrase)
+            if not norm_phrase or _is_generic_scope_phrase(norm_phrase):
+                continue
+            if norm_phrase in norm_scope:
+                return {
+                    "matched": True, "source": field_name,
+                    "matched_phrase": phrase, "reference": scope_text,
+                }
+    return {"matched": False, "source": None, "matched_phrase": None, "reference": None}
 
 
 # Examination age: the CRM field is semi-structured free text (see
@@ -2553,15 +2807,22 @@ def _resolve_and_validate_one_doctor(
     else:
         _scoped_specialty_text = None
 
-    # Canonicalise via the shared alias table (see _resolve_specialty_
-    # category) BEFORE comparing — never a raw Arabic-claim-vs-raw-CRM-
-    # English string comparison. None means no claim was safely extracted
-    # at all (nothing scoped to this doctor, or an ambiguous/contextless
-    # word like bare "ليزر" that offer_search's own alias table
-    # deliberately does not resolve) — never treated as a claim worth
-    # checking, so it can never itself cause a FAIL.
-    specialty_claim = _resolve_specialty_category(_scoped_specialty_text)
-    if specialty_claim is not None:
+    # Required lookup order (see module docstring / README_doctor.md):
+    #   1. CRM specialty fields    (cr301_specialtyname, cr18c_manualspecialtyname)
+    #   2. CRM subspecialty fields (cr301_subspecialtyname, cr18c_manualsubspecialtyname)
+    #   3. CRM scope of service    (cr301_scopeofservicear, cr301_scopeofservice)
+    #      — ONLY tried once neither 1 nor 2 produced a match, using the
+    #      RAW claim text (_match_specialty_against_scope) so a genuine
+    #      service phrase with no top-level category of its own (e.g.
+    #      "الحشوات") can still be confirmed via a doctor's detailed scope.
+    # Entered whenever there is ANY specialty-shaped claim at all — either
+    # a coarse category was resolved (see _resolve_specialty_category) OR
+    # the raw scoped text is itself a recognised specialty/service phrase
+    # even without one (see _GENERIC_SPECIALTY_WORDS). _scoped_specialty_
+    # text is None/empty only when nothing specialty-shaped was said about
+    # this doctor at all, which must never itself cause a FAIL.
+    if _scoped_specialty_text:
+        specialty_claim = _resolve_specialty_category(_scoped_specialty_text)
         # specialty and subspecialty may BOTH legitimately be valid for the
         # same claim wording (Part: specialty=Pediatrics, subspecialty=
         # Pediatric Endocrinology are both correct depending on what the
@@ -2571,48 +2832,83 @@ def _resolve_and_validate_one_doctor(
         # "غدد صماء" for a Pediatrics doctor whose subspecialty is Pediatric
         # Endocrinology) must not be reported as a FAILED specialty claim —
         # it was never an assertion about the general specialty at all.
-        specialty_ok = _specialty_claim_result(specialty_claim, doctor.get("cr301_specialtyname"), doctor.get("cr18c_manualspecialtyname"))
-        subspecialty_ok = _specialty_claim_result(specialty_claim, doctor.get("cr301_subspecialtyname"), doctor.get("cr18c_manualsubspecialtyname"))
+        # Stay None (never computed) when no coarse category resolved at
+        # all — there is nothing to compare against cr301_specialtyname/
+        # cr301_subspecialtyname in that case (the raw-phrase-only path,
+        # e.g. "الحشوات", goes straight to the scope fallback below).
+        specialty_ok = subspecialty_ok = None
+        if specialty_claim is not None:
+            specialty_ok = _specialty_claim_result(
+                specialty_claim, _scoped_specialty_text,
+                doctor.get("cr301_specialtyname"), doctor.get("cr18c_manualspecialtyname"),
+            )
+            subspecialty_ok = _specialty_claim_result(
+                specialty_claim, _scoped_specialty_text,
+                doctor.get("cr301_subspecialtyname"), doctor.get("cr18c_manualsubspecialtyname"),
+            )
+
+        _scope_fallback: dict[str, Any] | None = None
         if specialty_ok is True:
             validated["specialty"] = _field(specialty_claim, "PASS", doctor.get("cr301_specialtyname") or doctor.get("cr18c_manualspecialtyname"))
         elif subspecialty_ok is True:
             validated["subspecialty"] = _field(
                 specialty_claim, "PASS", doctor.get("cr301_subspecialtyname") or doctor.get("cr18c_manualsubspecialtyname"),
             )
-        elif specialty_ok is False or subspecialty_ok is False:
-            # A genuine, evidenced contradiction on at least one field
-            # pair — never masked just because the OTHER pair happened to
-            # have no CRM data at all.
-            reference = (
-                doctor.get("cr301_specialtyname") or doctor.get("cr18c_manualspecialtyname")
-                or doctor.get("cr301_subspecialtyname") or doctor.get("cr18c_manualsubspecialtyname")
-            )
-            validated["specialty"] = _field(specialty_claim, "FAIL", reference)
         else:
-            # specialty_ok and subspecialty_ok are both None: every
-            # specialty-related CRM field is empty for this doctor — no
-            # evidence to confirm OR contradict the claim (mirrors
-            # doctor_notes/scope_of_service/qualifications' own NEEDS_
-            # REVIEW handling below), never a silent FAIL for missing CRM
-            # data.
-            validated["specialty"] = _field(specialty_claim, "NEEDS_REVIEW", None)
+            # Step 3: CRM scope of service — tried because neither
+            # specialty nor subspecialty produced a PASS above (whether
+            # they contradicted the claim, or there was no coarse category
+            # to compare against them in the first place).
+            _scope_fallback = _match_specialty_against_scope(_scoped_specialty_text, specialty_claim, doctor)
+            if _scope_fallback["matched"]:
+                validated["scope_of_service"] = _field(
+                    _scoped_specialty_text, "PASS", _scope_fallback["reference"],
+                    match_source=_scope_fallback["source"], matched_phrase=_scope_fallback["matched_phrase"],
+                    scope_fallback_used=True,
+                )
+            else:
+                # No match anywhere in the required lookup order. FAIL when
+                # this doctor actually had SOME populated evidence (in
+                # specialty, subspecialty, OR scope) that simply didn't
+                # match; NEEDS_REVIEW only when every one of the 6 fields
+                # is empty — never a silent FAIL for missing CRM data.
+                has_any_evidence = any(
+                    doctor.get(f) for f in (
+                        "cr301_specialtyname", "cr18c_manualspecialtyname",
+                        "cr301_subspecialtyname", "cr18c_manualsubspecialtyname",
+                        "cr301_scopeofservicear", "cr301_scopeofservice",
+                    )
+                )
+                reference = (
+                    doctor.get("cr301_specialtyname") or doctor.get("cr18c_manualspecialtyname")
+                    or doctor.get("cr301_subspecialtyname") or doctor.get("cr18c_manualsubspecialtyname")
+                )
+                outcome = "FAIL" if has_any_evidence else "NEEDS_REVIEW"
+                validated["specialty"] = _field(specialty_claim or _scoped_specialty_text, outcome, reference)
 
         # Concise, always-visible (not DEBUG-gated) diagnostic for exactly
         # this one checked claim — never a dump of every normalisation
-        # attempt — so a production PASS/FAIL is never an unexplained
-        # verdict (see this module's specialty-canonicalisation design).
-        _field_result = validated.get("specialty") or validated.get("subspecialty")
-        _crm_specialty = doctor.get("cr301_specialtyname") or doctor.get("cr18c_manualspecialtyname")
-        _crm_subspecialty = doctor.get("cr301_subspecialtyname") or doctor.get("cr18c_manualsubspecialtyname")
+        # attempt — so a production PASS/FAIL/NEEDS_REVIEW is never an
+        # unexplained verdict (see this module's specialty-canonicalisation
+        # design).
+        _field_result = validated.get("specialty") or validated.get("subspecialty") or validated.get("scope_of_service")
+        _matched_field_name = (
+            "subspecialty" if "subspecialty" in validated
+            else "scope_of_service" if "scope_of_service" in validated
+            else "specialty"
+        )
         print(
             f"[doctor] field validation:\n"
-            f"[doctor]     field={'subspecialty' if 'subspecialty' in validated else 'specialty'}\n"
+            f"[doctor]     field={_matched_field_name!r}\n"
             f"[doctor]     claimed_raw={_scoped_specialty_text!r}\n"
-            f"[doctor]     claimed_canonical={_specialty_core(specialty_claim)!r}\n"
-            f"[doctor]     crm_specialty={_crm_specialty!r}\n"
-            f"[doctor]     crm_specialty_canonical={_specialty_core(_crm_specialty)!r}\n"
-            f"[doctor]     crm_subspecialty={_crm_subspecialty!r}\n"
-            f"[doctor]     crm_subspecialty_canonical={_specialty_core(_crm_subspecialty)!r}\n"
+            f"[doctor]     claimed_canonical={(_specialty_core(specialty_claim) if specialty_claim else None)!r}\n"
+            f"[doctor]     crm_specialty={doctor.get('cr301_specialtyname')!r}\n"
+            f"[doctor]     crm_manual_specialty={doctor.get('cr18c_manualspecialtyname')!r}\n"
+            f"[doctor]     crm_subspecialty={doctor.get('cr301_subspecialtyname')!r}\n"
+            f"[doctor]     crm_manual_subspecialty={doctor.get('cr18c_manualsubspecialtyname')!r}\n"
+            f"[doctor]     scope_fallback_used={bool(_scope_fallback and _scope_fallback['matched'])}\n"
+            f"[doctor]     match_source={(_scope_fallback['source'] if _scope_fallback else None)!r}\n"
+            f"[doctor]     matched_phrase={(_scope_fallback['matched_phrase'] if _scope_fallback else None)!r}\n"
             f"[doctor]     result={_field_result['outcome'] if _field_result else None}",
             flush=True,
         )
@@ -2719,8 +3015,15 @@ def _resolve_and_validate_one_doctor(
             crm_reference=crm_notes, canonical_crm=crm_notes, outcome=notes_outcome,
         )
 
+    # Skipped when the specialty/subspecialty scope FALLBACK above already
+    # populated "scope_of_service" (e.g. the "الحشوات" case) — that is a
+    # more specifically-targeted match (a claimed specialty/service phrase
+    # confirmed against this exact doctor's scope text) than this open-
+    # ended "what does the doctor treat" trigger-phrase check below, so it
+    # must never be silently overwritten by this one re-evaluating the
+    # same or a broader span of text.
     scope_claim = _claim_text_if_triggered(_doctor_scope_text, _SCOPE_CLAIM_TRIGGER_RE)
-    if scope_claim is not None:
+    if scope_claim is not None and "scope_of_service" not in validated:
         crm_scope = doctor.get("cr301_scopeofservicear") or doctor.get("cr301_scopeofservice")
         if not crm_scope:
             scope_outcome = "NEEDS_REVIEW"

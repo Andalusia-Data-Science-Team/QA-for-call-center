@@ -22,6 +22,7 @@ bank/location/offers features:
 |---|---|
 | `crm_doctors.py` | Fetches + caches the full doctor dataset (`cr301_newdoctordataset` joined with `cr301_table1` for fees) — spans both OPD and non-OPD doctors, not filtered by `cr301_opdflag`. |
 | `doctor_validation.py` | Doctor-mention detection, CRM filtering/dedup, name resolution, per-field claim validation, and the applicability gate for the semantic check. |
+| `specialty_taxonomy.py` | Shared, formal EN↔AR specialty/subspecialty NAME table (pediatric specialties included) — see "Specialty/subspecialty taxonomy" below. |
 
 ## Entry points
 
@@ -119,6 +120,88 @@ project's existing philosophy (see `bank_validation.py`'s
 `_BANK_NAME_CANON`, an explicitly extensible, non-exhaustive alias table)
 of preferring a documented, extensible starting point over an attempt at
 total coverage that would inevitably still miss real phrasing anyway.
+
+## Specialty/subspecialty taxonomy
+
+`specialty_taxonomy.py` holds a SECOND, formal EN↔AR specialty-NAME table
+(`SPECIALTY_EN_TO_AR`), deliberately separate from — and merged with, never
+duplicating — `offer_search._AR_ALIAS`'s colloquial-phrase table:
+`_AR_ALIAS` maps loose conversational phrases ("قلب", "اطفال انابيب") to a
+coarse category for patient-facing offer search; `specialty_taxonomy`
+instead maps the actual FORMAL specialty/subspecialty names CRM data and
+an Agent's explicit claim can carry verbatim, in either language,
+including pediatric subspecialties (`PEDIATRIC_SPECIALTIES_EN/AR`) offer
+search has no reason to know about. Several EN names can describe the same
+Arabic concept (e.g. "General Pediatrics"/"Pediatrics"/"Pediatric
+medicine") — `canonicalize_specialty_name()` collapses those onto one
+canonical EN bucket via an EXACT (never substring) lookup, which is what
+keeps closely related specialties — "Pediatric Cardiology" vs
+"Cardiology", "Oncology" vs "Medical Oncology" — as distinct, unambiguous
+entries instead of accidentally merging.
+
+`SPECIALTY_EN_TO_AR` is periodically extended (never replaced) with real
+specialty/subspecialty display-name values as they're observed in
+production CRM exports — including values that only differ from an
+existing entry by case (e.g. both "Pediatric surgery" and "Pediatric
+Surgery" are kept as their own keys, since real CRM rows carry both
+spellings) and known CRM misspellings (e.g. "Anastasia" for Anesthesia,
+"Neurospsychiatry"/"Neurospsychiry" for Neuropsychiatry, "Pain Managment"
+for Pain Management, "Summar" for Summer). A misspelling is never silently
+corrected in the table — it is kept as its own exact-match key so the raw
+CRM spelling stays recognisable in evidence/logs — but it resolves through
+`canonicalize_specialty_name()` to the same canonical concept as the
+correctly-spelled name via their shared Arabic value.
+
+**Required lookup order** for a claimed specialty/subspecialty/clinical
+service against a resolved doctor (`_resolve_and_validate_one_doctor` in
+`doctor_validation.py`):
+1. CRM specialty fields — `cr301_specialtyname`, `cr18c_manualspecialtyname`.
+2. CRM subspecialty fields — `cr301_subspecialtyname`, `cr18c_manualsubspecialtyname`.
+3. CRM scope of service — `cr301_scopeofservicear`, then `cr301_scopeofservice`
+   — tried ONLY once neither 1 nor 2 matched, using the RAW claim text (not
+   just its resolved coarse category) so a genuine service phrase with no
+   top-level specialty of its own (e.g. "الحشوات" — dental fillings) can
+   still be confirmed against a doctor's own detailed scope text (see
+   `_match_specialty_against_scope`). A mismatch against the general
+   specialty never immediately FAILs when subspecialty or scope confirms
+   the claim instead.
+
+Outcome: a specialty/subspecialty/scope match PASSes that respective
+field; no match anywhere the doctor has actual data FAILs; no populated
+evidence in ANY of the 6 fields above is `NEEDS_REVIEW`.
+
+**Pediatric guard** (`_specialty_values_match`/`_pediatric_flag` in
+`doctor_validation.py`): before comparing two specialty values at all, if
+exactly one side is pediatric (either its canonical taxonomy entry is
+pediatric-flagged, or its raw text mentions a pediatric/infant/neonatal
+marker word — see `_mentions_pediatric_context`) and the other is not,
+they are an automatic mismatch, regardless of what the qualifier-stripped
+core-token comparison below would otherwise conclude. This is what stops
+"Pediatric Cardiology" from ever matching plain "Cardiology" while still
+letting a claim like "غدد صماء أطفال" (which explicitly says "أطفال")
+correctly match a "Pediatric Endocrinology" subspecialty.
+
+**Scope-of-service fallback candidates** (`_scope_fallback_candidate_
+phrases`): the raw Agent claim text, the resolved category's own EN name,
+and that name's taxonomy-mapped Arabic equivalent — searched as
+NORMALIZED SUBSTRINGS of the scope text (never bare word-overlap, which
+risks a false PASS from shared generic vocabulary alone). A candidate
+phrase that reduces to nothing but a generic word (`_is_generic_scope_
+phrase` — "طب"/"جراحة"/"أطفال"/"علاج" alone, ...) is never accepted. The
+result records `matched_crm_field`-style evidence — `match_source` (which
+CRM field matched) and `matched_phrase` — on the `scope_of_service`
+validated-field entry, additively (see `_field()`'s `**evidence`
+parameter — the original `claimed`/`outcome`/`reference` keys are never
+removed).
+
+`_GENERIC_SPECIALTY_WORDS` (the vocabulary that decides whether a title's
+tail is a specialty/service phrase rather than a person's name — see
+`_rejected_candidate_reason`) is extended at import time with every
+taxonomy EN/AR name's own first word, so a literal specialty/subspecialty
+name an Agent states verbatim ("Pediatric Cardiology", "NICU",
+"Pedodontic") is recognised as a specialty phrase the same way the
+hardcoded colloquial words are — computed once from `specialty_taxonomy`,
+never a second, hand-maintained list of specialty names to keep in sync.
 
 ## Unconditional checks vs. optional (claim-driven) fields
 

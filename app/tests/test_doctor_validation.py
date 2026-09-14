@@ -27,6 +27,11 @@ from app.service_hub.doctor_validation import (
     resolve_doctor_candidates,
     validate_doctor_information,
 )
+from app.service_hub.specialty_taxonomy import (
+    SPECIALTY_EN_TO_AR,
+    canonicalize_specialty_name,
+    is_pediatric_specialty,
+)
 
 # Fixtures mirror the real cr301_newdoctordataset shape (verified against a
 # LIVE Dynamics 365 query this session — same doctors, same field names).
@@ -485,6 +490,473 @@ def test_ent_doctor_without_speech_subspecialty_still_fails_natq_claim():
     fail against it."""
     result = validate("Agent: دكتورة علياء المدبولي استشارية نطق وتخاطب", doctors=[DOC_ALIAA])
     assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+
+
+# ── Shared EN/AR specialty taxonomy + CRM scope-of-service fallback ────────
+# See app.service_hub.specialty_taxonomy: a formal EN<->AR specialty/
+# subspecialty NAME table (distinct from offer_search._AR_ALIAS's
+# colloquial-phrase table), used here to (a) keep pediatric specialties
+# distinct from their adult equivalent and (b) fall back to a doctor's own
+# CRM scope-of-service text when a claimed service phrase (e.g. "الحشوات")
+# has no top-level specialty category of its own at all.
+
+DOC_NORA = {
+    **DOC_RAMI, "cr301_doctorkey": "800800001",
+    "servhub_doctornameen": "Nora Adel", "cr301_doctornamear": "نورا عادل",
+    "cr301_subspecialtyname": None, "cr301_scopeofservice": None, "cr301_scopeofservicear": None,
+    "cr301_qualificationsandexperience": None, "cr301_qualificationsandexperiencear": None,
+}
+
+
+def test_arabic_claim_matches_english_crm_specialty():
+    """Item 1: a colloquial Arabic claim resolves (via the existing
+    offer_search alias table, unchanged) to an EN category that matches
+    the doctor's own EN CRM specialty."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "Cardiology"}
+    result = validate("Agent: دكتورة نورا عادل استشارية قلب", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_english_claim_matches_arabic_manual_crm_specialty():
+    """Item 2: a literal English specialty name, claimed verbatim, matches
+    the doctor's Arabic MANUAL specialty field via the shared taxonomy's
+    canonical-name bridging (cr18c_manualspecialtyname, not cr301_specialtyname)."""
+    doc = {**DOC_NORA, "cr301_specialtyname": None, "cr18c_manualspecialtyname": "القلب والأوعية الدموية"}
+    result = validate("Agent: دكتورة نورا عادل استشارية Cardiology", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_claim_misses_specialty_matches_subspecialty_pedodontic():
+    """Items 3 & 9: 'Pedodontic' (English, exact taxonomy name) doesn't
+    match the doctor's general 'Dental Services' specialty, but DOES match
+    the Arabic subspecialty 'طب أسنان الأطفال' — must PASS as subspecialty,
+    never reported as a failed specialty claim."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "Dental Services", "cr301_subspecialtyname": "طب أسنان الأطفال"}
+    result = validate("Agent: دكتورة نورا عادل استشارية Pedodontic", doctors=[doc])
+    assert result["validated_fields"]["subspecialty"]["outcome"] == "PASS"
+    assert "specialty" not in result["validated_fields"] or result["validated_fields"]["specialty"]["outcome"] != "FAIL"
+    assert result["outcome"] == "PASS"
+
+
+def test_nicu_english_claim_matches_arabic_crm_specialty():
+    """Item 10: 'NICU' (English, exact taxonomy name) matches the CRM
+    specialty stored in its full Arabic clinical name."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "وحدة العناية المركزة لحديثي الولادة"}
+    result = validate("Agent: دكتورة نورا عادل استشارية NICU", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_pediatric_specialty_does_not_match_adult_equivalent():
+    """Item 8: a plain 'Cardiology' claim must NOT match a CRM specialty of
+    'Pediatric Cardiology' — the two are distinct taxonomy entries and must
+    never collapse onto each other just because one name is a substring of
+    the other's core token."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "Pediatric Cardiology"}
+    result = validate("Agent: دكتورة نورا عادل استشارية Cardiology", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+    assert result["outcome"] == "FAIL"
+
+
+def test_pediatric_endocrinology_claim_with_context_still_matches_general_specialty_doctor():
+    """Existing regression, re-verified under the new pediatric guard:
+    'غدد صماء أطفال' explicitly mentions children, so it is correctly
+    recognised as pediatric on BOTH sides (the claim's own wording and the
+    doctor's 'Pediatric Endocrinology' subspecialty) and must still PASS —
+    the pediatric guard only blocks a mismatch, never a genuine same-
+    context match (see test_correct_subspecialty_recorded_separately_
+    from_specialty above, which already covers DOC_KHAIRYA end-to-end)."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "General Pediatrics", "cr301_subspecialtyname": "Pediatric Endocrinology"}
+    result = validate("Agent: دكتورة نورا عادل استشارية غدد صماء أطفال", doctors=[doc])
+    assert result["validated_fields"]["subspecialty"]["outcome"] == "PASS"
+
+
+def test_arabic_scope_of_service_fallback_for_fillings():
+    """The exact reported example: 'الحشوات' has no top-level specialty
+    category of its own, but matches the doctor's detailed Arabic scope
+    text — must PASS as scope_of_service, not FAIL as specialty."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Dental Services",
+        "cr301_scopeofservicear": "علاج الحشوات وحشو العصب وتجميل الأسنان",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية الحشوات", doctors=[doc])
+    scope = result["validated_fields"]["scope_of_service"]
+    assert scope["outcome"] == "PASS"
+    assert scope["match_source"] == "cr301_scopeofservicear"
+    assert scope["matched_phrase"] == "الحشوات"
+    assert scope["scope_fallback_used"] is True
+
+
+def test_english_scope_of_service_fallback():
+    """Item 5: a claim resolving to a coarse category ('تغذية' ->
+    'Nutrition') that matches neither specialty nor subspecialty still
+    PASSes via the doctor's ENGLISH scope-of-service text."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Internal Medicine",
+        "cr301_scopeofservice": "Nutrition counseling and weight management for adults",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية تغذية", doctors=[doc])
+    scope = result["validated_fields"]["scope_of_service"]
+    assert scope["outcome"] == "PASS"
+    assert scope["match_source"] == "cr301_scopeofservice"
+
+
+def test_no_specialty_or_scope_match_fails():
+    """Item 6: populated specialty AND scope evidence, neither of which
+    supports the claim -- a genuine FAIL, not NEEDS_REVIEW."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Orthopedics",
+        "cr301_scopeofservice": "Joint replacement and fracture care",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية غدد صماء", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+
+
+def test_no_specialty_or_scope_evidence_needs_review():
+    """Item 7: every specialty/subspecialty/scope CRM field is empty --
+    NEEDS_REVIEW, never a silent FAIL for missing CRM data."""
+    doc = {**DOC_NORA, "cr301_specialtyname": None}
+    result = validate("Agent: دكتورة نورا عادل استشارية غدد صماء", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "NEEDS_REVIEW"
+
+
+def test_generic_word_alone_does_not_match_scope():
+    """Item 12: a bare, generic medical word ('علاج' = "treatment") must
+    never, by itself, count as a scope-of-service match -- even though it
+    trivially appears in almost any clinical scope text."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "General Surgery",
+        "cr301_scopeofservicear": "علاج الفتق الإربي وجراحات المرارة",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية علاج", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+    assert "scope_of_service" not in result["validated_fields"]
+
+
+def test_multi_doctor_scope_fallback_does_not_leak_between_doctors():
+    """Item 13: a scope-fallback-eligible claim ('الحشوات') repeated for
+    two different recommended doctors must be checked against EACH
+    doctor's own scope text independently -- the first doctor's dental
+    scope must never validate the second, unrelated (general surgery)
+    doctor."""
+    doctors = [
+        {
+            **DOC_NORA, "cr301_doctorkey": "scopeleak1",
+            "servhub_doctornameen": "Omar Nabil", "cr301_doctornamear": "عمر نبيل",
+            "cr301_specialtyname": "Dental Services",
+            "cr301_scopeofservicear": "علاج الحشوات وحشو العصب",
+        },
+        {
+            **DOC_NORA, "cr301_doctorkey": "scopeleak2",
+            "servhub_doctornameen": "Huda Samir", "cr301_doctornamear": "هدى سمير",
+            "cr301_specialtyname": "General Surgery",
+            "cr301_scopeofservicear": "عمليات الفتق والمرارة",
+        },
+    ]
+    transcript = (
+        "Agent: Here are the options:\nDr Omar Nabil\nDr Huda Samir\n"
+        "Agent: دكتور Omar Nabil استشاري الحشوات\n"
+        "Agent: دكتورة Huda Samir استشارية الحشوات\n"
+    )
+    result = validate(transcript, doctors=doctors)
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    omar_fields = by_name["omar nabil"]["validated_fields"]
+    huda_fields = by_name["huda samir"]["validated_fields"]
+    assert omar_fields["scope_of_service"]["outcome"] == "PASS"
+    assert huda_fields.get("scope_of_service") is None
+    assert huda_fields["specialty"]["outcome"] == "FAIL"
+
+
+# ── Expanded CRM specialty/subspecialty taxonomy (re-edit) ─────────────────
+# Regression coverage for the expanded specialty_taxonomy.SPECIALTY_EN_TO_AR
+# table and PEDIATRIC_SPECIALTIES_EN/AR membership lists — the real CRM
+# specialty/subspecialty values observed in production, added on top of
+# (never replacing) the existing taxonomy. See specialty_taxonomy.py's own
+# module docstring and README_doctor.md's "Specialty/subspecialty taxonomy"
+# section for the required lookup order this all builds on.
+
+# Every EN specialty/subspecialty value newly added to SPECIALTY_EN_TO_AR by
+# this re-edit (i.e. NOT present before it) — kept as an explicit list
+# (rather than re-deriving it from a hardcoded "old" snapshot at test time)
+# so this test fails loudly if a future edit accidentally drops one of
+# these real CRM values instead of only ever adding to the table.
+_NEW_CRM_SPECIALTY_VALUES = [
+    "ABA Therapist", "Allergy and Immunology", "Anastasia", "Anesthesia",
+    "Art Drawing Skills Program", "Arthroplasty",
+    "Arthroplasty & orthopedic Oncology", "Behavior Modification (ABA)",
+    "Breast Imaging", "CTO Advanced coronary intervention",
+    "Cardiac procedure", "Cardiology Screening", "Cardiothoracic",
+    "Cardiothoracic surgery", "Clinical Pathology", "Clinical hematology",
+    "Clinical oncology", "Colorectal Surgery", "Conservative",
+    "Dental Screening", "Dentistry", "Derma-hair removal", "Dermatology",
+    "Dermatology, Cosmatology and Andrology", "Diabetic medicine", "E.E.G",
+    "E.N.T", "E.N.T surgery", "Early Intervention", "Emergency Medicine",
+    "Emotional Intelligence Program", "Endodontic and cosmetic dentistry",
+    "Endodontics", "Facioplastic and Reconstructive Surgery",
+    "Foot & Ankle", "Gastroenterology", "General Checkup",
+    "Geriatric medicine", "Gynecological Oncology", "Hand",
+    "Hepatobiliary Surgery", "Hepatology", "Home Care", "I.C.U", "ICU",
+    "Immunology", "Infectious Disease", "Intervention Radiology",
+    "Interventional Radiology", "Interventional radiology",
+    "Kids PHYSICAL STRENGTH - YOGA", "Kids PHYSICAL STRENGTH - Zumba",
+    "Knee", "Laboratory", "Learning Difficulties",
+    "Maternal Fetal Medicine", "Maxillofacial surgery", "N.C.S",
+    "Neurospsychiatry", "Neurospsychiry", "Neurosurgery",
+    "Obestetrics and Gynecology", "Obstetrics and gynecology",
+    "Occupational therapy (OT)", "PICU", "Pain Management",
+    "Pain Managment", "Pain management (specialty)", "Pediatric Dentistry",
+    "Pediatric Hematology", "Pediatric Medicine", "Pediatric Nutrition",
+    "Pediatric Pulmonology", "Pediatric Surgery",
+    "Pediatric neuropsychiatry", "Pediatrics Neurology", "Periodontics",
+    "Phonatics", "Play Therapy", "Preventive medicine", "Procedure",
+    "Procedure Room", "Prosthodontics", "Psychology", "Pulmonary medicine",
+    "Radiation Oncology", "Radiology", "Screening", "Shoulder",
+    "Sleep Medicine", "Speech and Phonetics", "Spine",
+    "Summar Club 1 Month", "Summar Club 1 Visit", "Summar Club 1 week",
+    "Summar Club 6 week", "Surgical specialty",
+    "Trauma & Orthopedics-Screening", "Trauma & orthopedics",
+    "cosmatology", "head and neck surgery", "interventional cardiology",
+]
+
+
+@pytest.mark.parametrize("crm_value", _NEW_CRM_SPECIALTY_VALUES)
+def test_every_new_crm_specialty_value_normalizes_and_indexes(crm_value):
+    """Every newly added CRM specialty/subspecialty value must be present
+    in the taxonomy's EN->AR table with a real (non-empty) Arabic value,
+    and must resolve through the exact-match canonical lookup (used by
+    _resolve_specialty_category's step 1) -- never silently dropped or
+    merged away by the .update() that added it."""
+    assert crm_value in SPECIALTY_EN_TO_AR
+    assert SPECIALTY_EN_TO_AR[crm_value]
+    assert canonicalize_specialty_name(crm_value) is not None
+    # Case-insensitive/whitespace-normalised lookup also resolves the same
+    # entry (evidence stays exact-cased in SPECIALTY_EN_TO_AR; only the
+    # lookup itself is normalised).
+    assert canonicalize_specialty_name(f"  {crm_value.upper()}  ") == canonicalize_specialty_name(crm_value)
+
+
+@pytest.mark.parametrize("existing_key,expected_ar", [
+    ("Pediatric surgery", "جراحة الأطفال"),
+    ("Pediatric hematology", "أمراض الدم للأطفال"),
+    ("Pediatric medicine", "طب الأطفال"),
+    ("NICU", "وحدة العناية المركزة لحديثي الولادة"),
+    ("Neuropsychiatry", "طب النفس والأعصاب"),
+    ("Anesthesiology", "التخدير"),
+    ("Cardiothoracic Surgery", "جراحة القلب والصدر"),
+    ("Maxillofacial Surgery", "جراحة الوجه والفكين"),
+    ("Interventional Cardiology", "أمراض القلب التدخلية"),
+    ("E.N.T.", "أنف وأذن وحنجرة"),
+    ("Prosthesis", "تركيبات الأسنان"),
+    ("Endodontic", "علاج جذور الأسنان"),
+])
+def test_existing_keys_not_overwritten_with_incompatible_meanings(existing_key, expected_ar):
+    """The .update() that added the expanded CRM values must never have
+    clobbered a pre-existing EN key's Arabic value -- each of these
+    predates the re-edit and must still map to exactly what it did
+    before."""
+    assert SPECIALTY_EN_TO_AR[existing_key] == expected_ar
+
+
+@pytest.mark.parametrize("lower_variant,upper_variant", [
+    ("Pediatric surgery", "Pediatric Surgery"),
+    ("Pediatric hematology", "Pediatric Hematology"),
+    ("Pediatric medicine", "Pediatric Medicine"),
+])
+def test_case_variants_retained_as_distinct_keys_but_compare_equivalently(lower_variant, upper_variant):
+    """Both differently-cased CRM spellings are kept as their own distinct
+    dict keys (never collapsed into one at authoring time -- real CRM data
+    carries both), but the exact-match lookup is case-insensitive after
+    normalisation, so they resolve to the same canonical concept."""
+    assert lower_variant in SPECIALTY_EN_TO_AR
+    assert upper_variant in SPECIALTY_EN_TO_AR
+    assert lower_variant != upper_variant
+    assert canonicalize_specialty_name(lower_variant) == canonicalize_specialty_name(upper_variant)
+
+
+@pytest.mark.parametrize("misspelling,correctly_spelled", [
+    ("Anastasia", "Anesthesiology"),
+    ("Neurospsychiatry", "Neuropsychiatry"),
+    ("Neurospsychiry", "Neuropsychiatry"),
+    ("Pain Managment", "Pain Management"),
+])
+def test_known_crm_misspellings_resolve_to_intended_canonical_concept(misspelling, correctly_spelled):
+    """Real CRM misspellings must still resolve to the SAME canonical
+    concept as the correctly-spelled name, via the shared Arabic value --
+    the misspelling itself is preserved as its own key (see
+    test_every_new_crm_specialty_value_normalizes_and_indexes), never
+    silently corrected away, but it must not be an isolated dead end
+    either."""
+    assert canonicalize_specialty_name(misspelling) == canonicalize_specialty_name(correctly_spelled)
+
+
+def test_summer_club_misspelling_is_preserved_and_indexed():
+    """'Summar' (misspelling of 'Summer') has no correctly-spelled
+    counterpart anywhere in the taxonomy -- it must still be preserved
+    verbatim and resolvable on its own, not merged onto an unrelated
+    concept."""
+    for value in (
+        "Summar Club 1 Month", "Summar Club 1 Visit",
+        "Summar Club 1 week", "Summar Club 6 week",
+    ):
+        assert canonicalize_specialty_name(value) == value
+
+
+@pytest.mark.parametrize("pediatric_value", [
+    "Pediatric Medicine", "Pediatric Surgery", "Pediatric Hematology",
+    "Pediatric Dentistry", "Pediatric Pulmonology", "Pediatric Nutrition",
+    "Pediatric neuropsychiatry", "Pediatrics Neurology", "PICU",
+    "Immunology",
+])
+def test_new_pediatric_variants_recognized_as_pediatric(pediatric_value):
+    canonical = canonicalize_specialty_name(pediatric_value)
+    assert canonical is not None
+    assert is_pediatric_specialty(canonical) is True
+
+
+def test_pediatric_specialty_does_not_match_adult_specialty_via_shared_parent_word():
+    """'Immunology' (pediatric-flagged) is a textual substring of the
+    ADULT 'Allergy & Immunology' specialty's core token ('immunology' in
+    'allergy immunology') -- without the pediatric guard this would
+    wrongly match on shared vocabulary alone. A doctor whose real CRM
+    specialty is the adult 'Allergy & Immunology' must FAIL a claim of the
+    pediatric-only 'Immunology'."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "Allergy & Immunology"}
+    result = validate("Agent: دكتورة نورا عادل استشارية Immunology", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+    assert result["outcome"] == "FAIL"
+
+
+def test_picu_and_nicu_remain_distinct():
+    """Both PICU and NICU are pediatric ICU concepts, but they are
+    DIFFERENT units -- a doctor recorded under one must never be confirmed
+    against a claim naming the other."""
+    assert canonicalize_specialty_name("PICU") != canonicalize_specialty_name("NICU")
+    doc = {**DOC_NORA, "cr301_specialtyname": "PICU"}
+    result = validate("Agent: دكتورة نورا عادل استشارية NICU", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+
+
+def test_pediatric_dentistry_and_pedodontic_map_to_pediatric_dentistry():
+    assert canonicalize_specialty_name("Pediatric Dentistry") == canonicalize_specialty_name("Pedodontic")
+    doc = {**DOC_NORA, "cr301_specialtyname": "Pediatric Dentistry"}
+    result = validate("Agent: دكتورة نورا عادل استشارية Pedodontic", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_pediatrics_neurology_maps_to_pediatric_neurology():
+    assert canonicalize_specialty_name("Pediatrics Neurology") == canonicalize_specialty_name("Pediatric Neurology")
+    doc = {**DOC_NORA, "cr301_specialtyname": "Pediatrics Neurology"}
+    result = validate("Agent: دكتورة نورا عادل استشارية طب أعصاب الأطفال", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_phonatics_and_speech_and_phonetics_match_speech_claims():
+    """Both the CRM misspelling 'Phonatics' and the newly added 'Speech
+    and Phonetics' subspecialty value must confirm a 'نطق وتخاطب'
+    (speech/communication) claim -- preserving the existing Speech/
+    Phonatics equivalence for the new taxonomy value too."""
+    for subspecialty_value in ("Phonatics", "Speech and Phonetics"):
+        doc = {**DOC_NORA, "cr301_specialtyname": "E.N.T", "cr301_subspecialtyname": subspecialty_value}
+        result = validate("Agent: دكتورة نورا عادل استشارية نطق وتخاطب", doctors=[doc])
+        assert result["validated_fields"]["subspecialty"]["outcome"] == "PASS", subspecialty_value
+        assert "specialty" not in result["validated_fields"] or result["validated_fields"]["specialty"]["outcome"] != "FAIL"
+
+
+def test_new_taxonomy_specialty_match_prevents_unnecessary_scope_fallback():
+    """A claim that matches the doctor's own CRM specialty must PASS via
+    the specialty field -- scope-of-service must never even be consulted,
+    even when the scope text would ALSO happen to match."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Gastroenterology",
+        "cr301_scopeofservicear": "أمراض الجهاز الهضمي",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية Gastroenterology", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+    assert "scope_of_service" not in result["validated_fields"]
+
+
+def test_new_taxonomy_subspecialty_match_prevents_unnecessary_scope_fallback():
+    """A claim that misses the general specialty but matches the
+    subspecialty must PASS as subspecialty -- scope-of-service must never
+    be consulted either, even when the scope text would ALSO match."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Internal Medicine",
+        "cr301_subspecialtyname": "Hepatology",
+        "cr301_scopeofservicear": "متابعة أمراض الكبد المزمنة",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية Hepatology", doctors=[doc])
+    assert result["validated_fields"]["subspecialty"]["outcome"] == "PASS"
+    assert "specialty" not in result["validated_fields"] or result["validated_fields"]["specialty"]["outcome"] != "FAIL"
+    assert "scope_of_service" not in result["validated_fields"]
+
+
+def test_new_taxonomy_scope_fallback_runs_only_after_both_specialty_layers_fail():
+    """No subspecialty on file at all, and the general specialty doesn't
+    match the claim -- ONLY THEN is the doctor's own scope-of-service text
+    consulted, confirming the claim via the taxonomy's EN->AR bridge."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Internal Medicine",
+        "cr301_scopeofservicear": "متابعة أمراض الكبد المزمنة",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية Hepatology", doctors=[doc])
+    scope = result["validated_fields"]["scope_of_service"]
+    assert scope["outcome"] == "PASS"
+    assert scope["scope_fallback_used"] is True
+    assert scope["match_source"] == "cr301_scopeofservicear"
+
+
+def test_new_taxonomy_generic_scope_word_alone_cannot_pass_validation():
+    """'علاج' ('treatment') alone must never count as a scope-of-service
+    match even though it is literally a substring of the doctor's own
+    Arabic scope text -- must FAIL as specialty, never PASS via scope."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Conservative",
+        "cr301_scopeofservicear": "العلاج التحفظي للأسنان",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية علاج", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+    assert "scope_of_service" not in result["validated_fields"]
+
+
+def test_multi_doctor_calls_use_each_doctors_own_new_taxonomy_specialty():
+    """Two doctors recommended in the same call, each carrying a
+    DIFFERENT newly added CRM specialty value -- each must be validated
+    against their OWN specialty field only, never leaking into the other's
+    result (mirrors test_multi_doctor_scope_fallback_does_not_leak_
+    between_doctors, using the expanded taxonomy's own values)."""
+    doctors = [
+        {
+            **DOC_NORA, "cr301_doctorkey": "newtax_multi1",
+            "servhub_doctornameen": "Omar Nabil", "cr301_doctornamear": "عمر نبيل",
+            "cr301_specialtyname": "Hepatology",
+        },
+        {
+            **DOC_NORA, "cr301_doctorkey": "newtax_multi2",
+            "servhub_doctornameen": "Huda Samir", "cr301_doctornamear": "هدى سمير",
+            "cr301_specialtyname": "Dermatology",
+        },
+    ]
+    transcript = (
+        "Agent: Here are the options:\nDr Omar Nabil\nDr Huda Samir\n"
+        "Agent: دكتور Omar Nabil استشاري Hepatology\n"
+        "Agent: دكتورة Huda Samir استشارية Dermatology\n"
+    )
+    result = validate(transcript, doctors=doctors)
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["omar nabil"]["validated_fields"]["specialty"]["outcome"] == "PASS"
+    assert by_name["huda samir"]["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+    # Negative control: swapping which doctor claims which specialty must
+    # FAIL for both -- proving the checks are genuinely doctor-scoped, not
+    # a coincidental always-PASS.
+    swapped_transcript = (
+        "Agent: Here are the options:\nDr Omar Nabil\nDr Huda Samir\n"
+        "Agent: دكتور Omar Nabil استشاري Dermatology\n"
+        "Agent: دكتورة Huda Samir استشارية Hepatology\n"
+    )
+    swapped = validate(swapped_transcript, doctors=doctors)
+    swapped_by_name = {d["input_name"]: d for d in swapped["doctors"]}
+    assert swapped_by_name["omar nabil"]["validated_fields"]["specialty"]["outcome"] == "FAIL"
+    assert swapped_by_name["huda samir"]["validated_fields"]["specialty"]["outcome"] == "FAIL"
 
 
 def test_correct_business_unit_recorded():
