@@ -2004,12 +2004,60 @@ def _resolve_specialty_category(text: str | None) -> str | None:
 # not itself found in specialty_taxonomy) in pediatric context — used ONLY
 # as a safety signal for _pediatric_flag below, never to resolve a
 # specialty category on its own. Deliberately non-exhaustive, same
-# philosophy as every other marker/blocklist in this module.
+# philosophy as every other marker/blocklist in this module. Arabic hamza
+# variants (أ/إ/آ/ٱ) already collapse onto plain ا inside
+# normalize_arabic_text itself (see app.services.text_helpers._normalize_
+# arabic), so e.g. "اطفال"/"أطفال" below are genuinely the same normalized
+# token — both spelled out here only for readability, never because the
+# normaliser treats them differently.
 _PEDIATRIC_CONTEXT_MARKERS = {
-    "اطفال", "أطفال", "طفل", "طفله", "طفلة", "رضيع", "رضع", "وليد", "مواليد",
-    "pediatric", "paediatric", "infant", "infants", "newborn", "neonatal", "neonate",
+    "اطفال", "أطفال", "طفل", "طفله", "طفلة", "رضيع", "رضع", "وليد", "مواليد", "مراهقين",
+    "pediatric", "paediatric", "pediatrics", "children", "child",
+    "infant", "infants", "newborn", "neonatal", "neonate", "adolescent", "adolescents",
 }
 _PEDIATRIC_CONTEXT_PHRASES = ("حديثي الولاده", "حديثي الولادة")
+
+
+def _is_pediatric_qualifier_token(word: str) -> bool:
+    """True when a single already-normalized token (or that token with a
+    leading ال/لل/بال/... morpheme stripped) is itself a pediatric-context
+    marker — reuses _strip_leading_al/_strip_contracted_prefix (defined
+    above for the doctor-name blocklist) so definite-article/preposition-
+    fused forms ("الاطفال", "الأطفال", "للطفل", "للأطفال") are recognised
+    as the same marker as their bare form ("اطفال"/"طفل") without listing
+    every prefixed variant separately."""
+    if not word:
+        return False
+    variants = {word, _strip_leading_al(word), _strip_contracted_prefix(word)}
+    variants |= {_strip_leading_al(_strip_contracted_prefix(word))}
+    return bool(variants & _PEDIATRIC_CONTEXT_MARKERS)
+
+
+def _pediatric_context_match(text: str | None) -> str | None:
+    """Token/phrase-boundary-safe pediatric-context match: returns the
+    specific normalized token or phrase from *text* that matched a
+    pediatric marker (see _PEDIATRIC_CONTEXT_MARKERS/_PEDIATRIC_CONTEXT_
+    PHRASES and _is_pediatric_qualifier_token), or None when nothing
+    matches. Matching is always whole-TOKEN-set membership (never a raw
+    substring search inside an unrelated word) plus the small, closed set
+    of multi-word phrases that aren't reducible to one already-covered
+    token — this is what keeps e.g. "أطفال" from ever matching inside an
+    unrelated longer word, while still recognising the definite-article/
+    prefixed forms this module already needs (see
+    _is_pediatric_qualifier_token). _mentions_pediatric_context below is
+    the boolean-only convenience wrapper over this same check."""
+    if not text:
+        return None
+    norm = normalize_arabic_text(text)
+    if not norm:
+        return None
+    for token in norm.split():
+        if _is_pediatric_qualifier_token(token):
+            return token
+    for phrase in _PEDIATRIC_CONTEXT_PHRASES:
+        if phrase in norm:
+            return phrase
+    return None
 
 
 def _mentions_pediatric_context(text: str | None) -> bool:
@@ -2019,15 +2067,48 @@ def _mentions_pediatric_context(text: str | None) -> bool:
     "غدد صماء أطفال" resolves to plain "Endocrinology" — see
     _resolve_specialty_category — but the raw claim text still says
     "أطفال"), so _pediatric_flag doesn't have to rely on the resolved
-    category alone."""
-    if not text:
-        return False
+    category alone. See _pediatric_context_match for the underlying,
+    phrase-identifying check this is a thin boolean wrapper over."""
+    return _pediatric_context_match(text) is not None
+
+
+def _split_compound_specialty_claim(text: str | None) -> tuple[str, list[str]]:
+    """Split a possibly-COMPOUND specialty claim (e.g. "عظام اطفال" =
+    base specialty "عظام"/Orthopedics + a pediatric QUALIFIER "اطفال")
+    into (base_text_with_qualifier_tokens_removed, detected_qualifier_
+    labels). Token-boundary safe — reuses the exact same whole-token
+    pediatric-marker check as _pediatric_context_match/_mentions_
+    pediatric_context (see _is_pediatric_qualifier_token), never an
+    unsafe partial substring.
+
+    This is the fix for the root-cause bug this function exists to close:
+    _resolve_specialty_category's own longest-alias-SUBSTRING search has
+    no notion of "compound phrase" at all — it just picks whichever known
+    alias is the most CHARACTERS long anywhere in the claim text. For
+    "عظام اطفال" that accidentally picks the pediatric qualifier "اطفال"
+    (5 chars) over the real base specialty "عظام" (4 chars), wrongly
+    resolving the whole claim to "Pediatrics" instead of "Orthopedics".
+    Stripping the qualifier token(s) out BEFORE resolution removes the
+    competing token entirely, so re-resolving the remainder recovers the
+    genuine base specialty (see _resolve_and_validate_one_doctor, which
+    re-resolves this function's base_text and — only when that succeeds —
+    uses it in place of the naive whole-phrase resolution).
+
+    Returns ("", []) for empty input, and (text_unchanged, []) whenever no
+    pediatric marker was found at all — a plain, non-compound claim (e.g.
+    bare "عظام") is returned completely unchanged, and a pediatric-only
+    claim with no base concept left after stripping (e.g. bare "اطفال")
+    reports qualifiers but an empty base_text, which callers must treat as
+    "not a genuine base+qualifier compound" (there is nothing to validate
+    a base specialty against) rather than silently resolving an empty
+    string."""
     norm = normalize_arabic_text(text)
     if not norm:
-        return False
-    if set(norm.split()) & _PEDIATRIC_CONTEXT_MARKERS:
-        return True
-    return any(phrase in norm for phrase in _PEDIATRIC_CONTEXT_PHRASES)
+        return "", []
+    tokens = norm.split()
+    kept = [t for t in tokens if not _is_pediatric_qualifier_token(t)]
+    qualifiers = ["pediatric"] if len(kept) != len(tokens) else []
+    return " ".join(kept), qualifiers
 
 
 def _pediatric_flag(canonical_name: str | None, *raw_texts: str | None) -> bool:
@@ -2209,6 +2290,32 @@ def _match_specialty_against_scope(
     return {"matched": False, "source": None, "matched_phrase": None, "reference": None}
 
 
+def _match_pediatric_qualifier_against_scope(doctor: dict[str, Any]) -> dict[str, Any]:
+    """Does the resolved doctor's own CRM scope-of-service text carry
+    clear evidence that they treat pediatric patients? Used ONLY as the
+    second half of a compound base+qualifier specialty claim (e.g. "عظام
+    اطفال" — see _split_compound_specialty_claim/_resolve_and_validate_
+    one_doctor) — AFTER the base specialty ("Orthopedics") has already
+    been confirmed against the doctor's own specialty/subspecialty
+    fields; this function never runs on its own and never substitutes for
+    that base-specialty check.
+
+    Checked in the same field order as the existing scope fallback
+    (_match_specialty_against_scope): cr301_scopeofservicear first, then
+    cr301_scopeofservice. Matching is the token/phrase-boundary-safe
+    _pediatric_context_match — never a raw substring search — so a
+    pediatric marker is never picked up as a partial match inside an
+    unrelated word.
+
+    Returns {"matched": bool, "source": field name or None, "phrase": the
+    matched pediatric marker/phrase, or None}."""
+    for field_name in ("cr301_scopeofservicear", "cr301_scopeofservice"):
+        phrase = _pediatric_context_match(doctor.get(field_name))
+        if phrase:
+            return {"matched": True, "source": field_name, "phrase": phrase}
+    return {"matched": False, "source": None, "phrase": None}
+
+
 # Examination age: the CRM field is semi-structured free text (see
 # doctor_validation.py module docstring / Part C examples) — this parser
 # handles the common "Age: N-M years" / "N years and above" / "Neonatal and
@@ -2243,6 +2350,28 @@ def parse_examination_age(raw: str | None) -> tuple[int, float] | None:
     if m:
         return (int(m.group(1)), float("inf"))
     return None
+
+
+# Adult-only age threshold used ONLY by _pediatric_scope_contradicted below
+# — a doctor whose own structured CRM age-eligibility data starts at this
+# age or later is explicit, structured evidence they do NOT see children,
+# not a guess from freeform scope wording.
+_PEDIATRIC_ADULT_ONLY_AGE_THRESHOLD = 18
+
+
+def _pediatric_scope_contradicted(doctor: dict[str, Any]) -> bool:
+    """True when the resolved doctor's own CRM data EXPLICITLY excludes
+    children — used only to decide whether an unconfirmed pediatric
+    qualifier (see _match_pediatric_qualifier_against_scope) should read
+    as NEEDS_REVIEW (no evidence either way) or a genuine FAIL (evidence
+    of exclusion). Deliberately conservative: relies on the already-
+    structured, already-parsed servhub_examinationage range (parse_
+    examination_age, the same field/parser examination_age validation
+    itself uses) rather than guessing at negation phrases in freeform
+    scope text, which risks a false FAIL from ordinary adult-specialty
+    wording that never actually said children are excluded."""
+    age_range = parse_examination_age(doctor.get("servhub_examinationage"))
+    return bool(age_range and age_range[0] >= _PEDIATRIC_ADULT_ONLY_AGE_THRESHOLD)
 
 
 # Agent age-eligibility claims: "يستقبل من عمر N" / "يستقبل أطفال" /
@@ -2823,6 +2952,35 @@ def _resolve_and_validate_one_doctor(
     # this doctor at all, which must never itself cause a FAIL.
     if _scoped_specialty_text:
         specialty_claim = _resolve_specialty_category(_scoped_specialty_text)
+
+        # Compound-claim decomposition ("عظام اطفال" = base specialty
+        # "عظام"/Orthopedics + a pediatric QUALIFIER "اطفال" — see
+        # _split_compound_specialty_claim's own docstring for the full
+        # root-cause explanation). specialty_claim above is resolved from
+        # the FULL, un-decomposed claim text via a longest-alias-SUBSTRING
+        # search that has no notion of "compound phrase": a co-occurring
+        # pediatric qualifier word can accidentally out-rank a genuinely
+        # SHORTER base-specialty word purely on character length (e.g.
+        # "اطفال", 5 chars, beating "عظام", 4 chars) and hijack the whole
+        # claim's resolved category. Re-resolving the QUALIFIER-STRIPPED
+        # remainder on its own has no such competing token, so it reliably
+        # recovers the real base specialty; when that succeeds, it REPLACES
+        # specialty_claim for every comparison below. specialty_ok/
+        # subspecialty_ok just below still compare against the FULL
+        # original claim text (never the stripped remainder), so an
+        # already-exact formal pediatric specialty/subspecialty on file
+        # (e.g. CRM "Pediatric Orthopedics") keeps matching directly there,
+        # exactly as it already did before this fix for claims where the
+        # naive whole-phrase resolution happened to already be correct
+        # (e.g. "غدد صماء أطفال" -> "Endocrinology").
+        _pediatric_base_text, _pediatric_qualifiers = _split_compound_specialty_claim(_scoped_specialty_text)
+        _base_specialty_claim = (
+            _resolve_specialty_category(_pediatric_base_text)
+            if _pediatric_qualifiers and _pediatric_base_text else None
+        )
+        if _base_specialty_claim:
+            specialty_claim = _base_specialty_claim
+
         # specialty and subspecialty may BOTH legitimately be valid for the
         # same claim wording (Part: specialty=Pediatrics, subspecialty=
         # Pediatric Endocrinology are both correct depending on what the
@@ -2847,6 +3005,32 @@ def _resolve_and_validate_one_doctor(
                 doctor.get("cr301_subspecialtyname"), doctor.get("cr18c_manualsubspecialtyname"),
             )
 
+        # Compound base+qualifier path: only engaged when the claim
+        # genuinely decomposed into base+qualifier AND neither check above
+        # already PASSed outright (i.e. CRM has no formal pediatric-
+        # flavoured specialty/subspecialty on file matching this claim
+        # directly). The BASE specialty is matched deliberately IGNORING
+        # the pediatric guard — comparing against the QUALIFIER-STRIPPED
+        # text (which mentions no pediatric marker at all) rather than the
+        # full claim — so a doctor whose CRM specialty is plain
+        # "Orthopedics" is a legitimate base match for "عظام اطفال" even
+        # though bare "Orthopedics" is not itself pediatric-flagged; the
+        # pediatric QUALIFIER is then confirmed SEPARATELY, only after the
+        # base already matched, against the doctor's own scope-of-service
+        # text (see _match_pediatric_qualifier_against_scope) — never
+        # merely because the scope happens to contain "أطفال" somewhere
+        # unrelated to the base specialty.
+        _base_specialty_match: bool | None = None
+        _qualifier_evidence: dict[str, Any] | None = None
+        if specialty_ok is not True and subspecialty_ok is not True and _base_specialty_claim and _pediatric_qualifiers:
+            _base_specialty_match = _specialty_claim_result(
+                _base_specialty_claim, _pediatric_base_text,
+                doctor.get("cr301_specialtyname"), doctor.get("cr18c_manualspecialtyname"),
+                doctor.get("cr301_subspecialtyname"), doctor.get("cr18c_manualsubspecialtyname"),
+            )
+            if _base_specialty_match is True:
+                _qualifier_evidence = _match_pediatric_qualifier_against_scope(doctor)
+
         _scope_fallback: dict[str, Any] | None = None
         if specialty_ok is True:
             validated["specialty"] = _field(specialty_claim, "PASS", doctor.get("cr301_specialtyname") or doctor.get("cr18c_manualspecialtyname"))
@@ -2854,11 +3038,41 @@ def _resolve_and_validate_one_doctor(
             validated["subspecialty"] = _field(
                 specialty_claim, "PASS", doctor.get("cr301_subspecialtyname") or doctor.get("cr18c_manualsubspecialtyname"),
             )
+        elif _base_specialty_match is True:
+            _pediatric_reference = (
+                doctor.get("cr301_specialtyname") or doctor.get("cr18c_manualspecialtyname")
+                or doctor.get("cr301_subspecialtyname") or doctor.get("cr18c_manualsubspecialtyname")
+            )
+            if _qualifier_evidence and _qualifier_evidence["matched"]:
+                validated["specialty"] = _field(
+                    specialty_claim, "PASS", _pediatric_reference,
+                    base_specialty=_base_specialty_claim, qualifiers=_pediatric_qualifiers,
+                    base_specialty_match=True, qualifier_match=True,
+                    match_source=_qualifier_evidence["source"], matched_phrase=_qualifier_evidence["phrase"],
+                )
+            else:
+                # Base specialty confirmed, but nothing in the doctor's own
+                # scope text evidences the pediatric qualifier —
+                # NEEDS_REVIEW (never a silent FAIL just because CRM only
+                # stores the general specialty), UNLESS the doctor's own
+                # CRM data explicitly contradicts a pediatric claim (e.g. a
+                # structured adult-only examination-age range).
+                _outcome = "FAIL" if _pediatric_scope_contradicted(doctor) else "NEEDS_REVIEW"
+                validated["specialty"] = _field(
+                    specialty_claim, _outcome, _pediatric_reference,
+                    base_specialty=_base_specialty_claim, qualifiers=_pediatric_qualifiers,
+                    base_specialty_match=True, qualifier_match=False,
+                )
         else:
             # Step 3: CRM scope of service — tried because neither
             # specialty nor subspecialty produced a PASS above (whether
             # they contradicted the claim, or there was no coarse category
-            # to compare against them in the first place).
+            # to compare against them in the first place), and the compound
+            # base+qualifier path above either didn't apply or the base
+            # specialty itself didn't match anything on file either (a
+            # genuinely unrelated specialty, e.g. "عظام اطفال" against a
+            # Cardiology-only doctor, still correctly FAILs/NEEDS_REVIEWs
+            # below exactly as any other unmatched claim would).
             _scope_fallback = _match_specialty_against_scope(_scoped_specialty_text, specialty_claim, doctor)
             if _scope_fallback["matched"]:
                 validated["scope_of_service"] = _field(
@@ -2901,11 +3115,17 @@ def _resolve_and_validate_one_doctor(
             f"[doctor] field validation:\n"
             f"[doctor]     field={_matched_field_name!r}\n"
             f"[doctor]     claimed_raw={_scoped_specialty_text!r}\n"
+            f"[doctor]     resolved_base_specialty={specialty_claim!r}\n"
+            f"[doctor]     detected_qualifiers={_pediatric_qualifiers!r}\n"
             f"[doctor]     claimed_canonical={(_specialty_core(specialty_claim) if specialty_claim else None)!r}\n"
             f"[doctor]     crm_specialty={doctor.get('cr301_specialtyname')!r}\n"
             f"[doctor]     crm_manual_specialty={doctor.get('cr18c_manualspecialtyname')!r}\n"
             f"[doctor]     crm_subspecialty={doctor.get('cr301_subspecialtyname')!r}\n"
             f"[doctor]     crm_manual_subspecialty={doctor.get('cr18c_manualsubspecialtyname')!r}\n"
+            f"[doctor]     base_specialty_match={_base_specialty_match!r}\n"
+            f"[doctor]     qualifier_match={bool(_qualifier_evidence and _qualifier_evidence['matched'])!r}\n"
+            f"[doctor]     qualifier_match_source={(_qualifier_evidence['source'] if _qualifier_evidence else None)!r}\n"
+            f"[doctor]     matched_pediatric_phrase={(_qualifier_evidence['phrase'] if _qualifier_evidence else None)!r}\n"
             f"[doctor]     scope_fallback_used={bool(_scope_fallback and _scope_fallback['matched'])}\n"
             f"[doctor]     match_source={(_scope_fallback['source'] if _scope_fallback else None)!r}\n"
             f"[doctor]     matched_phrase={(_scope_fallback['matched_phrase'] if _scope_fallback else None)!r}\n"

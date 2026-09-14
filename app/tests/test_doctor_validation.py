@@ -959,6 +959,150 @@ def test_multi_doctor_calls_use_each_doctors_own_new_taxonomy_specialty():
     assert swapped_by_name["huda samir"]["validated_fields"]["specialty"]["outcome"] == "FAIL"
 
 
+# ── Compound specialty claims (base specialty + pediatric qualifier) ───────
+# Real regression: "عظام اطفال" ("pediatric orthopedics", spoken as two
+# separate words) was wrongly resolved to claimed_canonical="pediatrics" —
+# _resolve_specialty_category's longest-alias-SUBSTRING search has no
+# notion of "compound phrase", so the merely-LONGER pediatric qualifier
+# word ("اطفال", 5 chars) accidentally out-ranked the genuinely correct,
+# but shorter, base specialty word ("عظام", 4 chars) purely on character
+# length, hijacking the whole claim onto "General Pediatrics" instead of
+# "Orthopedics". See _split_compound_specialty_claim/_match_pediatric_
+# qualifier_against_scope in doctor_validation.py for the fix: the base
+# specialty and the pediatric qualifier are now validated SEPARATELY — the
+# base against cr301_specialtyname/cr18c_manualspecialtyname/cr301_
+# subspecialtyname/cr18c_manualsubspecialtyname, the qualifier against
+# cr301_scopeofservicear/cr301_scopeofservice — and only PASS when BOTH
+# are confirmed.
+
+def test_compound_pediatric_orthopedic_claim_with_arabic_scope_passes():
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Orthopedics",
+        "cr301_scopeofservicear": "نعالج مشاكل العظام لدى الأطفال والمراهقين",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام اطفال", doctors=[doc])
+    field = result["validated_fields"]["specialty"]
+    assert field["outcome"] == "PASS"
+    assert field["claimed"] == "Orthopedics"
+    assert field["base_specialty"] == "Orthopedics"
+    assert field["qualifiers"] == ["pediatric"]
+    assert field["base_specialty_match"] is True
+    assert field["qualifier_match"] is True
+    assert field["match_source"] == "cr301_scopeofservicear"
+
+
+def test_compound_pediatric_orthopedic_claim_with_english_scope_passes():
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Orthopedics",
+        "cr301_scopeofservice": "We treat orthopedic conditions in children and adolescents",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام أطفال", doctors=[doc])
+    field = result["validated_fields"]["specialty"]
+    assert field["outcome"] == "PASS"
+    assert field["match_source"] == "cr301_scopeofservice"
+
+
+def test_compound_pediatric_orthopedic_claim_definite_article_form_passes():
+    """'عظام الاطفال' (definite-article form, 'the children') must be
+    recognised as the same pediatric qualifier as bare 'اطفال'."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Orthopedics",
+        "cr301_scopeofservicear": "جراحة عظام الأطفال وعلاج حالات الأطفال",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام الاطفال", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_compound_pediatric_claim_matches_direct_pediatric_orthopedics_specialty():
+    """CRM already carries the formal pediatric specialty directly -- no
+    scope text needed at all; the corrected base-specialty resolution lets
+    the EXISTING pediatric-guarded specialty/subspecialty comparison match
+    it directly, exactly as it already does for other pediatric
+    subspecialties (e.g. Pediatric Endocrinology)."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "Pediatric Orthopedics"}
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام اطفال", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_compound_pediatric_claim_matches_direct_pediatric_orthopedics_subspecialty():
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Orthopedics",
+        "cr301_subspecialtyname": "Pediatric Orthopedics",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام اطفال", doctors=[doc])
+    assert result["validated_fields"]["subspecialty"]["outcome"] == "PASS"
+    assert "specialty" not in result["validated_fields"] or result["validated_fields"]["specialty"]["outcome"] != "FAIL"
+
+
+def test_compound_pediatric_claim_without_scope_evidence_needs_review():
+    """Base specialty (Orthopedics) is confirmed, but nothing in the
+    doctor's scope-of-service text evidences the pediatric qualifier --
+    NEEDS_REVIEW, never a silent FAIL just because CRM only stores the
+    general specialty. servhub_examinationage is explicitly cleared here
+    (DOC_NORA otherwise inherits DOC_RAMI's "18 years and above", which
+    would correctly read as an explicit adult-only contradiction instead
+    -- see test_compound_pediatric_claim_with_explicit_adult_only_
+    restriction_fails below -- so this test isolates the genuine
+    no-evidence-either-way case)."""
+    doc = {**DOC_NORA, "cr301_specialtyname": "Orthopedics", "servhub_examinationage": None}
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام اطفال", doctors=[doc])
+    field = result["validated_fields"]["specialty"]
+    assert field["outcome"] == "NEEDS_REVIEW"
+    assert field["base_specialty_match"] is True
+    assert field["qualifier_match"] is False
+
+
+def test_compound_pediatric_claim_against_unrelated_specialty_fails_even_with_pediatric_scope():
+    """The doctor's real specialty (Cardiology) has nothing to do with the
+    claimed base specialty (Orthopedics) -- a pediatric scope mention
+    elsewhere must never paper over that mismatch."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Cardiology",
+        "cr301_scopeofservicear": "نعالج مشاكل القلب لدى الأطفال",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام اطفال", doctors=[doc])
+    assert result["validated_fields"]["specialty"]["outcome"] == "FAIL"
+
+
+def test_compound_pediatric_claim_with_explicit_adult_only_restriction_fails():
+    """Base specialty matches, but the doctor's own structured CRM
+    examination-age data explicitly excludes children (18+) -- a genuine
+    FAIL, not NEEDS_REVIEW."""
+    doc = {
+        **DOC_NORA, "cr301_specialtyname": "Orthopedics",
+        "servhub_examinationage": "18 years and above",
+    }
+    result = validate("Agent: دكتورة نورا عادل استشارية عظام اطفال", doctors=[doc])
+    field = result["validated_fields"]["specialty"]
+    assert field["outcome"] == "FAIL"
+    assert field["base_specialty_match"] is True
+    assert field["qualifier_match"] is False
+
+
+def test_plain_orthopedics_claim_resolves_to_orthopedics():
+    assert _resolve_specialty_category("عظام") == "Orthopedics"
+
+
+def test_plain_pediatric_claim_resolves_to_general_pediatrics():
+    assert _resolve_specialty_category("اطفال") == "General Pediatrics"
+
+
+def test_compound_pediatric_orthopedic_claim_never_resolves_to_general_pediatrics():
+    """The exact reported regression: 'عظام اطفال' must never resolve to
+    General Pediatrics -- across every CRM shape it might be checked
+    against, the claimed/base_specialty value must always read
+    'Orthopedics'."""
+    for doc in (
+        {**DOC_NORA, "cr301_specialtyname": "Orthopedics"},
+        {**DOC_NORA, "cr301_specialtyname": "Pediatric Orthopedics"},
+        {**DOC_NORA, "cr301_specialtyname": "Cardiology"},
+    ):
+        result = validate("Agent: دكتورة نورا عادل استشارية عظام اطفال", doctors=[doc])
+        field = result["validated_fields"]["specialty"]
+        assert field["claimed"] != "General Pediatrics"
+        assert field.get("base_specialty", field["claimed"]) != "General Pediatrics"
+
+
 def test_correct_business_unit_recorded():
     result = validate("Agent: دكتور رامي سمرقندي في فرع AHJ")
     assert result["business_unit"] == "AHJ"
