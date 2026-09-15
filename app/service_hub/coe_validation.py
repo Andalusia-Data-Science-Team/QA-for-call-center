@@ -579,17 +579,18 @@ def _clause_is_third_party_or_negated(clause: str) -> bool:
 # to script-similarity matching rather than a wrong specialty guess) ────────
 #
 # IBD deliberately does NOT list the bare specialty/complaint phrases
-# "الجهاز الهضمي"/"امراض الجهاز الهضمي" here (unlike the other three COEs,
-# whose markers are specific enough not to double as generic language) —
-# those exact words are also a doctor's ordinary specialty/title
-# description (e.g. "استشاري امراض الجهاز الهضمي والكبد والمناظير" naming a
-# GIT consultant while confirming a booking) and are already fully covered
-# as evidence via COMPLAINT_KEYWORDS/SPECIALTY_ALIASES["GIT"]. Keeping them
-# here would count a doctor's specialty title as if the agent had
-# explicitly announced "the IBD Center of Excellence", which is exactly
-# the false cross-context "explicit recommendation" that previously
-# corrupted multi-context aggregation (see build_coe_evaluations'
-# explicit_agent_recommended field and its module-level regression note).
+# "الجهاز الهضمي"/"امراض الجهاز الهضمي" here (unlike Headache/Asthma below,
+# whose short bare markers are specific enough not to double as generic
+# language) — those exact words are also a doctor's ordinary specialty/
+# title description (e.g. "استشاري امراض الجهاز الهضمي والكبد والمناظير"
+# naming a GIT consultant while confirming a booking) and are already
+# fully covered as evidence via COMPLAINT_KEYWORDS/SPECIALTY_
+# ALIASES["GIT"]. Keeping them here would count a doctor's specialty
+# title as if the agent had explicitly announced "the IBD Center of
+# Excellence", which is exactly the false cross-context "explicit
+# recommendation" that previously corrupted multi-context aggregation
+# (see build_coe_evaluations' explicit_agent_recommended field and its
+# module-level regression note).
 COE_NAME_MARKERS: dict[str, set[str]] = {
     "IBD": {"gastroenterology", "ibd"},
     # Bare "صداع" (no definite article) deliberately mirrors COMPLAINT_
@@ -601,17 +602,36 @@ COE_NAME_MARKERS: dict[str, set[str]] = {
     # marker even though the exact same word already counts as complaint
     # evidence when the PATIENT says it.
     "Headache": {"تشخيص وعلاج الصداع", "علاج الصداع", "صداع", "headache"},
-    # Bare "ربو"/"سكر" (no definite article) mirror the SAME "صداع" fix
-    # above for the SAME reason — "مركز التميز للربو"/"...للسكر" use the
-    # ل+ال contraction ("للربو"/"للسكر"), which "الربو"/"السكري" alone
-    # would never match as a substring. Both words are already accepted,
-    # by the same precedent as "صداع", as sufficiently COE-specific
-    # (never a generic complaint-only word) to serve as an explicit-
-    # recommendation marker.
-    "Asthma": {
-        "امراض الصدر والجهاز التنفسي", "امراض الصدر", "الصدر والجهاز التنفسي", "asthma", "ربو",
-    },
-    "Diabetes": {"امراض السكر والغدد الصماء", "السكر والغدد الصماء", "diabetes", "سكر"},
+    # Bare "ربو" (no definite article) mirrors the SAME "صداع" fix above
+    # for the SAME reason — "مركز التميز للربو" uses the ل+ال contraction
+    # ("للربو"), which "الربو" alone would never match as a substring.
+    # Accepted, by the same precedent as "صداع", as sufficiently COE-
+    # specific (never a generic complaint-only word) to serve as an
+    # explicit-recommendation marker.
+    "Asthma": {"asthma", "ربو"},
+    # Real regression (call 57C946E6-.../ similar): "امراض السكر والغدد
+    # الصماء" is lifted verbatim from the Diabetes script's own "...في علاج
+    # أمراض السكر والغدد الصماء..." wording, but — exactly like IBD's
+    # "الجهاز الهضمي" above — it is ALSO the perfectly ordinary way to
+    # describe a doctor's specialty (e.g. an agent naming two available
+    # doctors and stating "تخصصهم امراض السكر والغدد الصماء" while never
+    # mentioning مركز التميز/the Diabetes COE at all). Treating that
+    # specialty description as an unconditional "explicit_name" match
+    # produced a false explicit_agent_recommended=True/recommendation_
+    # status="pass", masking a genuine missed-recommendation violation.
+    # Bare "سكر" has the identical problem — it is the ordinary medical
+    # word for "diabetes" a patient/agent uses in perfectly ordinary complaint/
+    # specialty language (already covered as evidence via COMPLAINT_
+    # KEYWORDS["Diabetes"]), never a COE-specific announcement on its own.
+    # Only the unambiguous English COE name is kept, mirroring IBD's own
+    # minimal, unambiguous-only marker set — a genuine Arabic COE
+    # announcement (the actual "...مركز التميز... أمراض السكر والغدد
+    # الصماء..." script) is still fully caught via the SEPARATE, GATED
+    # script-similarity path (_turn_has_explicit_coe_program_marker +
+    # _turn_has_category_specific_evidence + script_similarity), which
+    # requires "مركز التميز" itself to be present and is unaffected by
+    # this change.
+    "Diabetes": {"diabetes"},
 }
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -711,7 +731,19 @@ _SPECIALTY_ALIAS_DATA: dict[str, list[str]] = {
     ],
     "Diabetes": [
         "Diabetes", "Diabetology", "Diabetologist",
-        "سكري", "السكري", "سكر", "مرض السكر", "عيادة السكر", "طبيب سكر",
+        # "السكر" (bare, definite-article form) was previously missing —
+        # SPECIALTY_ALIASES matching is deliberately EXACT/phrase-only,
+        # never prefix-tolerant (see _contains_phrase_arabic_prefix_
+        # tolerant's own docstring), so only "سكري"/"السكري" (with ي) and
+        # bare "سكر" (no ال) were ever recognised; "السكر" — the ordinary
+        # way an agent says "diabetes" while describing a doctor's
+        # specialty (e.g. "تخصصهم امراض السكر والغدد الصماء") — silently
+        # matched nothing at all. "الغدد الصماء"/"أمراض الغدد الصماء"
+        # (endocrinology) is the other half of that same real specialty
+        # description and belongs to the same specialty for the same
+        # reason.
+        "سكري", "السكري", "سكر", "السكر", "مرض السكر", "عيادة السكر", "طبيب سكر",
+        "الغدد الصماء", "أمراض الغدد الصماء", "امراض الغدد الصماء",
     ],
     "Diabetic Educator": [
         "Diabetic Educator", "Diabetes Educator", "Diabetes Education",

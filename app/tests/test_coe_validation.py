@@ -2587,6 +2587,128 @@ def test_diabetes_need_plus_ordinary_appointment_is_diabetes_missed():
     assert by_coe["Diabetes"]["is_violation"] is True
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# Regression: an agent describing a doctor's SPECIALTY using the Diabetes
+# script's own wording ("امراض السكر والغدد الصماء") must never be read as
+# an explicit COE recommendation — see COE_NAME_MARKERS["Diabetes"]'s own
+# regression comment. That phrase is lifted verbatim from the Diabetes
+# script ("...بمركز التميز المتخصص في علاج أمراض السكر والغدد الصماء...")
+# but is ALSO the perfectly ordinary way to describe a doctor's specialty,
+# exactly like IBD's "الجهاز الهضمي" was already known to be — it was
+# previously listed as an unconditional COE_NAME_MARKERS entry, so any
+# agent turn naming it (with no مركز التميز mention at all) short-circuited
+# straight to explicit_agent_recommended=True.
+#
+# Real reported call: the patient asked for the endocrine-disease/weight-
+# loss-injection appointment; the agent named two doctors and described
+# their specialty as "امراض السكر والغدد الصماء" while never mentioning the
+# Diabetes Center of Excellence at all. The correct finding is "COE
+# recommendation required but missed", never a false PASS, and the flag
+# must never claim the patient HAS diabetes — only that the request maps to
+# the Diabetes COE via the approved endocrine-disease complaint category.
+# ═════════════════════════════════════════════════════════════════════════
+
+_DIABETES_SPECIALTY_DESCRIPTION_REGRESSION_TRANSCRIPT = (
+    "Patient: ابغى احجز موعد في قسم الغدد الصماء عشان ابر التخسيس ايش اسم الدكتور المتواجد بكرة\n"
+    "Agent: الدكاترة المتواجدين بكرة هم الدكتورة بدرية البيروتي والدكتورة اميرة بركات، "
+    "تخصصهم امراض السكر والغدد الصماء، مواعيد العمل من الساعة 9 صباحا حتى 5 مساء\n"
+)
+
+
+def test_diabetes_specialty_description_regression_reports_missed_not_recommended():
+    """The exact reported regression, from call 57C946E6-1F85-F111-B337-
+    000D3AA9D4A7's chat: describing two doctors' specialty as 'امراض السكر
+    والغدد الصماء' must never be read as the agent explicitly recommending
+    the Diabetes COE — the trigger must still fire (a genuine endocrine-
+    disease need was stated), but the recommendation itself must read as
+    missed, never falsely satisfied by the specialty description."""
+    c = call(_DIABETES_SPECIALTY_DESCRIPTION_REGRESSION_TRANSCRIPT)
+    assert classify_coe_trigger(c)["triggered"] is True
+    evaluations = build_coe_evaluations(c)
+    by_coe = {e["coe"]: e for e in evaluations}
+    diabetes = by_coe["Diabetes"]
+    assert diabetes["explicit_agent_recommended"] is False
+    assert diabetes["explicit_coe_recommendation_status"] == "not_applicable"
+    assert diabetes["human_agent_recommended_coe"] is False
+    assert diabetes["recommendation_status"] == "missed"
+    assert diabetes["missed_recommendation"] is True
+    assert diabetes["is_violation"] is True
+    # Grounded via the approved complaint category, never a fabricated
+    # diagnosis — the patient asked about a service/department, not "I
+    # have diabetes".
+    assert diabetes["complaint_category"] == "endocrine_disease"
+    assert diabetes["patient_need"] == "The patient described a complaint/request connected to the Diabetes COE."
+    assert "has diabetes" not in diabetes["patient_need"].lower()
+    assert diabetes["note"] is not None
+    assert "has diabetes" not in diabetes["note"].lower()
+
+
+def test_diabetes_specialty_description_regression_note_cites_patient_and_agent_text():
+    """The resulting QA note must cite BOTH the patient's actual request
+    and the agent's actual reply verbatim — never a generic/boilerplate
+    statement with no grounding in what was actually said."""
+    evaluations = build_coe_evaluations(call(_DIABETES_SPECIALTY_DESCRIPTION_REGRESSION_TRANSCRIPT))
+    by_coe = {e["coe"]: e for e in evaluations}
+    note = by_coe["Diabetes"]["note"]
+    assert note is not None
+    assert "ابغى احجز موعد في قسم الغدد الصماء عشان ابر التخسيس" in note
+    assert "تخصصهم امراض السكر والغدد الصماء" in note
+    assert "without explaining or recommending the Diabetes Center of Excellence" in note
+
+
+def test_diabetes_specialty_description_alone_is_not_a_coe_recommendation():
+    """The same bug class, generalised to a DIFFERENT call (distinct
+    patient request/agent reply from the reported regression): an ordinary
+    specialty description alone must never satisfy the recommendation
+    requirement, in any call."""
+    transcript = (
+        "Patient: عندي مشكلة في السكر من فترة وعايزة اتابع\n"
+        "Agent: تمام، هحجزلك عند دكتورة تخصصها امراض السكر والغدد الصماء بكرة الساعة 4\n"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    diabetes = by_coe["Diabetes"]
+    assert diabetes["explicit_agent_recommended"] is False
+    assert diabetes["recommendation_status"] == "missed"
+    assert diabetes["is_violation"] is True
+
+
+def test_diabetes_genuine_coe_recommendation_still_passes():
+    """A genuine explicit Diabetes COE recommendation (mentioning مركز
+    التميز, not just the bare specialty) must still PASS — the fix must
+    never make a real recommendation unrecognisable."""
+    transcript = (
+        "Patient: ابغى احجز موعد في قسم الغدد الصماء عشان ابر التخسيس\n"
+        "Agent: هحجزلك في مركز التميز المتخصص في علاج امراض السكر والغدد الصماء بكرة\n"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    diabetes = by_coe["Diabetes"]
+    assert diabetes["explicit_agent_recommended"] is True
+    assert diabetes["human_agent_recommended_coe"] is True
+    assert diabetes["recommendation_status"] == "pass"
+    assert diabetes["missed_recommendation"] is False
+    assert diabetes["is_violation"] is False
+
+
+def test_diabetes_full_script_recommendation_still_passes():
+    """The complete, official Diabetes COE script (DEFAULT_SCRIPTS_AR) —
+    which itself contains the same "امراض السكر والغدد الصماء" wording —
+    must still be recognised as an explicit recommendation; removing that
+    phrase from COE_NAME_MARKERS must never break the genuinely-explicit,
+    gated script-similarity path it was always meant to fall back to."""
+    transcript = (
+        "Patient: ابغى احجز موعد في قسم الغدد الصماء عشان ابر التخسيس\n"
+        f"Agent: {DEFAULT_SCRIPTS_AR['Diabetes']}\n"
+    )
+    evaluations = build_coe_evaluations(call(transcript))
+    by_coe = {e["coe"]: e for e in evaluations}
+    diabetes = by_coe["Diabetes"]
+    assert diabetes["explicit_agent_recommended"] is True
+    assert diabetes["recommendation_status"] == "pass"
+    assert diabetes["is_violation"] is False
+
+
 def test_campaign_text_alone_does_not_satisfy_human_agent_requirement():
     """SUPERSEDED (campaign-relevance work) — a bare campaign click with no
     substantive patient inquiry at all afterward (only an ordinary agent

@@ -804,6 +804,35 @@ async def infer_overall_scoring(
 #   Pydantic validation.  No LLM call — pure Python merge.
 # ---------------------------------------------------------------------------
 
+def _normalize_flag_type(flag: dict) -> dict:
+    """The ComplianceFlag schema's `type` field only ever accepts
+    {C2C, C2B, C2Com, NC} (see app.models.output.FlagType) — "positive" is
+    a valid SEVERITY value instead (app.models.output.Severity), and every
+    focused-evaluation prompt shows the LLM "positive" as an example
+    severity ("severity": "<critical | positive>", see qa_prompt.py). The
+    offer-evaluation prompt specifically also shows "positive" as an
+    example TYPE value ("type": "<C2B | NC | positive>"), but this mix-up
+    is not unique to that one node — any of the behavioral/compliance/
+    reservation/offer/script/scoring LLM calls can (and in production has)
+    echoed "positive" into `type` instead of `severity`. Real regression:
+    call 57C946E6-1F85-F111-B337-000D3AA9D4A7 crashed aggregate_results'
+    Pydantic validation with type='positive' from a NON-offer flag list,
+    because the fix used to be applied only to offer_flags.
+
+    Mapped uniformly, regardless of which sub-evaluation produced the
+    flag, so this can't recur just because a different node's LLM makes
+    the same mix-up: type -> "NC" (a positive/no-violation finding is
+    reported as an informational NC-shaped flag), severity -> "positive"
+    (the value the LLM actually meant). A flag whose type is already
+    valid is returned unchanged (never copied unnecessarily)."""
+    if flag.get("type") != "positive":
+        return flag
+    flag = dict(flag)
+    flag["type"] = "NC"
+    flag["severity"] = "positive"
+    return flag
+
+
 async def aggregate_results(state: AgentState) -> dict:
     """
     Merge sub-evaluation results into a single QAAnalysisResult-compatible dict.
@@ -837,17 +866,7 @@ async def aggregate_results(state: AgentState) -> dict:
     doctor_scope  = state.get("doctor_scope_validation") or {}
     coe           = state.get("coe_validation") or {}
 
-    # Normalise offer_flags: the offer node uses "C2B"/"NC"/"positive" as type
-    # but the ComplianceFlag schema expects type in {C2Com,C2C,C2B,NC}.
-    # Map "positive" type to "NC" with severity "positive" so Pydantic validates.
-    _raw_offer_flags: list[dict] = offer.get("offer_flags", [])
-    _offer_flags: list[dict] = []
-    for f in _raw_offer_flags:
-        flag = dict(f)
-        if flag.get("type") == "positive":
-            flag["type"] = "NC"
-            flag["severity"] = "positive"
-        _offer_flags.append(flag)
+    _offer_flags: list[dict] = offer.get("offer_flags", [])
 
     # Persist masked C2B findings through the existing DWH flag path. Both
     # comparisons were already completed deterministically — bank and
@@ -915,10 +934,16 @@ async def aggregate_results(state: AgentState) -> dict:
         + scoring.get("compliance_flags", [])
     )
 
-    # Deduplicate flags by (type + transcript_excerpt[:80])
+    # Deduplicate flags by (type + transcript_excerpt[:80]) — every flag is
+    # normalised (see _normalize_flag_type) BEFORE the dedup key is built,
+    # so a "positive"-typed flag from ANY source (not just the offer node)
+    # is corrected before it ever reaches Pydantic validation below, and so
+    # two flags that only differ by this mix-up still dedup against a
+    # genuinely equivalent already-normalised "NC" flag from another source.
     seen: set[tuple] = set()
     deduped_flags: list[dict] = []
-    for flag in all_flags:
+    for raw_flag in all_flags:
+        flag = _normalize_flag_type(raw_flag)
         key = (flag.get("type"), flag.get("transcript_excerpt", "")[:80])
         if key not in seen:
             seen.add(key)
