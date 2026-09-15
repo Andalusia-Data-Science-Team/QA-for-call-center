@@ -648,6 +648,12 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_edge("skip_doctor_validation", "loc_bank_ready")
     builder.add_conditional_edges(
         "loc_bank_ready",
+        _booking_router,
+        {
+            "booking":      "extract_appointment_details",
+            "skip_booking": "inference_gate",
+        },
+    )
     # Identity/IQAMA requests are insurance intent unless the patient explicitly
     # selected cash or stated they are uninsured. The detector always runs; a
     # successful check returns to the unchanged booking router.
