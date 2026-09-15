@@ -30,6 +30,11 @@ class AgentState(TypedDict, total=False):
     service_eval: dict[str, Any]      # from infer_service_evaluation
     package_eval: dict[str, Any]      # from infer_package_evaluation
     script_eval: dict[str, Any]       # from infer_script_matching
+    crm_lead_lookup: dict[str, Any]    # from validate_crm_lead
+    crm_lead_eval: dict[str, Any]      # C2B findings from validate_crm_lead
+    is_faq_escalation: Optional[bool]  # from detect_faq_escalation
+    faq_lookup: dict[str, Any]         # from validate_faq_record
+    faq_eval: dict[str, Any]           # compliance findings from FAQ validation
     scoring_eval: dict[str, Any]      # from infer_overall_scoring
 
     # ── Per-node usage tracking (list so all 4 LLM calls are preserved) ───

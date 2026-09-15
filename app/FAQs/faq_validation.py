@@ -33,7 +33,6 @@ FAQ_RULES = {
 }
 
 
-
 _ARABIC_CHAR_TRANSLATION = str.maketrans(
     {
         "أ": "ا",
@@ -119,9 +118,29 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term in text for term in terms)
 
 
+def _agent_message_text(transcript: str) -> str:
+    """Return labelled agent messages, falling back to unlabelled text."""
+    agent_messages: list[str] = []
+    labelled_message_seen = False
+    for line in str(transcript or "").splitlines():
+        match = re.match(r"^\s*([^:：]+)[:：]\s*(.*)$", line)
+        if not match:
+            continue
+        role, content = match.groups()
+        normalized_role = normalize_faq_text(role)
+        if normalized_role in {"agent", "user", "csr", "advisor", "الموظف"}:
+            agent_messages.append(content)
+        if normalized_role in {
+            "agent", "user", "csr", "advisor", "الموظف",
+            "patient", "relation", "customer", "client", "bot",
+        }:
+            labelled_message_seen = True
+    return "\n".join(agent_messages) if labelled_message_seen else transcript
+
+
 def detect_faq_escalation(transcript: str) -> bool:
     """Detect a claim that a request was sent to a responsible department."""
-    text = normalize_faq_text(transcript)
+    text = normalize_faq_text(_agent_message_text(transcript))
     strong_action = _contains_any(text, _RAISE_OR_ESCALATE_TERMS)
     transfer_action = _contains_any(text, _SEND_OR_TRANSFER_TERMS)
     has_request = _contains_any(text, _REQUEST_TERMS)
@@ -252,7 +271,7 @@ def normalize_faq_evaluation(data: dict[str, Any]) -> dict[str, Any]:
         check for check in (data.get("field_checks") or []) if isinstance(check, dict)
     ]
     normalized_flags: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
 
     def add_flag(
         rule_id: str,
@@ -267,10 +286,11 @@ def normalize_faq_evaluation(data: dict[str, Any]) -> dict[str, Any]:
         field_name = str(field or "FAQ record").strip()
         evidence = str(excerpt or "N/A").strip() or "N/A"
         explanation = str(reason or "does not match the call facts").strip()
+        normalized_evidence = normalize_faq_text(evidence)
         key = (
-            resolved_rule,
-            normalize_faq_text(field_name),
-            normalize_faq_text(evidence),
+            (resolved_rule, normalize_faq_text(field_name), normalized_evidence)
+            if evidence.upper() == "N/A"
+            else (resolved_rule, normalized_evidence)
         )
         if key in seen:
             return

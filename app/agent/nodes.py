@@ -38,6 +38,7 @@ from sqlalchemy import create_engine, text as sa_text
 from arabic_reshaper import reshape
 
 from app.agent.state import AgentState
+from app.config import settings
 from app.models.output import QAAnalysisResult
 from app.prompts.qa_prompt import (
     SYSTEM_PROMPT,
@@ -51,6 +52,8 @@ from app.prompts.qa_prompt import (
     build_script_prompt,
     build_scoring_prompt,
     build_user_prompt,   # kept for legacy path
+    build_crm_lead_validation_prompt,
+    build_faq_validation_prompt,
 )
 from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
@@ -60,6 +63,18 @@ from app.services.text_helpers import (
     _arabic_like_pattern, 
     _strip_markdown_fences,
     _norm_score,
+)
+from app.service_hub.crm_leads_validation import (
+    fetch_crm_lead,
+    missing_lead_evaluation,
+    matched_crm_lead_attributes,
+    normalize_crm_lead_evaluation,
+)
+from app.FAQs.faq_validation import (
+    detect_faq_escalation as transcript_has_faq_escalation,
+    lookup_faq_record,
+    missing_faq_evaluation,
+    normalize_faq_evaluation,
 )
 
 logger = logging.getLogger(__name__)
@@ -291,62 +306,153 @@ def _escape_json_string_controls(payload: str) -> str:
     return "".join(repaired)
 
 
+def _summarize_llm_usage(
+    node_name: str, request_usages: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Aggregate all billed generations made by one graph node."""
+    prompt_tokens = sum(
+        int(item.get("prompt_tokens") or item.get("input_tokens") or 0)
+        for item in request_usages
+    )
+    completion_tokens = sum(
+        int(item.get("completion_tokens") or item.get("output_tokens") or 0)
+        for item in request_usages
+    )
+    costs = [item.get("cost_usd") for item in request_usages]
+    cost_is_complete = bool(costs) and all(cost is not None for cost in costs)
+    return {
+        "node": node_name,
+        "provider": request_usages[-1].get("provider") if request_usages else None,
+        "model": request_usages[-1].get("model") if request_usages else None,
+        "requests": len(request_usages),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cost_usd": (
+            round(sum(float(cost) for cost in costs), 12)
+            if cost_is_complete
+            else None
+        ),
+        "cost_complete": cost_is_complete,
+        "details": request_usages,
+    }
+
+
 async def _focused_llm_call(
     node_name: str,
     call_id: str,
     user_prompt: str,
     llm_client: LLMClient,
     state: AgentState,
+    max_tokens: int | None = None,
 ) -> tuple[dict | None, dict | None]:
-    """
-    Internal helper: call the LLM, log usage, parse JSON.
-    Returns (parsed_dict, error_dict).  Exactly one of the two will be None.
-    """
-    try:
-        raw_text, usage = await llm_client.complete(SYSTEM_PROMPT, user_prompt)
-    except Exception as exc:
-        logger.error("%s LLM call failed | call_id=%s | %s", node_name, call_id, exc)
-        return None, {
-            "error": f"{node_name}: LLM call failed: {exc}",
-            "error_node": node_name,
-            "node_trace": _trace(state, node_name),
-        }
+    """Call the LLM and retry generation when its JSON is invalid or truncated."""
+    parse_attempts = settings.LLM_JSON_PARSE_RETRIES + 1
+    prompt = user_prompt
+    last_error: Exception | None = None
+    last_repair_error: Exception | None = None
+    request_usages: list[dict[str, Any]] = []
 
-    logger.debug(
-        "%s | call_id=%s latency=%.0fms tokens_in=%s tokens_out=%s",
-        node_name,
-        call_id,
-        usage.get("latency_ms", 0),
-        usage.get("input_tokens") or usage.get("prompt_tokens"),
-        usage.get("output_tokens") or usage.get("completion_tokens"),
-    )
+    for parse_attempt in range(1, parse_attempts + 1):
+        try:
+            if max_tokens is None:
+                raw_text, usage = await llm_client.complete(SYSTEM_PROMPT, prompt)
+            else:
+                raw_text, usage = await llm_client.complete(
+                    SYSTEM_PROMPT, prompt, max_tokens=max_tokens
+                )
+        except Exception as exc:
+            logger.error("%s LLM call failed | call_id=%s | %s", node_name, call_id, exc)
+            error_result = {
+                "error": f"{node_name}: LLM call failed: {exc}",
+                "error_node": node_name,
+                "node_trace": _trace(state, node_name),
+            }
+            if request_usages:
+                error_result["usage_list"] = [
+                    _summarize_llm_usage(node_name, request_usages)
+                ]
+            return None, error_result
 
-    clean = _strip_markdown_fences(raw_text)
-    try:
-        data: dict = json.loads(clean)
-    except json.JSONDecodeError as exc:
-        # Models occasionally emit a raw newline inside a JSON string. Escape
-        # only those invalid control characters before failing the QA run.
+        request_usage = dict(usage)
+        request_usage["generation_attempt"] = parse_attempt
+        request_usages.append(request_usage)
+
+        logger.debug(
+            "%s | call_id=%s latency=%.0fms tokens_in=%s tokens_out=%s finish_reason=%s",
+            node_name,
+            call_id,
+            usage.get("latency_ms", 0),
+            usage.get("input_tokens") or usage.get("prompt_tokens"),
+            usage.get("output_tokens") or usage.get("completion_tokens"),
+            usage.get("finish_reason"),
+        )
+
+        clean = _strip_markdown_fences(raw_text)
+        try:
+            data = json.loads(clean)
+            if not isinstance(data, dict):
+                raise ValueError("response is not a JSON object")
+            data["_usage"] = _summarize_llm_usage(node_name, request_usages)
+            return data, None
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+
         try:
             data = json.loads(_escape_json_string_controls(clean))
             if not isinstance(data, dict):
                 raise ValueError("repaired response is not a JSON object")
             logger.warning(
                 "%s JSON repaired | call_id=%s original_error=%s",
-                node_name, call_id, exc,
+                node_name, call_id, last_error,
             )
+            data["_usage"] = _summarize_llm_usage(node_name, request_usages)
+            return data, None
         except (json.JSONDecodeError, ValueError) as repair_exc:
-            logger.error(
-                "%s JSON parse error | call_id=%s snippet=%s | %s",
-                node_name, call_id, raw_text[:300], exc,
-            )
-            return None, {
-                "error": f"{node_name}: LLM returned invalid JSON: {exc}; repair failed: {repair_exc}",
-                "error_node": node_name,
-                "node_trace": _trace(state, node_name),
-            }
+            last_repair_error = repair_exc
 
-    return data, None
+        if parse_attempt < parse_attempts:
+            logger.warning(
+                "%s invalid JSON; regenerating | call_id=%s parse_attempt=%d/%d "
+                "chars=%d tokens_out=%s finish_reason=%s error=%s",
+                node_name,
+                call_id,
+                parse_attempt,
+                parse_attempts,
+                len(raw_text),
+                usage.get("output_tokens") or usage.get("completion_tokens"),
+                usage.get("finish_reason"),
+                last_error,
+            )
+            prompt = (
+                user_prompt
+                + "\n\nYour previous response was invalid or truncated JSON. "
+                "Regenerate the entire response as one complete, concise JSON object. "
+                "Close every string, array, and object. Return no markdown or commentary."
+            )
+            continue
+
+        logger.error(
+            "%s JSON parse error | call_id=%s chars=%d tokens_out=%s "
+            "finish_reason=%s response_tail=%s | %s",
+            node_name,
+            call_id,
+            len(raw_text),
+            usage.get("output_tokens") or usage.get("completion_tokens"),
+            usage.get("finish_reason"),
+            raw_text[-500:],
+            last_error,
+        )
+
+    return None, {
+        "error": (
+            f"{node_name}: LLM returned invalid JSON after {parse_attempts} "
+            f"generation attempt(s): {last_error}; repair failed: {last_repair_error}"
+        ),
+        "error_node": node_name,
+        "node_trace": _trace(state, node_name),
+        "usage_list": [_summarize_llm_usage(node_name, request_usages)],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +488,7 @@ async def infer_behavioral_evaluation(
 
     return {
         "behavioral_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_behavioral_evaluation"),
     }
 
@@ -423,7 +529,7 @@ async def infer_compliance_evaluation(
 
     return {
         "compliance_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_compliance_evaluation"),
     }
 
@@ -484,7 +590,7 @@ async def infer_reservation_evaluation(
 
     return {
         "reservation_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_reservation_evaluation"),
     }
 
@@ -1198,7 +1304,7 @@ async def infer_offer_evaluation(
 
     return {
         "offer_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_offer_evaluation"),
     }
 
@@ -1237,6 +1343,7 @@ async def infer_service_evaluation(
 
     Result stored in state["service_eval"].
     """
+    
     call = state["call"]
 
     user_prompt = build_service_prompt(
@@ -1283,7 +1390,7 @@ async def infer_service_evaluation(
 
     return {
         "service_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_service_evaluation"),
     }
 
@@ -1313,6 +1420,7 @@ async def infer_package_evaluation(
 
     Result stored in state["package_eval"].
     """
+    
     call = state["call"]
 
     user_prompt = build_package_prompt(
@@ -1340,7 +1448,7 @@ async def infer_package_evaluation(
 
     return {
         "package_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_package_evaluation"),
     }
 
@@ -1377,16 +1485,202 @@ async def infer_script_matching(
 
     return {
         "script_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_script_matching"),
     } """
 
 
 # ---------------------------------------------------------------------------
+# CRM leads validation — fetches the lead and converts every detected mismatch
+# into a C2B finding before scoring and aggregation.
+# ---------------------------------------------------------------------------
+
+async def validate_crm_lead(
+    state: AgentState, llm_client: LLMClient
+) -> dict:
+    """Fetch and validate the CRM lead associated with the retrieved chat."""
+    call = state["call"]
+    lookup = fetch_crm_lead(call.Patient_Phone, call.call_date)
+    status = lookup.get("status")
+    logger.info(
+        "validate_crm_lead | call_id=%s phone=%s report_date=%s crm_lead_status=%s",
+        call.call_id,
+        call.Patient_Phone,
+        call.call_date,
+        status,
+    )
+
+    if status == "unavailable":
+        logger.warning(
+            "validate_crm_lead | call_id=%s unavailable=%s",
+            call.call_id,
+            lookup.get("message"),
+        )
+        evaluation = {
+            "crm_lead_status": "unavailable",
+            "summary": lookup.get("message"),
+            "field_checks": [],
+            "crm_leads_flags": [],
+        }
+        return {
+            "crm_lead_lookup": lookup,
+            "crm_lead_eval": evaluation,
+            "node_trace": _trace(state, "validate_crm_lead"),
+        }
+
+    if status == "not_found":
+        evaluation = missing_lead_evaluation(lookup.get("message", "CRM lead not found."))
+        return {
+            "crm_lead_lookup": lookup,
+            "crm_lead_eval": evaluation,
+            "node_trace": _trace(state, "validate_crm_lead"),
+        }
+
+    user_prompt = build_crm_lead_validation_prompt(
+        call,
+        lookup,
+        appointment_details=state.get("appointment_details"),
+        appointment_verification=state.get("appointment_verification"),
+        is_booking_intent=bool(state.get("is_booking_intent")),
+    )
+    data, err = await _focused_llm_call(
+        "validate_crm_lead", call.call_id, user_prompt, llm_client, state,
+        max_tokens=settings.CRM_LEADS_LLM_MAX_TOKENS,
+    )
+    if err:
+        return err
+
+    evaluation = normalize_crm_lead_evaluation(data)
+    matched_attributes = matched_crm_lead_attributes(
+        evaluation,
+        lookup.get("record") or {},
+    )
+    logger.info(
+        "validate_crm_lead | call_id=%s phone=%s report_date=%s "
+        "status=%s flags=%d matched_attributes=%s",
+        call.call_id,
+        call.Patient_Phone,
+        call.call_date,
+        evaluation.get("crm_lead_status"),
+        len(evaluation.get("crm_leads_flags", [])),
+        json.dumps(matched_attributes, ensure_ascii=False, default=str),
+    )
+    return {
+        "crm_lead_lookup": lookup,
+        "crm_lead_eval": evaluation,
+        "usage_list": [data.pop("_usage", {})],
+        "node_trace": _trace(state, "validate_crm_lead"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# FAQ escalation validation
+# ---------------------------------------------------------------------------
+
+async def detect_faq_escalation(state: AgentState) -> dict:
+    """Route only chats that claim a request was sent to a responsible team."""
+    call = state["call"]
+    detected = transcript_has_faq_escalation(call.transcript)
+    return {
+        "is_faq_escalation": detected,
+        "faq_eval": {
+            "faq_status": "pending" if detected else "skipped",
+            "summary": (
+                "FAQ validation required."
+                if detected
+                else "No FAQ escalation claim detected."
+            ),
+            "field_checks": [],
+            "faq_flags": [],
+        },
+        "node_trace": _trace(state, "detect_faq_escalation"),
+    }
+
+
+async def validate_faq_record(
+    state: AgentState,
+    llm_client: LLMClient,
+    csv_path: Path | None = None,
+) -> dict:
+    """Lookup and validate the same-day FAQ record for an escalation claim."""
+    call = state["call"]
+    lookup = lookup_faq_record(
+        csv_path=csv_path,
+        patient_phone=call.Patient_Phone,
+        call_date=call.call_date,
+        agent_name=call.agent_name,
+        agent_email=call.agent_email,
+    )
+    status = lookup.get("status")
+    logger.info(
+        "validate_faq_record | call_id=%s status=%s faq_id=%s",
+        call.call_id,
+        status,
+        (lookup.get("match") or {}).get("faq_id"),
+    )
+
+    if status == "unavailable":
+        return {
+            "faq_lookup": lookup,
+            "error": f"validate_faq_record: {lookup.get('message', 'FAQ CSV unavailable.')}",
+            "error_node": "validate_faq_record",
+            "node_trace": _trace(state, "validate_faq_record"),
+        }
+
+    if status == "not_found":
+        evaluation = missing_faq_evaluation(
+            lookup.get("message", "No same-day FAQ record found.")
+        )
+        return {
+            "faq_lookup": lookup,
+            "faq_eval": evaluation,
+            "node_trace": _trace(state, "validate_faq_record"),
+        }
+
+    if status != "found":
+        return {
+            "faq_lookup": lookup,
+            "error": f"validate_faq_record: unsupported FAQ lookup status {status!r}",
+            "error_node": "validate_faq_record",
+            "node_trace": _trace(state, "validate_faq_record"),
+        }
+
+    user_prompt = build_faq_validation_prompt(
+        call,
+        lookup,
+        compliance_pillars=state.get("compliance_pillars", ""),
+    )
+    data, err = await _focused_llm_call(
+        "validate_faq_record",
+        call.call_id,
+        user_prompt,
+        llm_client,
+        state,
+    )
+    if err:
+        return err
+
+    evaluation = normalize_faq_evaluation(data)
+    usage = data.pop("_usage", {})
+    logger.info(
+        "validate_faq_record | call_id=%s status=%s faq_id=%s flags=%d",
+        call.call_id,
+        evaluation.get("faq_status"),
+        (lookup.get("match") or {}).get("faq_id"),
+        len(evaluation.get("faq_flags", [])),
+    )
+    return {
+        "faq_lookup": lookup,
+        "faq_eval": evaluation,
+        "usage_list": [usage],
+        "node_trace": _trace(state, "validate_faq_record"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Node D – infer_overall_scoring
-#   Focused LLM call: synthesise behavioral + compliance + script results
-#   into the final overall_assessment + scores.
-#   Runs AFTER the three parallel nodes complete (fan-in barrier).
+#   Synthesises behavioral, compliance, reservation, script, and CRM results
+#   into the final overall assessment and classification.
 # ---------------------------------------------------------------------------
 
 async def infer_overall_scoring(
@@ -1405,6 +1699,8 @@ async def infer_overall_scoring(
     compliance_summary = json.dumps(state.get("compliance_eval") or {}, ensure_ascii=False)    
     reservation_summary = json.dumps(state.get("reservation_eval") or {}, ensure_ascii=False)
     script_summary     = json.dumps(state.get("script_eval") or {},     ensure_ascii=False)
+    crm_lead_summary   = json.dumps(state.get("crm_lead_eval") or {},   ensure_ascii=False)
+    faq_summary        = json.dumps(state.get("faq_eval") or {},        ensure_ascii=False)
 
     user_prompt = build_scoring_prompt(
         call,
@@ -1412,6 +1708,8 @@ async def infer_overall_scoring(
         behavioral_summary=behavioral_summary,
         compliance_summary=compliance_summary,
         reservation_summary=reservation_summary,
+        crm_lead_summary=crm_lead_summary,
+        faq_summary=faq_summary,
         script_summary=script_summary,
     )
     logger.debug(
@@ -1420,14 +1718,15 @@ async def infer_overall_scoring(
     )
 
     data, err = await _focused_llm_call(
-        "infer_overall_scoring", call.call_id, user_prompt, llm_client, state
+        "infer_overall_scoring", call.call_id, user_prompt, llm_client, state,
+        max_tokens=settings.OVERALL_SCORING_LLM_MAX_TOKENS,
     )
     if err:
         return err
 
     return {
         "scoring_eval": data,
-        "usage_list": [data.get("_usage", {})],
+        "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_overall_scoring"),
     }
 
@@ -1508,6 +1807,8 @@ async def aggregate_results(state: AgentState) -> dict:
     reservation = state.get("reservation_eval") or {}
     offer       = state.get("offer_eval")       or {}
     service     = state.get("service_eval")     or {}
+    crm_lead    = state.get("crm_lead_eval")    or {}
+    faq         = state.get("faq_eval")         or {}
     package     = state.get("package_eval")     or {}
     script      = state.get("script_eval")      or {}
     scoring     = state.get("scoring_eval")     or {}
@@ -1550,6 +1851,8 @@ async def aggregate_results(state: AgentState) -> dict:
         + compliance.get("compliance_flags", [])
         + reservation.get("reservation_flags", [])
         + _offer_flags
+        + crm_lead.get("crm_leads_flags", [])
+        + faq.get("faq_flags", [])
         + _service_flags
         + _package_flags
         + script.get("script_flags", [])
@@ -1558,11 +1861,17 @@ async def aggregate_results(state: AgentState) -> dict:
 
     all_flags = _filter_unsubstantiated_reservation_flags(all_flags, state)
 
-    # Deduplicate flags by (type + transcript_excerpt[:80])
+    # Keep distinct metadata findings when no transcript excerpt is available.
     seen: set[tuple] = set()
     deduped_flags: list[dict] = []
     for flag in all_flags:
-        key = (flag.get("type"), flag.get("transcript_excerpt", "")[:80])
+        excerpt = str(flag.get("transcript_excerpt") or "").strip()
+        evidence_key = (
+            str(flag.get("description") or "")[:80]
+            if not excerpt or excerpt.upper() == "N/A"
+            else excerpt[:80]
+        )
+        key = (flag.get("type"), evidence_key)
         if key not in seen:
             seen.add(key)
             deduped_flags.append(flag)
@@ -1709,6 +2018,7 @@ async def save_to_database(state: AgentState) -> dict:
     node trace rather than crashing the pipeline — the caller already has
     the in-memory result and should not lose it due to a transient DB issue.
     """
+    
     result = state.get("result")
     call   = state.get("call")
 

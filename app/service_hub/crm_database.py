@@ -48,6 +48,7 @@ _ALLOW_INTERACTIVE = os.environ.get("CRM_ALLOW_INTERACTIVE", "1") != "0"
 SQL_COPT_SS_ACCESS_TOKEN = 1256
  
 _token_cache: dict = {"token": None, "expires_at": 0.0}
+_token_caches: dict[str, dict] = {}
 _token_lock = threading.Lock()
 # Set to True when a 28000/connection-expired error is detected so _get_token()
 # forces MSAL to do a real network refresh instead of returning the stale
@@ -64,15 +65,24 @@ _doctor_lock = threading.Lock()
 _msal_atexit_registered = False
  
  
-def _crm_host() -> str:
+def _crm_host(server: Optional[str] = None) -> str:
     # "org2f45e702.crm4.dynamics.com,5558" → "org2f45e702.crm4.dynamics.com"
-    return (CRM_SERVER or "").split(",")[0].strip()
+    return (server if server is not None else CRM_SERVER or "").split(",")[0].strip()
  
  
-def _is_configured() -> bool:
+def _is_configured(server: Optional[str] = None) -> bool:
     # Server is the only hard requirement — password is optional when a cached
     # refresh token or interactive login is used.
-    return bool(CRM_SERVER and _crm_host())
+    target_server = server if server is not None else CRM_SERVER
+    return bool(target_server and _crm_host(target_server))
+
+
+def _token_state(server: Optional[str] = None) -> dict:
+    """Return an in-memory token cache scoped to the Dynamics host/audience."""
+    host = _crm_host(server)
+    if host == _crm_host(CRM_SERVER):
+        return _token_cache
+    return _token_caches.setdefault(host, {"token": None, "expires_at": 0.0})
  
  
 def _load_msal_cache(msal_mod):
@@ -103,7 +113,10 @@ def _load_msal_cache(msal_mod):
     return cache, _persist
  
  
-def _get_token(force_refresh: bool = False) -> Optional[str]:
+def _get_token(
+    force_refresh: bool = False,
+    server: Optional[str] = None,
+) -> Optional[str]:
     """Acquire a bearer token for the CRM TDS endpoint. Caches in memory until near expiry.
  
     Args:
@@ -113,8 +126,10 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
             'Connection expired' error to guarantee a brand-new access token.
     """
     global _force_token_refresh
-    if not _is_configured():
+    target_server = server if server is not None else CRM_SERVER
+    if not _is_configured(target_server):
         return None
+    token_state = _token_state(target_server)
  
     now = time.time()
     # Consume the module-level force flag (set by _run_query_with_retry on
@@ -123,13 +138,13 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
  
     with _token_lock:
         _force_token_refresh = False  # consumed — reset immediately
-        if not effective_force and _token_cache["token"] and _token_cache["expires_at"] > now + 60:
-            return _token_cache["token"]
+        if not effective_force and token_state["token"] and token_state["expires_at"] > now + 60:
+            return token_state["token"]
  
         import msal
  
         authority = f"https://login.microsoftonline.com/{CRM_TENANT}"
-        scope = [f"https://{_crm_host()}/.default"]
+        scope = [f"https://{_crm_host(target_server)}/.default"]
  
         cache, persist = _load_msal_cache(msal)
         app = msal.PublicClientApplication(
@@ -173,13 +188,14 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
             raise RuntimeError(f"CRM auth failed: {err}")
  
         persist()
-        _token_cache["token"] = result["access_token"]
-        _token_cache["expires_at"] = now + int(result.get("expires_in", 3599))
-        return _token_cache["token"]
+        token_state["token"] = result["access_token"]
+        token_state["expires_at"] = now + int(result.get("expires_in", 3599))
+        return token_state["token"]
  
  
-def _get_connection() -> pyodbc.Connection:
-    token = _get_token()
+def _get_connection(server: Optional[str] = None) -> pyodbc.Connection:
+    target_server = server if server is not None else CRM_SERVER
+    token = _get_token(server=target_server)
     if not token:
         raise RuntimeError("CRM not configured")
  
@@ -195,10 +211,10 @@ def _get_connection() -> pyodbc.Connection:
     # execute, surfacing as "Communication link failure" on SELECT 1.
     # Connection Timeout=120 must also appear inside the connection string —
     # the pyodbc timeout= kwarg is a connect-phase hint only on some drivers.
-    org = _crm_host().split(".")[0]
+    org = _crm_host(target_server).split(".")[0]
     conn_str = (
         f"DRIVER={{{DB_DRIVER}}};"
-        f"SERVER={CRM_SERVER};"
+        f"SERVER={target_server};"
         f"DATABASE={org};"
         f"Encrypt=yes;"
         f"TrustServerCertificate=no;"
@@ -254,10 +270,16 @@ _QUERY_VARIANTS = [
 ]
  
  
-def _run_query_with_retry(query: str, max_attempts: int = 3, params: dict | None = None) -> list[dict]:
+def _run_query_with_retry(
+    query: str,
+    max_attempts: int = 3,
+    params: dict | None = None,
+    server: Optional[str] = None,
+) -> list[dict]:
     """Open a fresh connection and execute the query, retrying on transient errors.
 
     Args:
+        server:      Optional CRM TDS server override; defaults to CRM_SERVER.
         query:       SQL string, may contain pyodbc named placeholders (:name).
         max_attempts: Number of retry attempts on transient errors.
         params:      Optional dict of bind parameters, e.g. {"bu_name": "AHJ"}.
@@ -276,7 +298,7 @@ def _run_query_with_retry(query: str, max_attempts: int = 3, params: dict | None
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
-            with _get_connection() as conn:
+            with _get_connection(server=server) as conn:
                 cursor = conn.cursor()
                 if _param_values:
                     cursor.execute(query, _param_values)
@@ -307,18 +329,20 @@ def _run_query_with_retry(query: str, max_attempts: int = 3, params: dict | None
                 global _force_token_refresh
                 _force_token_refresh = True        # tell _get_token() to force-refresh
                 with _token_lock:
-                    _token_cache["token"] = None
-                    _token_cache["expires_at"] = 0.0
+                    token_state = _token_state(server)
+                    token_state["token"] = None
+                    token_state["expires_at"] = 0.0
             if not transient or attempt == max_attempts:
                 raise
             backoff = 2 ** (attempt - 1)
-            print(f"[CRM] query attempt {attempt} failed ({e}); retrying in {backoff}s")
+            print(f"[CRM] transient query failure on attempt {attempt} ({e}); retrying in {backoff}s")
             time.sleep(backoff)
             # For non-auth transient errors, still clear the token as belt-and-braces.
             if not is_auth_err:
                 with _token_lock:
-                    _token_cache["token"] = None
-                    _token_cache["expires_at"] = 0.0
+                    token_state = _token_state(server)
+                    token_state["token"] = None
+                    token_state["expires_at"] = 0.0
     if last_err:
         raise last_err
     return []

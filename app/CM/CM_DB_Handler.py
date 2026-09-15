@@ -71,8 +71,16 @@ class CMDatabaseHandler:
         
         self.connection = None
     
-    def connect(self):
-        """Establish connection to SQL Server"""
+    def connect(self, connection_timeout: int = 30, query_timeout: int = 120):
+        """
+        Establish connection to SQL Server.
+
+        Args:
+            connection_timeout: Seconds to wait for the initial TCP connection (default 30).
+            query_timeout:      Seconds to wait for a query to complete (default 120).
+                                Increase this when the server uses linked-server queries
+                                that fan out to a remote host.
+        """
         try:
             if self.username and self.password:
                 # SQL Server Authentication
@@ -82,6 +90,7 @@ class CMDatabaseHandler:
                     f'Database={self.database};'
                     f'UID={self.username};'
                     f'PWD={self.password};'
+                    f'Connection Timeout={connection_timeout};'
                 )
             else:
                 # Windows Authentication
@@ -90,9 +99,11 @@ class CMDatabaseHandler:
                     f'Server={self.server};'
                     f'Database={self.database};'
                     f'Trusted_Connection=yes;'
+                    f'Connection Timeout={connection_timeout};'
                 )
-            
-            self.connection = pyodbc.connect(connection_string)
+
+            self.connection = pyodbc.connect(connection_string, timeout=connection_timeout)
+            self.connection.timeout = query_timeout  # per-statement timeout
             print(f"✓ Connected to {self.server}.{self.database}")
             return True
         except Exception as e:
@@ -141,6 +152,10 @@ class CMDatabaseHandler:
             return df
         except Exception as e:
             print(f"✗ Query execution failed: {e}")
+            # Error 258 = TCP wait operation timed out.  This usually means the
+            # linked server referenced in the SQL file is unreachable from the
+            # target SQL Server instance.  Increase query_timeout in connect()
+            # or check the linked-server connectivity on the remote host.
             raise
     
     def save_to_excel(self, dataframe, output_file=None, sheet_name='Sheet1'):

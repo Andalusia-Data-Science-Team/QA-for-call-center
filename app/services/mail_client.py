@@ -14,9 +14,9 @@ except ImportError:
     SMTP_PORT = 587
     SENDER_EMAIL = "rafik.atallah@andalusiagroup.net"
     SMTP_USER = "andalusia\\rafik.atallah"
-    SMTP_PASSWORD = "refa2001"
-    USE_TLS = True
-    USE_SSL = False
+    SMTP_PASSWORD = "rafik2001"
+    USE_TLS = False
+    USE_SSL = True
 
 
 def build_html_body(body_text: str, review_link: str) -> str:

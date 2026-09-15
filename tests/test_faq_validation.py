@@ -1,7 +1,11 @@
+import asyncio
 import csv
+import json
 from pathlib import Path
 
 import pytest
+from app.agent import graph as agent_graph
+from app.agent import nodes as agent_nodes
 
 from app.FAQs.faq_validation import (
     detect_faq_escalation,
@@ -12,7 +16,10 @@ from app.FAQs.faq_validation import (
     normalize_faq_text,
 )
 from app.models.input import CallTranscript
-from app.prompts.qa_prompt import build_faq_validation_prompt
+from app.prompts.qa_prompt import (
+    build_faq_validation_prompt,
+    build_scoring_prompt,
+)
 
 
 FAQ_HEADERS = [
@@ -69,6 +76,7 @@ def test_detect_faq_escalation_accepts_semantic_phrase_variants(transcript):
     "transcript",
     [
         "Patient: أريد رفع التقرير الطبي",
+        "Patient: أريد رفع الطلب للقسم المختص\nAgent: حاضر",
         "Agent: تم تحويلك إلى قسم الحجز",
         "Agent: القسم المختص متاح من التاسعة",
     ],
@@ -216,6 +224,13 @@ def test_normalize_faq_evaluation_enforces_rules_and_deduplicates_evidence():
                     "transcript_excerpt": "فرع حي الجامعة",
                 },
             ],
+            "faq_flags": [
+                {
+                    "rule_id": "C2C_023",
+                    "description": "C2C_023: duplicated response mismatch.",
+                    "transcript_excerpt": "لسه تحت الإجراء",
+                }
+            ],
         }
     )
 
@@ -280,3 +295,268 @@ def test_faq_prompt_contains_call_record_fields_and_existing_rules():
         assert rule_id in prompt
     assert "mahmoud.atef@andalusiagroup.net" in prompt
     assert "C2B_017 existing-regulation excerpt" in prompt
+
+
+def make_call(transcript="Agent: تم رفع الطلب للقسم المختص"):
+    return CallTranscript(
+        call_id="call-faq-node",
+        agent_name="Mahmoud Atef Helmy",
+        agent_email="mahmoud.atef@andalusiagroup.net",
+        Patient_Phone="0555123456",
+        call_date="2026-09-14",
+        call_duration_seconds=120,
+        department="Helpdesk",
+        business_unit="LIVE",
+        transcript=transcript,
+    )
+
+
+def test_detect_faq_escalation_node_sets_route_and_neutral_state():
+    detected = asyncio.run(
+        agent_nodes.detect_faq_escalation({"call": make_call()})
+    )
+    skipped = asyncio.run(
+        agent_nodes.detect_faq_escalation(
+            {"call": make_call("Agent: القسم المختص متاح من التاسعة")}
+        )
+    )
+
+    assert detected["is_faq_escalation"] is True
+    assert detected["faq_eval"]["faq_status"] == "pending"
+    assert detected["node_trace"] == ["detect_faq_escalation"]
+    assert skipped["is_faq_escalation"] is False
+    assert skipped["faq_eval"]["faq_status"] == "skipped"
+
+
+def test_validate_faq_record_missing_does_not_call_llm(monkeypatch):
+    monkeypatch.setattr(
+        agent_nodes,
+        "lookup_faq_record",
+        lambda **kwargs: {
+            "status": "not_found",
+            "record": None,
+            "message": "No same-day FAQ record.",
+        },
+    )
+
+    class RejectingLLM:
+        async def complete(self, *args, **kwargs):
+            raise AssertionError("LLM must not be called for a missing FAQ row")
+
+    result = asyncio.run(
+        agent_nodes.validate_faq_record(
+            {"call": make_call(), "compliance_pillars": "rules"},
+            RejectingLLM(),
+        )
+    )
+
+    assert result["faq_lookup"]["status"] == "not_found"
+    assert result["faq_eval"]["faq_flags"][0]["description"].startswith("C2B_017:")
+    assert "usage_list" not in result
+
+
+def test_validate_faq_record_routes_unavailable_csv_to_error(monkeypatch):
+    monkeypatch.setattr(
+        agent_nodes,
+        "lookup_faq_record",
+        lambda **kwargs: {
+            "status": "unavailable",
+            "record": None,
+            "message": "FAQ CSV could not be read.",
+        },
+    )
+
+    result = asyncio.run(
+        agent_nodes.validate_faq_record(
+            {"call": make_call(), "compliance_pillars": "rules"},
+            object(),
+        )
+    )
+
+    assert result["error_node"] == "validate_faq_record"
+    assert "FAQ CSV could not be read" in result["error"]
+
+
+def test_validate_faq_record_normalizes_found_record_evaluation(monkeypatch):
+    lookup = {
+        "status": "found",
+        "record": faq_row(ID="77"),
+        "match": {"identity": "email", "faq_id": "77"},
+        "message": "Same-day FAQ record found.",
+    }
+    monkeypatch.setattr(agent_nodes, "lookup_faq_record", lambda **kwargs: lookup)
+
+    class FakeLLM:
+        async def complete(self, system_prompt, user_prompt):
+            assert "C2B_017 existing rules" in user_prompt
+            return (
+                json.dumps(
+                    {
+                        "faq_status": "violation",
+                        "summary": "Wrong business unit.",
+                        "field_checks": [
+                            {
+                                "field": "BU",
+                                "matches": False,
+                                "expected": "AHJ",
+                                "actual": "MKR",
+                                "rule_id": "C2B_021",
+                                "reason": "The business unit is wrong.",
+                                "transcript_excerpt": "N/A",
+                            }
+                        ],
+                        "faq_flags": [],
+                    }
+                ),
+                {
+                    "provider": "test",
+                    "model": "fake",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                },
+            )
+
+    result = asyncio.run(
+        agent_nodes.validate_faq_record(
+            {
+                "call": make_call(),
+                "compliance_pillars": "C2B_017 existing rules",
+            },
+            FakeLLM(),
+        )
+    )
+
+    assert result["faq_lookup"]["record"]["ID"] == "77"
+    assert result["faq_eval"]["faq_flags"][0]["description"].startswith("C2B_021:")
+    assert result["usage_list"][0]["total_tokens"] == 15
+    assert result["node_trace"] == ["validate_faq_record"]
+
+
+def test_scoring_prompt_includes_faq_validation_summary():
+    summary = '{"faq_status":"violation","faq_flags":[{"type":"C2B"}]}'
+
+    prompt = build_scoring_prompt(make_call(), faq_summary=summary)
+
+    assert "FAQ VALIDATION" in prompt
+    assert summary in prompt
+
+
+def test_infer_overall_scoring_passes_faq_summary_to_prompt(monkeypatch):
+    captured = {}
+
+    async def fake_focused_call(
+        node_name,
+        call_id,
+        user_prompt,
+        llm_client,
+        state,
+        max_tokens=None,
+    ):
+        captured["prompt"] = user_prompt
+        return (
+            {
+                "overall_assessment": "needs_review",
+                "assessment_reasoning": "FAQ record missing.",
+                "compliance_flags": [],
+                "agent_performance": {
+                    "professionalism_score": 0.8,
+                    "Agent Classification": "C",
+                    "Profiling Comment": "Poor Report",
+                    "strengths": [],
+                    "improvements": [],
+                },
+                "escalation_required": False,
+                "escalation_reason": None,
+                "_usage": {"total_tokens": 3},
+            },
+            None,
+        )
+
+    monkeypatch.setattr(agent_nodes, "_focused_llm_call", fake_focused_call)
+    result = asyncio.run(
+        agent_nodes.infer_overall_scoring(
+            {
+                "call": make_call(),
+                "faq_eval": {
+                    "faq_status": "violation",
+                    "faq_flags": [{"description": "C2B_017 missing record"}],
+                },
+            },
+            object(),
+        )
+    )
+
+    assert '"faq_status": "violation"' in captured["prompt"]
+    assert "C2B_017 missing record" in captured["prompt"]
+    assert result["usage_list"] == [{"total_tokens": 3}]
+
+
+def test_aggregate_results_merges_faq_flags_into_final_result():
+    faq_flag = {
+        "type": "C2B",
+        "severity": "moderate",
+        "description": "C2B_017: FAQ request was not recorded on the call date.",
+        "transcript_excerpt": "N/A",
+    }
+    second_faq_flag = {
+        "type": "C2B",
+        "severity": "moderate",
+        "description": "C2B_021: FAQ mismatch in BU: wrong business unit.",
+        "transcript_excerpt": "N/A",
+    }
+    state = {
+        "call": make_call(),
+        "behavioral_eval": {
+            "professionalism_score": 0.8,
+            "strengths": [],
+            "improvements": [],
+        },
+        "faq_eval": {
+            "faq_status": "violation",
+            "faq_flags": [faq_flag, second_faq_flag],
+        },
+        "scoring_eval": {
+            "overall_assessment": "needs_review",
+            "assessment_reasoning": "A required FAQ record is missing.",
+            "compliance_flags": [],
+            "agent_performance": {
+                "professionalism_score": 0.8,
+                "Agent Classification": "C",
+                "Profiling Comment": "Poor Report",
+                "strengths": [],
+                "improvements": [],
+            },
+            "escalation_required": False,
+            "escalation_reason": None,
+        },
+    }
+
+    output = asyncio.run(agent_nodes.aggregate_results(state))
+
+    assert "error" not in output
+    assert [flag.description for flag in output["result"].compliance_flags] == [
+        faq_flag["description"],
+        second_faq_flag["description"],
+    ]
+
+
+def test_faq_router_only_validates_detected_escalation_claims():
+    assert agent_graph._faq_router({"is_faq_escalation": True}) == "validate"
+    assert agent_graph._faq_router({"is_faq_escalation": False}) == "skip"
+    assert agent_graph._faq_router({}) == "skip"
+
+
+def test_graph_wires_faq_branch_between_crm_validation_and_scoring():
+    compiled = agent_graph.build_qa_graph(object())
+    edge_pairs = {
+        (edge.source, edge.target)
+        for edge in compiled.get_graph().edges
+    }
+
+    assert {
+        ("validate_crm_lead", "detect_faq_escalation"),
+        ("detect_faq_escalation", "validate_faq_record"),
+        ("detect_faq_escalation", "infer_overall_scoring"),
+        ("validate_faq_record", "infer_overall_scoring"),
+        ("validate_faq_record", "handle_error"),
+    } <= edge_pairs
