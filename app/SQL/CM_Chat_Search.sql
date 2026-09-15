@@ -9,6 +9,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
     SELECT
         c.UniqueId,
         a.EmailAddress,
+        p.UserEmailAddress,
         p.FirstName + ' ' + p.LastName AS AgentFullName,
         DATEADD(HOUR, 3, c.StartDateTime)       AS Start_DateTime,
         DATEADD(HOUR, 3, c.AnswerDateTime)      AS Answer_DateTime,
@@ -52,7 +53,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
     WHERE
         (@ConversationId IS NULL OR c.UniqueId = @ConversationId)
         AND (@AgentFullName IS NULL OR (p.FirstName + ' ' + p.LastName) LIKE '%' + @AgentFullName + '%')
-        AND (@AgentEmail IS NULL OR a.EmailAddress LIKE '%' + @AgentEmail + '%')
+        AND (@AgentEmail IS NULL OR p.UserEmailAddress LIKE '%' + @AgentEmail + '%')
         AND (
             @FilterDate IS NULL
             OR (
@@ -98,7 +99,7 @@ SELECT
 FROM TopConversations tc
 INNER JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[MessagesTotal] m
     ON m.ConversationId = tc.UniqueId
---where m.ConversationId = '499DBB06-5279-F111-B337-000D3AA9D4A7'
+where m.ConversationId = UPPER('32497DAA-9299-F111-9B33-000D3AA9D409')
 ORDER BY
     tc.Start_DateTime DESC,
     tc.UniqueId,

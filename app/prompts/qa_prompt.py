@@ -23,6 +23,8 @@ Design philosophy
   QAAnalysisResult schema — output shape is UNCHANGED.
 """
 
+import json
+
 from app.models.input import CallTranscript
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -383,6 +385,8 @@ def build_scoring_prompt(
     compliance_summary: str = "",
     reservation_summary: str = "",
     script_summary: str = "",
+    crm_lead_summary: str = "",
+    faq_summary: str = "",
 ) -> str:
     """
     Prompt that synthesizes the three focused sub-evaluations into a final score.
@@ -401,6 +405,7 @@ evaluated in three separate passes. Your job is to:
   7. Aggregate strengths and improvements from behavioral sub-evaluation.
   8. Assign Agent Classification based on the violation counts below.
   9. Assign Profiling Comment ONLY if there is a clear performance issue — otherwise omit it (null).
+  10. if there is a misrepresented or said any incorrect information about offer, service, package flag the conversations as needs review and mention the misrepresented offer, service, package in the assessment_reasoning.
 
 Agent Classification criteria:
 A  -> No C2C, C2B, C2Com or NC violations
@@ -445,6 +450,16 @@ SUB-EVALUATION 3 — RESERVATION PILLARS
 SUB-EVALUATION 4 — SCRIPT MATCHING
 ════════════════════════════════════════════════════════════
 {script_summary or "(not available)"}
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 5 — CRM LEAD VALIDATION
+════════════════════════════════════════════════════════════
+{crm_lead_summary or "(not available)"}
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 6 — FAQ VALIDATION
+════════════════════════════════════════════════════════════
+{faq_summary or "(not available)"}
+
+
 
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
@@ -971,4 +986,165 @@ Respond ONLY with a valid JSON object with keys:"appointment_date", "doctor_name
 
 Transcript:
 {transcript}
+"""
+
+
+
+def build_crm_lead_validation_prompt(
+    call: CallTranscript,
+    lookup: dict[str, any],
+    appointment_details: dict[str, any] | None = None,
+    appointment_verification: dict[str, any] | None = None,
+    is_booking_intent: bool = False,
+) -> str:
+    """Build the focused semantic comparison prompt for one fetched CRM lead."""
+    details = appointment_details or {}
+    verification = appointment_verification or {}
+    crm_record = lookup.get("record") or {}
+    return f"""\
+Validate the fetched Dynamics CRM lead against the authoritative chat facts.
+This is a focused CRM data-quality check. Do not evaluate tone, scripts, offers,
+or any compliance topic unrelated to the CRM lead.
+
+VALIDATION RULES
+1. modifiedbyname must identify the same agent as the chat agent. Allow harmless
+   ordering, title, Arabic/English transliteration, spacing, and case differences.
+2. new_clinicbu must match the chat business unit. Treat known code
+   and full-name representations as equivalent. Known input mappings include
+   MKR=BU-MKR, LCH=BU-LCH, SNB=BU-SNB, ALW=BU-ALW, AKW=BU-AKW, and LIVE=BU-AHJ.
+3. When the objective is booking, new_doctor must match the extracted/verified
+   doctor and new_reservationdate must match the appointment date. The supplied
+   Booking intent boolean is a broad routing hint that may include appointment
+   inquiries/reschedules; classify the actual objective from the transcript and
+   do not apply these two checks unless a booking was created.
+4. description must be a short note that accurately describes the chat objective.
+   Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
+   wording differences are acceptable; contradictory or unrelated descriptions are not.
+5. new_lastcallresult must match the final outcome actually reached in the chat
+   (for example booked, rescheduled, inquiry answered, callback/pending, patient
+   declined, or disconnected). Do not confuse the requested objective with outcome.
+6. A CRM field required for an applicable check but null/blank is a mismatch.
+7. Return one field_check per field. Every mismatch must produce a C2B/moderate
+   flag. Use a concise transcript excerpt supporting the expected value, or "N/A"
+   when the expectation comes only from authoritative metadata/database evidence.
+8. Return no positive flags. Limit crm_leads_flags to the first 4 mismatches.
+
+AUTHORITATIVE CHAT FACTS
+Call ID: {call.call_id}
+Agent: {call.agent_name}
+Business unit: {call.business_unit or "unknown"}
+Report date: {call.call_date}
+Booking intent: {is_booking_intent}
+Extracted appointment details: {json.dumps(details, ensure_ascii=False, default=str)}
+Appointment database verification: {json.dumps(verification, ensure_ascii=False, default=str)}
+
+FETCHED CRM LEAD
+{json.dumps(crm_record, ensure_ascii=False, default=str)}
+
+TRANSCRIPT
+{call.transcript}
+
+Return ONLY valid JSON with this shape:
+{{
+  "crm_lead_status": "match | violation",
+  "objective": "reschedule | booking | inquiry",
+  "final_outcome": "<short normalized outcome>",
+  "summary": "<concise validation summary>",
+  "field_checks": [
+    {{
+      "field": "<CRM field name>",
+      "matches": true,
+      "expected": "<chat/database value>",
+      "actual": "<CRM value>",
+      "reason": "<concise evidence-based reason>"
+    }}
+  ],
+  "crm_leads_flags": [
+    {{
+      "type": "C2B",
+      "severity": "moderate",
+      "description": "CRM lead mismatch: <field and concise reason>",
+      "transcript_excerpt": "<verbatim excerpt or N/A>"
+    }}
+  ]
+}}
+"""
+
+
+def build_faq_validation_prompt(
+    call: CallTranscript,
+    lookup: dict[str, any],
+    compliance_pillars: str = "",
+) -> str:
+    """Build the focused comparison prompt for one same-day FAQ record."""
+    faq_record = lookup.get("record") or {}
+    return f"""\
+Validate the fetched FAQ record against the authoritative call metadata and
+transcript. Evaluate only FAQ submission accuracy and data quality. Do not
+evaluate tone, scripts, offers, services, packages, or reservations.
+
+AUTHORITATIVE CALL FACTS
+Call ID: {call.call_id}
+AgentName: {call.agent_name}
+AgentEmail: {call.agent_email or "unknown"}
+mobile_phone: {call.Patient_Phone}
+Date: {call.call_date}
+BU: {call.business_unit or "unknown"}
+
+FETCHED FAQ RECORD
+{json.dumps(faq_record, ensure_ascii=False, default=str)}
+
+TRANSCRIPT
+{call.transcript}
+
+EXISTING REGULATION CATALOG
+{compliance_pillars or "(not loaded)"}
+
+VALIDATION RULES
+1. Check AgentName, AgentEmail, mobile_phone, and Date against the call metadata.
+   The lookup already required the same normalized phone, exact day, and matching
+   agent email or name, but report any contradictory selected-row value.
+2. Check CustomerName against the patient/client name stated in the transcript.
+   Allow harmless spelling, spacing, Arabic/English transliteration, and word
+   order differences. If no patient/client name is stated, do not invent one or
+   flag the CSV name solely because it cannot be verified.
+3. Check BU against the call business unit. Treat LIVE and AHJ as equivalent.
+   Other business-unit codes must describe the same unit.
+4. Check Inquiry semantically against every customer inquiry in the transcript.
+   Do not require exact wording.
+5. Check whether Response is present or blank and whether its content agrees with
+   what the agent communicated. A blank response can be correct while a request
+   is genuinely awaiting the responsible department.
+6. Check End Call Result against the actual outcome. "In Progress" is correct
+   when the responsible department has not answered or work remains pending.
+   "Closed" is correct only when the FAQ inquiry has a completed response or
+   resolution consistent with the chat.
+7. Use C2B_021 for missing or wrong FAQ fields. Use C2C_023 only when affirmative
+   evidence proves the agent gave the customer false information about the
+   submission, response, or status.
+8. Use C2C_024 only when affirmative evidence proves escalation was required but
+   was not performed. A missing same-day record is handled outside this prompt
+   by the deterministic C2B_017 rule.
+9. Return one field_check for each of AgentName, AgentEmail, mobile_phone, Date,
+   CustomerName, BU, Inquiry, Response, and End Call Result. Do not return
+   positive flags and do not create rules outside C2B_017, C2B_021, C2C_023,
+   and C2C_024.
+
+Return ONLY valid JSON with this shape:
+{{
+  "faq_status": "match | violation",
+  "summary": "<concise evidence-based summary>",
+  "field_checks": [
+    {{
+      "field": "<FAQ column name>",
+      "matches": true,
+      "expected": "<call/transcript value>",
+      "actual": "<FAQ value>",
+      "rule_id": "<C2B_021 | C2C_023 | C2C_024>",
+      "reason": "<concise evidence-based reason>",
+      "transcript_excerpt": "<verbatim excerpt or N/A>"
+    }}
+  ],
+  "faq_flags": []
+}}
 """

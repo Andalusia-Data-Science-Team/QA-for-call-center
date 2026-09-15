@@ -21,5 +21,9 @@ ENV/
 
 chats/
 output_json/
+logs/*.log*
 Passcode.json
 passcode.json
+*.csv
+*.ipynb
+*.iqy

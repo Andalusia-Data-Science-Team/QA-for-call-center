@@ -128,6 +128,9 @@ from app.agent.nodes import (
     integrity_check,
     save_to_database,
     finalize,
+    validate_crm_lead,
+    detect_faq_escalation,
+    validate_faq_record,
     handle_error,
     detect_intent,
     detect_insurance_intent,
@@ -167,6 +170,11 @@ def _insurance_router(state: AgentState) -> Literal["insurance", "continue"]:
     if state.get("is_insurance_intent"):
         return "insurance"
     return "continue"
+
+
+def _faq_router(state: AgentState) -> Literal["validate", "skip"]:
+    """Route escalation claims through FAQ validation."""
+    return "validate" if state.get("is_faq_escalation") else "skip"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +232,15 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         functools.partial(infer_service_evaluation, llm_client=llm_client),
     )
     builder.add_node(
+        "validate_crm_lead",
+        functools.partial(validate_crm_lead, llm_client=llm_client),
+    )
+    builder.add_node("detect_faq_escalation", detect_faq_escalation)
+    builder.add_node(
+        "validate_faq_record",
+        functools.partial(validate_faq_record, llm_client=llm_client),
+    )
+    builder.add_node(
         "infer_package_evaluation",
         functools.partial(infer_package_evaluation, llm_client=llm_client),
     )
@@ -252,6 +269,13 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     #   • infer_script_matching           (direct from inference_gate)
     # Exactly 6 unconditional predecessors.
     builder.add_node("inference_ready", lambda state: {})
+    builder.add_node("behavioral_done", lambda state: {})
+    builder.add_node("compliance_done", lambda state: {})
+    builder.add_node("offer_done", lambda state: {})
+    builder.add_node("service_done", lambda state: {})
+    builder.add_node("package_done", lambda state: {})
+    builder.add_node("script_done", lambda state: {})
+
 
     # Stage 5: aggregate + validate merged result
     builder.add_node("aggregate_results", aggregate_results)
@@ -394,28 +418,62 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_conditional_edges(
         "infer_behavioral_evaluation",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "behavioral_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
         "infer_compliance_evaluation",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "compliance_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
         "infer_offer_evaluation",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "offer_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
         "infer_script_matching",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "script_done", "handle_error": "handle_error"},
     )
-    builder.add_edge("fetch_crm_services_for_call",  "inference_ready")
-    builder.add_edge("fetch_crm_packages_for_call",  "inference_ready")
+    builder.add_conditional_edges(
+        "infer_service_evaluation",
+        _error_router,
+        {"continue": "service_done", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "infer_package_evaluation",
+        _error_router,
+        {"continue": "package_done", "handle_error": "handle_error"},
+    )
+    builder.add_edge(
+        [
+            "behavioral_done",
+            "compliance_done",
+            "offer_done",
+            "service_done",
+            "package_done",
+            "script_done",
+        ],
+        "inference_ready",
+    )
 
-    # ── Step 5: inference_ready → infer_overall_scoring ───────────────────
-    builder.add_edge("inference_ready", "infer_overall_scoring")
+    # ── Step 5: CRM lead validation → overall scoring → aggregation ───────
+    builder.add_edge("inference_ready", "validate_crm_lead")
+    builder.add_conditional_edges(
+        "validate_crm_lead",
+        _error_router,
+        {"continue": "detect_faq_escalation", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "detect_faq_escalation",
+        _faq_router,
+        {"validate": "validate_faq_record", "skip": "infer_overall_scoring"},
+    )
+    builder.add_conditional_edges(
+        "validate_faq_record",
+        _error_router,
+        {"continue": "infer_overall_scoring", "handle_error": "handle_error"},
+    )
     builder.add_conditional_edges(
         "infer_overall_scoring",
         _error_router,

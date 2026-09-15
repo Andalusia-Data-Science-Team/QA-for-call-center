@@ -1,0 +1,126 @@
+/****** Script for SelectTopNRows command from SSMS  ******/
+SELECT top 100
+      [leadid] ----------
+      ,[createdon]
+      --,[createdby]
+      ,[modifiedon]
+      --,[modifiedby]
+      ,[createdbyname]
+      ,[createdbyyominame]
+      ,[modifiedbyname]
+      ,[modifiedbyyominame]
+      --,[ownerid]
+      ,[owneridname]
+      ,[owneridyominame]
+      --,[owningbusinessunit]
+      --,[owninguser]
+      --,[owningbusinessunitname]
+      ,[fullname]
+      --,[address1_addressid]
+      --,[address1_addresstypecode]
+      --,[address1_addresstypecodename]
+      --,[address1_shippingmethodcode]
+      --,[address1_shippingmethodcodename]
+      --,[address2_addressid]
+      --,[address2_addresstypecode]
+      --,[address2_addresstypecodename]
+      --,[address2_shippingmethodcode]
+      --,[address2_shippingmethodcodename]
+      ,[confirminterest]
+      --,[confirminterestname]
+      --,[customerid]
+      --,[decisionmaker]
+      --,[decisionmakername]
+      ,[description]
+      --,[donotbulkemail]
+      --,[donotbulkemailname]
+      --,[donotemail]
+      --,[donotemailname]
+      --,[donotfax]
+      --,[donotfaxname]
+      --,[donotphone]
+      --,[donotphonename]
+      --,[donotpostalmail]
+      --,[donotpostalmailname]
+      --,[donotsendmm]
+      --,[donotsendmarketingmaterialname]
+      ,[evaluatefit]
+      ,[evaluatefitname]
+      ,[fax]
+      ,[firstname]
+      ,[isautocreatename]
+      ,[isprivatename]
+      ,[leadsourcecode]
+      ,[leadsourcecodename]
+      ,[merged]
+      ,[mergedname]
+      ,[mobilephone] ---------------------
+      ,[participatesinworkflow]
+      ,[participatesinworkflowname]
+      ,[preferredcontactmethodcode]
+      ,[preferredcontactmethodcodename]
+      ,[prioritycode]
+      ,[prioritycodename]
+      ,[salesstagecode]
+      ,[salesstagecodename]
+      ,[sic]
+      ,[statecode]
+      ,[statecodename]
+      ,[statuscode]
+      ,[statuscodename]
+      ,[subject]
+      --,[followemail]
+      --,[followemailname]
+      ,[yomifullname]
+      ,[campaignid]
+      ,[campaignidname]
+      ,[msdyn_gdproptout]
+      ,[msdyn_gdproptoutname]
+      ,[new_ads]
+      ,[new_duplicate_lead]
+      ,[new_financialtype]
+      ,[new_financialtypename]
+      ,[new_inboundhandled]
+      ,[new_inboundhandledname]
+      ,[new_isautocreate]
+      ,[new_notes] ---------------------
+      --,[new_promocode]
+      ,[new_sourcebusinessunit]
+      ,[new_sourcebusinessunitname] ----------
+      --,[new_treatingdoctor]
+      ,[new_bookedbusinesunitname]
+      --,[new_duplicate_leadname]
+      --,[new_duplicate_leadyominame]
+      ,[new_clinicbu]
+	  ,[new_ads]
+	  ,[new_doctor]
+	  ,[new_reservationdate]
+	  ,[new_specialtie1]
+      --,[new_dccf]
+      --,[new_dccfname]
+      --,[new_dccstate]
+      --,[new_dccstatename]
+      ,[new_bookingphonenumber] ---------------------
+	  ,[new_district]
+	  ,[new_lastcallresult]
+      ,[new_lastcallcreatedby]
+	  ,[new_lastcallcreatedbyname]
+      ,[new_lastphone]
+  FROM [dbo].[lead] 
+  where leadsourcecodename = 'Whatsapp'
+  and statuscodename != 'Untouched'
+  and new_lastcallcreatedbyname != 'Andalusia Sharepoint'
+  and mobilephone = :mobile_number
+  and CAST([createdon] AS DATE) = :Report_Date
+  --and createdon >= CAST(GETDATE() AS DATE)
+  --and new_sourcebusinessunitname != 'ADC'
+  order by createdon asc
+  --where leadsourcecodename = 'Confirmation'
+  --and createdon >= CAST(GETDATE() AS DATE)
+  --and new_sourcebusinessunitname != 'ADC'
+  --and new_lastcallresult in ('Hung up the phone')
+  --order by createdon asc
+  
+  --where leadid = 'D87FD96C-2CA0-F111-B8DC-7CED8D764CA1'
+  --where fullname = 'testttt'
+  --and createdon >= CAST(GETDATE() AS DATE)

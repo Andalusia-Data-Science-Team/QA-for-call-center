@@ -201,7 +201,7 @@ async def dismiss_escalation(payload: dict):
 @app.get("/agents/emails")
 async def list_agent_emails(
     json_file: str = Query(default="/home/ai/Workspace/Rafik/QA_System-main/app/Passcode.json"),
-    db_key:    str = Query(default="DWH"),
+    db_key:    str = Query(default="CM"),
 ):
     import sys
     sys.path.insert(0, str(CM_DIR))
@@ -217,7 +217,7 @@ async def list_agent_emails(
     if not handler.connect():
         raise HTTPException(status_code=503, detail="Cannot connect to CM database.")
 
-    sql_file = str(SQL_DIR / "DWH_Agents.sql")
+    sql_file = str(SQL_DIR / "CM_users.sql")
     try:
         df = handler.execute_query_from_file(sql_file)
     except Exception as exc:
@@ -225,7 +225,7 @@ async def list_agent_emails(
     finally:
         handler.close()
 
-    emails = df["Agent_Email_Address"].dropna().unique().tolist()
+    emails = df["UserEmailAddress"].dropna().unique().tolist()
     emails.sort()
     return {"emails": emails}
 
