@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 OverallAssessment = Literal["pass", "needs_review", "escalate", "error"]
@@ -62,6 +62,22 @@ class QAAnalysisResult(BaseModel):
     escalated: bool = False
     qa_reviewed: bool = False
     qa_review_comment: Optional[str] = None
+    # Expose the masked deterministic outcomes to API consumers alongside
+    # compliance flags; no raw IBAN/account number is included. Bank and
+    # location are independent checks (separate graph nodes) — each is None
+    # when its own request type wasn't present in the call.
+    bank_validation: Optional[dict[str, Any]] = None
+    location_validation: Optional[dict[str, Any]] = None
+    # Doctor validation is two independent checks (deterministic factual
+    # info + separate LLM-based recommendation-suitability) — same pattern
+    # as bank/location being independent of each other. Either is None
+    # when its own applicability condition wasn't met for this call.
+    doctor_validation: Optional[dict[str, Any]] = None
+    doctor_scope_validation: Optional[dict[str, Any]] = None
+    # COE (Center of Excellence) validation — bundles the correct-COE-
+    # recommendation and correct-primary-doctor checks. None when no COE
+    # trigger was present for this call (the normal/expected case).
+    coe_validation: Optional[dict[str, Any]] = None
 
     # monitoring only — not part of the public schema
     _latency_ms: Optional[float] = None
@@ -95,6 +111,11 @@ class QAAnalysisResult(BaseModel):
             escalated=False,
             qa_reviewed=False,
             qa_review_comment=None,
+            bank_validation=None,
+            location_validation=None,
+            doctor_validation=None,
+            doctor_scope_validation=None,
+            coe_validation=None,
         )
 
 

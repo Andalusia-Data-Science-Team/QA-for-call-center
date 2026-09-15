@@ -1,4 +1,32 @@
 """
+CRM doctor reference data — walk-in/cash price, specialty, etc. — pulled
+from Dynamics 365 via the shared connector in app/services/crm_connector.py.
+
+Location/bank reference data used to be fetched from this module too; that
+now lives in its own independent modules — app/service_hub/crm_bank.py and
+app/service_hub/crm_location.py — and the generic auth/connection/retry
+primitives all three depend on live in app/services/crm_connector.py
+(no domain module owns them).
+
+Cache: in-memory dict with a TTL (default 24h) — CRM data changes slowly
+and we never want to block the booking flow on CRM latency.
+"""
+import threading
+import time
+
+import pyodbc
+
+from app.config import settings
+from app.services.crm_connector import _run_query_with_retry, _is_configured
+
+CRM_DOCTOR_TABLE = settings.CRM_DOCTOR_TABLE
+CRM_FEE_TABLE = settings.CRM_FEE_TABLE
+CRM_PRICE_CACHE_TTL_SECONDS = settings.CRM_PRICE_CACHE_TTL_SECONDS
+
+_doctor_cache: dict = {"doctors": [], "loaded_at": 0.0, "failed": False}
+_doctor_lock = threading.Lock()
+
+
 Dynamics 365 CRM connector — pulls doctor reference data (walk-in/cash price,
 specialty, etc.) from the CRM SQL/TDS endpoint using Azure AD auth.
  
@@ -353,10 +381,10 @@ def get_crm_doctors_by_specialty(
     child_age: int = None,
 ) -> list[dict]:
     """Return all active CRM doctors for the given specialty (English name).
- 
+
     When child_age is provided, only doctors whose ExaminationAge covers that
     age are returned (same logic as _filter_dental_for_child in routing.py).
- 
+
     Each returned dict has at minimum:
         DoctorEn, DoctorAr, Specialty, SubSpecialty, ExaminationAge,
         WalkInPrice, IsStar, IsPriority, Degree, ScopeEN, ScopeAR
@@ -365,16 +393,16 @@ def get_crm_doctors_by_specialty(
     all_doctors = fetch_all_doctor_prices()
     if not all_doctors:
         return []
- 
+
     matched = [
         r for r in all_doctors
         if _specialty_matches(specialty_en, r.get("Specialty") or "")
         and r.get("DoctorEn")
     ]
- 
+
     if child_age is None:
         return matched
- 
+
     # Filter by ExaminationAge when child age is known
     from nodes.routing import _parse_examination_age_range  # lazy import
     eligible = []
@@ -391,8 +419,8 @@ def get_crm_doctors_by_specialty(
         if lo <= child_age <= hi:
             eligible.append(r)
     return eligible
- 
- 
+
+
 def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
     """
     Return list of dicts: {DoctorEn, DoctorAr, Specialty, WalkInPrice, BusinessUnit}.
@@ -403,7 +431,7 @@ def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
     """
     if not _is_configured():
         return []
- 
+
     with _doctor_lock:
         now = time.time()
         cached = _doctor_cache["doctors"]
@@ -414,7 +442,7 @@ def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
         if _doctor_cache["failed"] and age < 300:
             print("[CRM] skipping fetch — last attempt failed, in 5-min backoff", flush=True)
             return cached
- 
+
         print("[CRM] Fetching all doctor prices from Dynamics 365...", flush=True)
         t0 = time.time()
         rows: list[dict] = []
@@ -434,7 +462,7 @@ def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
             _doctor_cache["failed"] = True
             _doctor_cache["loaded_at"] = now
             return _doctor_cache["doctors"] or []
- 
+
         print(f"[CRM] Fetched {len(rows)} doctor price records in {time.time()-t0:.1f}s", flush=True)
         _doctor_cache["doctors"] = rows
         _doctor_cache["loaded_at"] = now

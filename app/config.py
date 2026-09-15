@@ -21,7 +21,12 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     huggingface_api_key: str = ""
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY")
+    # Match the sibling *_api_key fields above: default to "" and let
+    # pydantic_settings populate it from the env var itself. The previous
+    # `os.getenv("OPENROUTER_API_KEY")` default evaluated to None whenever
+    # that var was unset, which fails validation against the `str` type and
+    # crashes Settings() (and therefore the whole app) at import time.
+    openrouter_api_key: str = ""
 
     # Retry config 
     llm_max_retries: int = 5
@@ -29,6 +34,15 @@ class Settings(BaseSettings):
 
     # ── Performance ───────────────────────────────────────────────────────────
     llm_max_tokens: int = 2048
+    # infer_overall_scoring (app.agent.nodes) synthesises EVERY other node's
+    # output (behavioral/compliance/script/bank/location/doctor/doctor-scope/
+    # COE summaries) into one JSON response — a much larger prompt AND
+    # expected response than any other focused node budgets against with the
+    # shared llm_max_tokens cap. A response cut off mid-string by hitting
+    # that cap is not a transient/retryable failure: resending the identical
+    # prompt against the identical cap truncates in the same place every
+    # time, so this node gets its own, higher ceiling instead.
+    llm_scoring_max_tokens: int = 4096
     CRM_LEADS_LLM_MAX_TOKENS: int = max(2048, int(os.getenv("CRM_LEADS_LLM_MAX_TOKENS", "4096")))
     OVERALL_SCORING_LLM_MAX_TOKENS: int = max(2048, int(os.getenv("OVERALL_SCORING_LLM_MAX_TOKENS", "4096")))
     LLM_JSON_PARSE_RETRIES: int = max(0, int(os.getenv("LLM_JSON_PARSE_RETRIES", "1")))

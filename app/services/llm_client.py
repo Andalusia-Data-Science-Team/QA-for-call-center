@@ -45,6 +45,11 @@ class LLMClient:
         """
         Send a completion request and return (raw_text, usage_metadata).
 
+        *max_tokens* overrides settings.llm_max_tokens for this call only —
+        e.g. infer_overall_scoring (app.agent.nodes) needs more headroom
+        than the shared default, since it synthesises every other node's
+        output into one response. Omit it (None) to use the shared default.
+
         Retries up to settings.llm_max_retries times with exponential backoff.
         Raises LLMError if all attempts fail.
         """
@@ -122,7 +127,9 @@ class LLMClient:
 
     # Anthropic
 
-    async def _call_anthropic(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
+    async def _call_anthropic(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             import anthropic
         except ImportError as e:
@@ -150,7 +157,9 @@ class LLMClient:
 
     # OpenAI
 
-    async def _call_openai(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
+    async def _call_openai(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             from openai import AsyncOpenAI
         except ImportError as e:
@@ -181,7 +190,9 @@ class LLMClient:
 
     # HuggingFace
 
-    async def _call_huggingface(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
+    async def _call_huggingface(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             from huggingface_hub import AsyncInferenceClient
         except ImportError as e:
@@ -216,8 +227,10 @@ class LLMClient:
             "completion_tokens": getattr(response.usage, "completion_tokens", None),
         }
         return text, usage
-    
-    async def _call_openrouter(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> tuple[str, dict]:
+
+    async def _call_openrouter(
+        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
         try:
             import aiohttp
         except ImportError as e:

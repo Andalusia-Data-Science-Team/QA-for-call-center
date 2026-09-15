@@ -4,7 +4,33 @@ import json
 from pathlib import Path
 import os
 import re
+import time
 from datetime import datetime
+
+# Substrings (matched case-insensitively) that identify a TRANSIENT
+# network/connection failure — worth retrying with a fresh connection —
+# as opposed to a real SQL error (bad syntax, permissions, a missing
+# object) that would fail identically on every retry. pyodbc surfaces
+# both kinds as the same generic ProgrammingError/Error, so the only way
+# to tell them apart is the driver's own message text. Real regression:
+# a cross-server (linked-server) query occasionally failed with
+# "[SQL Server]TCP Provider: The wait operation timed out. (258)" — the
+# remote provider's TCP session dying mid-query — and surfaced straight
+# to the caller as a hard failure with no retry at all.
+_TRANSIENT_DB_ERROR_MARKERS = (
+    "wait operation timed out",     # TCP Provider: The wait operation timed out (258)
+    "timeout expired",              # HYT00-style command-timeout message
+    "communication link failure",
+    "server is not found or not accessible",
+)
+
+
+def _is_transient_db_error(exc: Exception) -> bool:
+    """Best-effort classification of *exc* as a transient, retry-worthy
+    connection/network failure — see _TRANSIENT_DB_ERROR_MARKERS."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_DB_ERROR_MARKERS)
+
 
 class CMDatabaseHandler:
     """Handler for connecting to SQL Server and executing queries"""
@@ -110,14 +136,23 @@ class CMDatabaseHandler:
             print(f"✗ Connection failed: {e}")
             return False
     
-    def execute_query_from_file(self, query_file, params=None):
+    def execute_query_from_file(self, query_file, params=None, max_retries=2, retry_delay_seconds=2.0):
         """
         Execute SQL query from a file and return results as DataFrame
-        
+
         Args:
             query_file: Path to SQL file
             params: Dictionary of parameters for query substitution
-            
+            max_retries: How many times to retry the query itself after a
+                TRANSIENT connection/network failure (see
+                _is_transient_db_error) — e.g. a cross-server query's TCP
+                session dying mid-execution. Each retry reconnects first,
+                since the dead connection cannot be reused. A genuine SQL
+                error (bad syntax, permissions, a missing object) is never
+                retried — it would just fail identically every time.
+            retry_delay_seconds: Base delay between retries; doubles each
+                attempt (1x, 2x, 4x, ...).
+
         Returns:
             pandas DataFrame with query results
         """

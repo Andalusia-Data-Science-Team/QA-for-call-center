@@ -385,6 +385,26 @@ def build_scoring_prompt(
     compliance_summary: str = "",
     reservation_summary: str = "",
     script_summary: str = "",
+    # Masked deterministic bank/location outputs are scoring context, not an
+    # LLM decision about whether an account number or address is correct —
+    # each comes from its own independent graph node (both backed by
+    # app.service_hub).
+    bank_summary: str = "",
+    location_summary: str = "",
+    # Doctor validation is two independent checks, same pattern as bank/
+    # location: doctor_summary is the deterministic factual-information
+    # result (app.service_hub.doctor_validation), doctor_scope_summary is
+    # the separate, semantic recommendation-suitability result (LLM-based,
+    # app.agent.nodes.infer_doctor_scope_validation) — never merged into
+    # one opaque call.
+    doctor_summary: str = "",
+    doctor_scope_summary: str = "",
+    # COE (Center of Excellence) validation — two independent checks bundled
+    # in one result (correct-COE-recommendation + correct-primary-doctor),
+    # written by app.agent.nodes.infer_coe_validation /
+    # skip_coe_validation. None/"not applicable" when no COE trigger was
+    # detected for this call — see app.service_hub.coe_validation.
+    coe_summary: str = "",
     crm_lead_summary: str = "",
     faq_summary: str = "",
 ) -> str:
@@ -460,6 +480,144 @@ SUB-EVALUATION 6 — FAQ VALIDATION
 {faq_summary or "(not available)"}
 
 
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 5 — DETERMINISTIC KSA BANK VALIDATION
+════════════════════════════════════════════════════════════
+{bank_summary or "(not applicable)"}
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 6 — DETERMINISTIC KSA LOCATION VALIDATION
+════════════════════════════════════════════════════════════
+{location_summary or "(not applicable)"}
+
+How to interpret the location result above — reason in this order, and
+never let this override a confident deterministic PASS/FAIL:
+  1. Is the location text actually about an Andalusia branch/facility at
+     all? Home-care / home-service conversations (قسم الرعاية المنزلية,
+     خدمة منزلية, زيارة منزلية, مرافق منزلي, تمريض منزلي, خدمة في المنزل)
+     routinely use the same location words to ask for the PATIENT's OWN
+     address so a coordinator can arrange delivery/visit there — e.g. an
+     agent saying "وبترسل لهم الموقع" / "ابعت موقعك" / "شارك اللوكيشن" /
+     "المنسق هيطلب موقع حضرتك" / "نحتاج موقعك لتقديم الخدمة المنزلية".
+     That is the customer's own service address, never an Andalusia
+     branch location. When the transcript is clearly this kind of
+     home-service context, branch-location validation is simply out of
+     scope: do not raise a location-related compliance violation or lower
+     accuracy for it, whatever the deterministic outcome field says.
+  2. Otherwise, check whether the patient asked about one branch but the
+     agent redirected them to a different one (e.g. the requested branch
+     doesn't offer the service, so the agent names another facility and
+     gives ITS address instead). When that happens, judge the
+     agent-provided branch and address — not the patient's
+     originally-named branch. A transcript that clearly shows this kind
+     of redirection, followed by the agent supplying the new branch's
+     location, reflects the agent doing its job correctly, not an error —
+     even if the deterministic resolver couldn't map that alternative
+     branch name.
+  3. With that context established, treat the deterministic outcome as
+     the primary signal:
+       - PASS: the provided location is correct. No violation.
+       - FAIL: a confirmed mismatch between the provided address and the
+         resolved branch's known location. Treat this as a real location
+         error — do not soften or dismiss a confirmed FAIL.
+       - BRANCH_UNRESOLVED: the matcher could not map a branch name to a
+         CRM record. This is NOT automatically an agent error — it
+         commonly happens in exactly the redirection case (an alternative
+         branch name the matcher doesn't recognize) or the home-service
+         case above. Do not create a compliance violation or lower the
+         accuracy score from a bare BRANCH_UNRESOLVED; only flag a
+         problem if the transcript itself shows the agent naming a
+         wrong/nonexistent facility, or giving an address that conflicts
+         with a branch you can otherwise identify from the conversation.
+       - NOT_APPLICABLE: no branch/location request or agent-provided
+         branch location was in scope. Do not infer any location
+         violation.
+  4. Only report a location-related violation when the transcript gives
+     real evidence of incorrect information — a confirmed FAIL, or the
+     agent clearly naming the wrong facility/address for what was asked.
+     Never penalize based on a home-service address, and never penalize a
+     plausible branch redirection just because it left the deterministic
+     resolver unable to confirm the alternative branch.
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 7 — DETERMINISTIC DOCTOR INFORMATION VALIDATION
+════════════════════════════════════════════════════════════
+{doctor_summary or "(not applicable)"}
+
+How to interpret the doctor result above — never override a confident
+deterministic PASS/FAIL:
+  - PASS: every factual claim the agent actually made about the doctor
+    (name/degree/specialty/subspecialty/business unit/notes/scope/
+    qualifications/examination age/walk-in fee) matches the authoritative
+    CRM record. Treat this as correct — no violation.
+  - FAIL: a confirmed mismatch between something the agent stated and the
+    CRM record (e.g. wrong degree, wrong fee, recommending an inactive or
+    non-OPD doctor). Treat this as a real violation — do not soften or
+    dismiss a confirmed FAIL.
+  - DOCTOR_UNRESOLVED / AMBIGUOUS_DOCTOR: the deterministic matcher could
+    not confidently identify which doctor was meant, or found multiple
+    equally plausible records. This is NOT automatically an agent error —
+    only flag a problem if the transcript itself gives clear evidence the
+    agent was wrong (e.g. a name/detail that plainly doesn't correspond to
+    any real doctor). A bare unresolved/ambiguous result on its own must
+    not lower the score.
+  - INSUFFICIENT_REFERENCE_DATA: CRM doctor data was unavailable. Never
+    penalize the agent for this — it is a system/reference-data condition.
+  - NOT_APPLICABLE: no specific doctor was mentioned or recommended. Do
+    not infer any doctor-information violation.
+  - A field the agent never mentioned is never checked (it will not appear
+    under validated_fields at all) — do not penalize for information the
+    agent simply didn't state.
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 8 — DOCTOR RECOMMENDATION SUITABILITY (semantic, LLM-based)
+════════════════════════════════════════════════════════════
+{doctor_scope_summary or "(not applicable)"}
+
+This is a SEPARATE check from Sub-Evaluation 7 — it judges whether the
+resolved doctor's documented CRM scope of service is a reasonable fit for
+what the patient described, not whether the agent's factual claims about
+the doctor were correct.
+  - SUITABLE: the recommendation fits the doctor's documented scope. No
+    violation.
+  - UNSUITABLE: the patient described a need that falls outside the
+    doctor's documented scope/specialty — this MAY become a QA issue,
+    since the agent recommended a doctor whose documented scope does not
+    match what the patient needed. Ground any flag strictly in the
+    provided reasoning/evidence, never in outside medical knowledge.
+  - UNCLEAR: the available scope evidence was too limited to decide
+    confidently. Do not automatically penalize an UNCLEAR result.
+  - NOT_APPLICABLE: the patient did not describe a medical complaint/need,
+    or no doctor was resolved, or no scope evidence was available. No
+    doctor-recommendation penalty in any of these cases.
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 9 — COE (CENTER OF EXCELLENCE) VALIDATION
+════════════════════════════════════════════════════════════
+{coe_summary or "(not applicable)"}
+
+This checks two SEPARATE things — never double-penalize the same underlying issue twice:
+  1. coe_match_status — did the agent recommend/confirm the COE that actually matches the
+     patient's primary complaint (IBD/Headache/Asthma/Diabetes)?
+       - pass: correct COE recommended. No violation.
+       - fail: the agent recommended a different supported COE than the complaint warrants —
+         a real violation.
+       - uncertain: the complaint or recommendation could not be reliably identified. Do NOT
+         penalize an uncertain result.
+       - not_applicable: no COE/specialized-center trigger existed for this call at all (most
+         calls). No violation, and this is the normal/expected case — do not treat it as
+         missing information.
+  2. primary_doctor_status — did the agent start the new COE booking with an approved primary
+     doctor for that COE's first clinic?
+       - pass: an approved primary doctor was clearly offered for the initial appointment.
+       - fail: the initial COE booking started with an unapproved or secondary-specialty
+         doctor — a real violation.
+       - uncertain / not_applicable: the call never reached doctor selection, an
+         existing-patient follow-up exception applies, or it is unclear which doctor was
+         intended for the initial appointment. Do NOT penalize either of these.
+  Ground any COE-related flag strictly in the reasoning/evidence provided above — never in
+  outside knowledge about doctors or specialties.
 
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
@@ -625,6 +783,106 @@ NO_OFFER_AVAILABLE or OFFER_NOT_APPLICABLE.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NODE — Doctor Recommendation Suitability Prompt (semantic, LLM-based)
+#   Focus: is the ALREADY-RESOLVED doctor's authoritative CRM scope of
+#          service compatible with what the patient described?
+#   This is the separate, semantic half of doctor validation — the
+#   deterministic half (name/degree/specialty/BU/fee/... factual checks)
+#   lives entirely in app.service_hub.doctor_validation and never touches
+#   an LLM. This prompt receives ONLY the already-resolved doctor's CRM
+#   fields (never the full CRM dataset) and must NEVER be asked to pick a
+#   doctor itself — that decision is made deterministically before this
+#   prompt is ever built.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_doctor_scope_prompt(
+    call: CallTranscript,
+    patient_complaint: str = "",
+    doctor_reference: str = "",
+) -> str:
+    """
+    Determine whether a doctor's documented CRM scope of service reasonably
+    covers a patient's stated medical complaint/need.
+
+    Parameters
+    ----------
+    patient_complaint : str
+        The patient's own words describing their symptom/condition/desired
+        treatment (already extracted — never the full transcript re-parsed
+        by the LLM).
+    doctor_reference : str
+        Compact JSON of ONLY the CRM fields needed for this decision
+        (doctor_name_ar/en, degree, specialty, subspecialty, manual
+        specialty/subspecialty, scope_of_service(_ar), doctor_notes,
+        examination_age, qualifications, plus the deterministically
+        precomputed has_detailed_scope/patient_age/age_eligibility_hint
+        flags — see infer_doctor_scope_validation) — built from the
+        ALREADY-RESOLVED doctor record, never the full CRM dataset.
+    """
+    return f"""\
+You are checking whether a SPECIFIC, ALREADY-IDENTIFIED doctor's documented CRM scope of
+service reasonably covers a patient's stated medical need. This is NOT a diagnosis task —
+you are not determining what disease the patient has. You are only comparing the patient's
+stated complaint against the doctor's DOCUMENTED scope, notes, subspecialty, and specialty.
+
+## YOUR TASK
+1. Read the patient's stated complaint/need below.
+2. Read the doctor's authoritative CRM reference (already resolved — do not question or
+   change which doctor this is; you are only judging fit, not identity).
+3. Decide whether the complaint reasonably falls within the doctor's documented scope, using
+   this evidence hierarchy in order of authority (highest first):
+     1. scope_of_service / scope_of_service_ar — the most authoritative evidence: exact
+        documented services/procedures. Prefer this over any category label below.
+     2. doctor_notes — especially an EXPLICIT restriction or inclusion statement (e.g. "new
+        cases only", "does not accept reviews except Sunday", a specific service the doctor
+        does NOT provide, a branch restriction, an age/case-type restriction). An explicit
+        note MAY OVERRIDE an otherwise-suitable scope/specialty reading in either direction.
+     3. subspecialty / manual subspecialty — narrower than specialty, but still just a
+        category label, not proof of exact coverage.
+     4. specialty / manual specialty — the broadest, weakest tier. NEVER treat a specialty
+        match alone as sufficient: two doctors can share the exact same specialty (e.g. both
+        "Orthopedics") while one handles spine surgery and the other handles sports injuries/
+        ACL reconstruction — a specialty label says nothing about which.
+     5. examination_age / patient_age / age_eligibility_hint — see the age-eligibility rule
+        below.
+     6. qualifications / qualifications_ar — CONTEXT ONLY. A doctor's degree or years of
+        experience is never proof they handle a specific condition; never use it alone to
+        justify SUITABLE.
+4. Choose exactly ONE outcome.
+
+## SPECIALTY-ALONE SAFEGUARD (critical)
+If has_detailed_scope is false (no scope_of_service/scope_of_service_ar text at all) and
+doctor_notes gives no explicit relevant signal, do NOT return a confident SUITABLE based on
+specialty or subspecialty alone — prefer UNCLEAR. A bare specialty/subspecialty label is
+supporting context, never the primary decision source.
+
+## OUTCOME DEFINITIONS
+- SUITABLE     : The complaint clearly falls within the doctor's documented scope (or, absent
+                 detailed scope text, a specific and directly-relevant subspecialty/note), and
+                 no doctor_notes restriction rules it out.
+- UNSUITABLE   : The complaint clearly falls OUTSIDE the doctor's documented scope, a
+                 doctor_notes restriction explicitly excludes this kind of case, or
+                 age_eligibility_hint is "outside_range".
+- UNCLEAR      : The documented evidence is too limited, generic (e.g. specialty-only with no
+                 detailed scope), or ambiguous to confidently decide either way — do NOT guess;
+                 this is the safe default when evidence is thin.
+- NOT_APPLICABLE : Use only if the reference data given to you is empty/unusable (this should
+                 be rare — the caller already checked for a complaint and reference data
+                 before invoking you).
+
+## AGE-ELIGIBILITY RULE
+age_eligibility_hint is precomputed deterministically from an explicitly-stated patient age
+compared against examination_age — trust it when present: "outside_range" is strong evidence
+toward UNSUITABLE; "within_range" supports (but does not alone prove) SUITABLE. When
+age_eligibility_hint is null/absent (no explicit patient age was stated), do NOT infer or
+penalize based on age — proceed on the other evidence only.
+
+## MEDICAL-SAFETY RULES (read carefully)
+- Do NOT diagnose the patient. Never state what disease/condition the patient "has".
+- Only state whether the stated symptoms/need appear within or outside the doctor's
+  DOCUMENTED scope — ground every claim in the CRM reference text given below, not in your
+  own general medical knowledge.
+- Do not invent scope-of-service content that isn't present in the reference below.
 # NODE F — Service Recommendation Evaluation Prompt
 #   Focus: did the agent correctly recommend services available for the
 #          patient's specialty from the CRM/hospital database?
@@ -716,120 +974,372 @@ CALL METADATA
 Call ID   : {call.call_id}
 Agent     : {call.agent_name}
 Date      : {call.call_date}
-Duration  : {call.call_duration_seconds}s
-Department: {call.department}
 
-{crm_section}
 ════════════════════════════════════════════════════════════
-TRANSCRIPT
+PATIENT'S STATED COMPLAINT / NEED
 ════════════════════════════════════════════════════════════
-{call.transcript}
+{patient_complaint or "(not available)"}
+
+════════════════════════════════════════════════════════════
+DOCTOR CRM REFERENCE  (already resolved — the authoritative record for this specific doctor)
+════════════════════════════════════════════════════════════
+{doctor_reference or "(not available)"}
 
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 ════════════════════════════════════════════════════════════
 {{
-  "service_outcome": "<SUITABLE_SERVICE_RECOMMENDED | SERVICE_SKIPPED | UNRELATED_SERVICE_RECOMMENDED | SERVICE_MISREPRESENTED | INCOMPLETE_SERVICE_PRESENTATION | NO_SERVICE_AVAILABLE | SERVICE_NOT_APPLICABLE>",
-  "service_reasoning": "<1-2 concise sentences citing transcript evidence.>",
-  "service_flags": [
-    {{
-      "type": "<C2B | NC | positive>",
-      "severity": "<critical | positive>",
-      "description": "<1-2 concise sentences; do not use raw line breaks.>",
-      "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
-    }}
-  ]
+  "outcome": "<SUITABLE | UNSUITABLE | UNCLEAR | NOT_APPLICABLE>",
+  "patient_need_summary": "<1 sentence, patient's own words/summary — no diagnosis>",
+  "doctor_scope_summary": "<1 sentence summarising the doctor's relevant documented scope>",
+  "matched_scope_evidence": ["<verbatim snippet(s) from the CRM reference that drove your decision>"],
+  "reasoning": "<2-3 sentences, grounded ONLY in the CRM reference text above>",
+  "is_violation": <true if outcome == "UNSUITABLE", else false>
 }}
-
-IMPORTANT: service_flags must be an EMPTY LIST [] when the outcome is
-NO_SERVICE_AVAILABLE or SERVICE_NOT_APPLICABLE.
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NODE G — Package Recommendation Evaluation Prompt
-#   Focus: did the agent correctly recommend packages available for the
-#          patient's specialty from the CRM/hospital database?
+# NODE — COE (Center of Excellence) Validation Prompt (semantic, LLM-based)
+#   Focus: given that a COE/specialized-center trigger was ALREADY confirmed
+#          deterministically (app.service_hub.coe_validation.
+#          classify_coe_trigger — this prompt is never built otherwise),
+#          extract the patient's primary complaint, the COE the agent
+#          actually recommended/confirmed, and which named doctor(s) the
+#          agent offered/selected for the INITIAL COE appointment vs. only
+#          as a possible LATER referral.
+#   This prompt must NEVER decide whether a doctor is an approved primary
+#   doctor — that is a deterministic, hardcoded lookup
+#   (coe_validation.match_primary_doctor) applied by the caller AFTER this
+#   extraction, never an LLM judgment call.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_package_prompt(
-    call: "CallTranscript",
-    crm_packages_context: str = "",
+def build_coe_prompt(
+    call: CallTranscript,
+    coe_reference: str = "",
+    trigger_reason: str = "",
+    trigger_path: str = "",
 ) -> str:
     """
-    Evaluate whether the agent correctly handled package recommendations during
-    the call.
-
     Parameters
     ----------
-    call : CallTranscript
-        The call being evaluated.
-    crm_packages_context : str
-        Optional: a JSON-serialised list of active packages available for
-        the patient's specialty at call time. Pass "" when packages cannot
-        be fetched.
+    coe_reference : str
+        Compact JSON of the four supported COEs' first clinic + approved
+        script (already CRM-resolved and HTML-stripped where needed — see
+        app.service_hub.coe_validation.build_coe_reference). Context only —
+        never asked to judge doctor approval.
+    trigger_reason : str
+        Why COE validation was triggered (see classify_coe_trigger) —
+        included so the model grounds its extraction in the same evidence
+        that triggered this check, rather than re-deciding applicability.
+    trigger_path : str
+        Which of the three trigger paths applied — "proactive_recommendation",
+        "customer_inquiry", or "campaign_origin" (see classify_coe_trigger).
+        Determines how the model should read the transcript — see the
+        TRIGGER CONTEXT section below, especially for campaign_origin.
     """
-    crm_section = (
-        f"""
-════════════════════════════════════════════════════════════
-AVAILABLE CRM PACKAGES  (active packages for this specialty at call time)
-════════════════════════════════════════════════════════════
-{crm_packages_context}
-"""
-        if crm_packages_context
-        else """
-════════════════════════════════════════════════════════════
-AVAILABLE CRM PACKAGES
-════════════════════════════════════════════════════════════
-(CRM package data not available for this evaluation — infer from transcript only)
-"""
-    )
+    return f"""\
+You are extracting facts about a Center of Excellence (COE) discussion in a call-center
+transcript — nothing else. A deterministic check already confirmed this call DOES contain a
+genuine COE/specialized-center discussion (reason below); do not re-decide that.
 
-    return f"""
-Evaluate whether the agent correctly identified and recommended appropriate
-packages to the patient during the call below.
+## CLASSIFY THE PATIENT'S INTENT BEFORE CLASSIFYING MEDICAL TERMS (critical — do this FIRST)
+First determine whether each distinct patient request concerns:
+- An active complaint or diagnosis.
+- A doctor/specialty appointment.
+- A COE package or service.
+- A new diagnostic test (a test the patient wants to HAVE DONE — still not itself a COE
+  recommendation requirement on its own; see below).
+- Retrieval of an already completed test, image, or report (a PAST result the patient wants
+  to VIEW/DOWNLOAD/RECEIVE).
+- A non-clinical administrative request.
+
+Do NOT interpret a laboratory or radiology TEST NAME as a diagnosis or a specialty. A test
+name (e.g. "سكر تراكمي"/HbA1c, "كوليسترول", CBC, "وظائف كبد", "أشعة مقطعية", "رنين مغناطيسي")
+describes an INVESTIGATION, never a disease, complaint, or specialty by itself — no matter how
+strongly that test is normally ASSOCIATED with a given specialty in general medical knowledge.
+
+If the patient is asking to retrieve, view, download, receive, or locate an ALREADY COMPLETED
+lab result, radiology result, medical report, or image — rather than asking to book, request,
+or discuss ongoing/new care — mark that request:
+    intent_type = "completed_diagnostic_results_inquiry"
+    coe_eligible = false
+This is true even when the test name mentioned is normally connected to a COE specialty (e.g.
+a blood-sugar test connects to Diabetes, a liver-function test connects to IBD) — asking for
+the RESULT of a test already done is never itself a booking/complaint/specialty request. A
+short, verb-less follow-up naming another test right after such a request (e.g. "وكوليسترول"
+right after "اريد اخر تحليل سكر تراكمي") is part of the SAME results-retrieval request, not a
+new, separate need.
+
+Worked example:
+- "اريد اخر تحليل سكر تراكمي" is a request for an EXISTING lab result (a completed HbA1c
+  test) — it is NOT a Diabetes appointment/booking request, even though "سكر" is a word also
+  used for the Diabetes specialty.
+- "وكوليسترول" immediately after it continues the SAME lab-result request — it is not a
+  separate IBD/Nutrition/Cardiology request.
+- An agent response directing the patient to retrieve results from the mobile application
+  (e.g. "يمكنك الحصول عليها من خلال التطبيق") is an ordinary administrative answer — it is
+  NEVER a COE recommendation, and never satisfies the human-agent recommendation requirement
+  for any COE.
+- By contrast, "أنا مريض سكر وأريد أحجز عيادة السكر" IS an active diagnosis + explicit
+  booking request — Diabetes COE eligibility DOES apply there.
+
+A NEW test request with no accompanying diagnosis, complaint, or specialty/doctor booking
+(e.g. "اريد اعمل تحليل سكر", "عايز أحجز أشعة") is ALSO not, by itself, enough to require a COE
+recommendation — a diagnostic test alone is not a specialty or COE booking, whether it is a
+request for a NEW test or for an OLD result.
+
+Do not let this exclusion swallow a genuinely separate, independently active need stated
+elsewhere in the same call — e.g. "أريد نتيجة التحليل السابق وبعدها أريد أحجز عيادة السكر"
+has TWO distinct requests: exclude the results-retrieval part, but the explicit Diabetes
+booking request that follows remains fully eligible on its own.
+
+Do not exclude genuine COE conversations merely because an investigation is mentioned as part
+of an active package/journey — e.g. "هل باقة الصداع تشمل الأشعة؟" or "برنامج مركز التميز
+للصداع يشمل الأشعة المقطعية" are asking about what an ACTIVE Headache COE package includes;
+the radiology mention there is supporting context, not a completed-results retrieval, and it
+does not replace or cancel the active Headache COE intent.
+
+## SPEAKER ATTRIBUTION (critical)
+Only what the AGENT (human call-center employee) says counts as a recommendation,
+confirmation, offer, or booking action. Never treat something the CUSTOMER/PATIENT says as if
+the agent said or did it. This includes an automatically populated marketing/campaign message
+that happens to be persisted under the Patient speaker (see TRIGGER CONTEXT below) — it is
+system/marketing content, not something the patient personally wrote, and it is NEVER
+something the agent wrote either.
+
+## TRIGGER CONTEXT
+This call's trigger path is: {trigger_path or "(not available)"}
+- "proactive_recommendation": the agent proactively introduced/recommended the COE.
+- "customer_inquiry": the customer asked about a COE/specialized center and the agent
+  responded to or confirmed it.
+- "campaign_origin": the customer entered this conversation by clicking a COE marketing
+  post/ad (the transcript contains a structured campaign identifier, e.g. "BU-AHJ-COE-...").
+  This message is MARKETING/SYSTEM content, not something the human agent wrote — NEVER
+  attribute its wording to the agent, and NEVER treat it as evidence that the agent delivered
+  the approved COE script or recommendation.
+
+  ### CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT (critical)
+  A campaign message establishes only a CANDIDATE marketing context — the COE its own text
+  names (e.g. "مركز تميز الصداع" -> Headache). It does NOT prove that the patient's
+  substantive inquiry is actually about that campaign's service. Do not assume the patient
+  wants that campaign service just because the call started there.
+
+  Inspect the patient's LATER substantive inquiry (ignore the campaign payload itself, bot
+  menu selections, handoff messages, greetings, names, insurance, IDs, and other
+  administrative turns when doing this):
+  - If it continues the SAME COE topic (an approved complaint mapped to the candidate COE, an
+    explicit request for that COE's package/program, or an explicit COE explanation the agent
+    gives that the patient accepts/continues discussing), set campaign_relevance="engaged".
+  - If the patient clearly requests an unrelated service (a different specialty alone, a
+    completed-results inquiry, an administrative request, another branch, etc.) and never
+    returns to the campaign topic, set campaign_relevance="diverted".
+  - If no substantive patient inquiry exists at all (only the campaign click and/or
+    administrative turns), set campaign_relevance="pending".
+  - If the evidence is genuinely ambiguous, set campaign_relevance="uncertain".
+  - If the patient LATER returns to the campaign topic after an earlier unrelated turn,
+    campaign_relevance is "engaged" from that later evidence — a diversion is not permanent.
+
+  Only an ENGAGED campaign may become an active COE evaluation context or create a
+  recommendation requirement. Report all four values explicitly:
+  ```json
+  {{
+    "campaign_detected": true,
+    "campaign_candidate_coe": "Headache",
+    "campaign_relevance": "diverted",
+    "campaign_relevance_evidence": "<the patient's actual, later substantive inquiry>",
+    "active_campaign_coe": null
+  }}
+  ```
+  campaign_coe (the legacy field) must equal active_campaign_coe — set ONLY when
+  campaign_relevance is "engaged", never merely because a campaign identifier was present.
+  Only set recommended_coe when an actual AGENT turn itself recommends, names, or confirms a
+  COE — campaign_coe on its own (even when engaged) is never sufficient to also claim
+  recommended_coe. It is entirely normal and CORRECT for recommended_coe to be null while
+  campaign_coe is set (the agent simply continued the campaign-established journey without
+  independently naming the COE again). If the agent recommends, offers, selects, confirms, or
+  books a doctor for the initial appointment, extract that doctor even though the agent never
+  repeats the COE name — but only within an ENGAGED campaign's context, never a diverted one.
+
+  Never create a second COE context solely because an agent turn is vaguely similar to one of
+  the reference scripts below — the four approved scripts share substantial boilerplate
+  wording, so a generic agent closing/wrap-up sentence can score highly against ALL of them at
+  once with no category-specific content at all. Reference scripts are validation data, used
+  only to check ADHERENCE once a COE is already independently, explicitly grounded in the same
+  turn (an explicit COE/program marker plus category-specific evidence) — never transcript
+  evidence that a category was discussed, and never the reason a category is chosen.
+
+## REFERENCE DATA IS NOT TRANSCRIPT EVIDENCE (critical)
+The SUPPORTING/REFERRAL REFERENCE section below lists the four categories this system CAN
+recognise and their approved scripts — it describes what is POSSIBLE, not what happened on
+this call. Do not select IBD, Asthma, Diabetes, or Headache for primary_complaint_category,
+campaign_coe, or recommended_coe merely because that COE's name or script text appears in the
+reference section. Every one of those three values must instead be justified by a VERBATIM
+excerpt that actually appears in the TRANSCRIPT section further below — if you cannot quote
+such an excerpt, return null for that value rather than guessing from the reference data.
 
 ## YOUR TASK
-1. Determine if the call type warrants a package recommendation check.
-2. Identify whether the agent mentioned any packages.
-3. Compare what the agent said against the available CRM packages provided below.
-4. Choose exactly ONE outcome and produce appropriate flags.
-5. If there is a package fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched package
+1. Identify the patient's PRIMARY complaint — their main reason for calling / the complaint
+   they request an appointment for / the complaint most clearly discussed or connected to the
+   COE recommendation. If several unrelated complaints appear and none is clearly primary,
+   say so (primary_complaint_category = null) rather than guessing. Quote the verbatim
+   transcript excerpt that supports your chosen category in primary_complaint_evidence.
+2. Classify that primary complaint into exactly one of: IBD (gastrointestinal/digestive),
+   Headache, Asthma (chest/pulmonary/respiratory), Diabetes (diabetes/endocrinology), or null
+   if it does not clearly fit one of these four.
+3. Separately, identify THREE distinct COE values — do not conflate them:
+   a. campaign_coe — the COE explicitly established by a campaign/post message's own text
+      (only when trigger_path is "campaign_origin"; null otherwise).
+   b. recommended_coe — a COE actually recommended, named, or confirmed by an ACTUAL AGENT
+      turn — never inferred merely because a doctor happens to be a COE member, and never
+      copied from campaign_coe.
+   For BOTH, quote a verbatim excerpt (campaign_coe_evidence / coe_recommendation_evidence)
+   from the correct source, and set recommended_coe_source to exactly one of "campaign",
+   "patient", or "agent" describing WHO actually said the words your recommended_coe excerpt
+   is quoted from (use "agent" only when an actual Agent turn is being quoted).
+4. List every doctor name the AGENT offered, recommended, selected, confirmed, or booked for
+   the patient's INITIAL COE appointment, separately from any doctor mentioned ONLY as a
+   possible LATER referral (e.g. "an ENT doctor may get involved after the initial pulmonology
+   assessment" is a later-referral mention, not an initial doctor). Extract the doctor's
+   PERSONAL NAME only — never include a trailing clinic/department/specialty phrase such as
+   "بعيادة المخ والاعصاب"/"بقسم ..."/"بتخصص ..." as part of the name.
+5. Determine whether the transcript clearly establishes the customer as an EXISTING patient
+   with an established treating doctor (continuing follow-up), as opposed to starting a new
+   COE journey. Only mark this true when the evidence is explicit and clear.
 
+## THIS CALL MAY DISCUSS MORE THAN ONE COE (critical)
+A single call can legitimately raise more than one COE — e.g. the patient actively raises an
+approved Headache complaint AND, separately, an approved IBD complaint later in the same call.
+This requires at least two INDEPENDENT, patient-side eligible needs — NOT merely a campaign
+click plus an unrelated agent recommendation: a Headache campaign the patient never actually
+engaged with (see CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT), paired with an unrelated
+agent recommendation elsewhere in the call, is NOT two legitimate COE contexts — it is, at
+most, ONE active context (whichever one the patient's own evidence actually supports), plus an
+unsupported agent action that a deterministic check may compare against it. A deterministic
+check builds one INDEPENDENT evaluation context per grounded, ADMITTED COE and associates
+each doctor with the correct one using turn-level evidence; that is the system of record, not
+this prompt's single recommended_coe/initial_doctors fields — treat those as your best summary
+of the MOST SALIENT context, not as a merged answer, and never let a doctor approved for one
+COE make you think a doctor discussed under a DIFFERENT COE is also fine:
+- Associate each doctor with a COE only when the SAME turn (or the turns immediately
+  surrounding it) actually names that COE, its clinic, or its specialty — e.g. "لدكتور X
+  بعيادة المخ والأعصاب" grounds X to Headache. Never associate a doctor with a COE just
+  because that doctor happens to be a member of it in some external list.
+- Never use a doctor's membership in a COE to reverse-infer that the COE was discussed — the
+  COE must be evidenced in the transcript independently of who the doctor is, and belonging to
+  a COE's specialty list is NOT the same thing as being its approved primary doctor.
+- Determine each doctor's role (initial appointment vs. an initial SUPPORTING role vs. a later
+  referral vs. continuing an existing treating-doctor relationship vs. genuinely unclear)
+  SEPARATELY for each doctor — never assume every doctor mentioned in the call shares the same
+  role.
+- CRM reference records (below) list what's POSSIBLE, never evidence that a COE was actually
+  discussed in this call.
+- Some specialties are organizationally SHARED between two COEs (e.g. ENT/"أنف وأذن وحنجرة"
+  supports both Headache and Asthma) — mentioning a shared specialty alone does not tell you
+  which COE is meant. Disambiguate using, in priority order: (1) an explicit campaign-origin
+  COE already established for this call, (2) an actual agent/patient turn naming a COE or
+  script explicitly, (3) the patient's own stated complaint, (4) a specialty or doctor
+  discussion closely connected in the same or an adjacent turn, (5) an actively-in-progress
+  booking context, (6) sheer turn proximity as a last resort. If none of these resolves it,
+  do not guess — leave that mention out of both COEs' evidence rather than assigning it to
+  either.
+- A clear topic change mid-call (e.g. the patient saying "وبعده"/"كمان"/"وكمان" — "and after
+  that" / "also") can start a SEPARATE service context for a different complaint, specialty,
+  or COE — do not keep applying an earlier COE's doctor or specialty evidence to whatever is
+  said after such a shift.
+- Never return a generic procedural or referral phrase (e.g. "تحويل", "تحويل طبي", "استشارة",
+  "موعد", "التحويل بعد ذلك") as if it were a doctor's personal name — if no actual personal
+  name is present, omit that mention rather than inventing a name from the surrounding words.
+- Multiple COEs are ONLY genuinely present when there are at least TWO independently eligible
+  patient needs that resolve to at least TWO DISTINCT canonical specialties belonging to at
+  least TWO DISTINCT COEs. Two DIFFERENT specialties that both belong to the SAME COE (e.g.
+  Ophthalmology and Cardiology, both under Headache) are still only ONE COE context — merge
+  them, never report two. Do not create a second COE context merely because a second medical
+  keyword appears somewhere in the call.
 
-## OUTCOME DEFINITIONS
-- SUITABLE_PACKAGE_RECOMMENDED    : Agent correctly identified and presented a matching package → positive flag.
-                                    ONLY use this when the package name mentioned by the agent matches a package 
-                                    in the AVAILABLE CRM PACKAGES list (check both cr301_service and cr301_servicear fields).
-                                    The match must be exact or semantically equivalent (e.g., "Dental Package" ≈ "باقة الأسنان").
-                                    Price and details must also be accurate.
-- PACKAGE_SKIPPED                 : Relevant package existed in the CRM list but agent never mentioned it → C2B flag.
-- UNRELATED_PACKAGE_RECOMMENDED   : Agent presented a package that does NOT appear in the AVAILABLE CRM PACKAGES list → C2B flag.
-- PACKAGE_MISREPRESENTED          : Agent mentioned a package that exists in the CRM list but stated incorrect 
-                                    price, name spelling, or details → C2B flag.
-- INCOMPLETE_PACKAGE_PRESENTATION : Package mentioned correctly but key details (price, code) omitted → NC flag.
-- NO_PACKAGE_AVAILABLE            : No active package exists for this specialty in the CRM list → no flag.
-- PACKAGE_NOT_APPLICABLE          : Call type doesn't warrant package check (complaint, admin, etc.) → no flag.
+## STRICT COE RECOMMENDATION ELIGIBILITY (critical — read before coe_eligible)
+A patient requesting or being offered a specialty/doctor that is merely ASSOCIATED with a COE
+(as a supporting, referral, or package specialty) is NOT, by itself, evidence that a COE
+recommendation was owed. Only an approved diagnosis/complaint category, an explicit COE
+campaign/post with a real COE identifier, or explicit patient/agent COE discussion may make
+coe_eligible=true. In particular, the following specialties/requests must NEVER, on their own,
+require their associated COE's recommendation:
+- Dental/أسنان, Neurology alone/مخ واعصاب alone, Ophthalmology/عيون, ENT/أنف وأذن وحنجرة,
+  Cardiology/قلب, and Psychiatry/طب نفسي do NOT require the Headache COE.
+- Nutrition/تغذية علاجية and General Surgery/جراحة عامة alone do NOT require the IBD COE.
+- Pulmonology/صدرية alone, ENT, generic Allergy/حساسية with no chest/respiratory context, and
+  Immunology alone do NOT require the Asthma COE.
+- Diabetic Educator/مثقف سكري alone and Orthopedics/عظام do NOT require the Diabetes COE.
+A specialty from this list may still appear as SUPPORTING/REFERRAL context inside a COE
+context that is ALREADY established by a genuine approved complaint or explicit COE
+discussion elsewhere in the same call — it simply can never be the SOLE reason coe_eligible is
+true. When a specialty/doctor request like this is the ONLY thing the patient said, with no
+approved complaint and no COE/campaign language anywhere in the call, mark that intent
+coe_eligible=false, even though it maps to a COE in the reference data below.
 
-## IMPORTANT RULES — READ CAREFULLY
-- **STRICT MATCHING REQUIRED**: You can ONLY select SUITABLE_PACKAGE_RECOMMENDED if:
-  1. The agent mentioned a package by name (in Arabic or English)
-  2. That exact package name appears in the AVAILABLE CRM PACKAGES section below
-  3. The agent provided accurate price and details matching the CRM record
-  4. If the package name does NOT appear in the CRM list → choose UNRELATED_PACKAGE_RECOMMENDED or PACKAGE_SKIPPED
-  
-- Do NOT penalise when CRM packages context is absent (shows "CRM package data not available").
-- Do NOT penalise when patient explicitly declined a correctly presented package.
-- Short calls (< 90 seconds) with no specialty signal → PACKAGE_NOT_APPLICABLE.
-- **KEYWORD DETECTION**: If the agent mentioned any of these patterns in the transcript:
-  • English words in Arabic context (e.g., "VIP Package", "Prenatal Care", "Diabetes Package") → extract the English phrase as the package name
-  • Arabic package trigger words: باقة، باقات، برنامج، برامج، عرض، عروض، شامل، شاملة، كامل، كاملة، متكامل، متكاملة
-    → extract the 2-4 words AFTER the trigger as the actual package name (e.g., "باقة السكري المتكاملة" → extract "السكري المتكاملة")
-  • Then check if that extracted name matches any package in the AVAILABLE CRM PACKAGES list below
-  • The trigger words themselves (باقة، عرض، etc.) are NOT the package name — they indicate intent only
-- **CRITICAL**: If the agent mentioned a package but you cannot find it in the AVAILABLE CRM PACKAGES list below, 
-  you MUST choose UNRELATED_PACKAGE_RECOMMENDED or NO_PACKAGE_AVAILABLE — never SUITABLE_PACKAGE_RECOMMENDED.
-- Report at most 1 package flag per call.
+## STRUCTURED INTENT OUTPUT (produce this before any COE context)
+For every distinct patient request in the call, classify its intent BEFORE deciding whether it
+is COE-eligible. Return a "patient_intents" list, then a "coe_contexts" list built ONLY from
+the intents you marked coe_eligible=true:
+```json
+{{
+  "patient_intents": [
+    {{
+      "intent_type": "completed_diagnostic_results_inquiry",
+      "evidence": "اريد اخر تحليل سكر تراكمي",
+      "active_booking_intent": false,
+      "coe_eligible": false,
+      "canonical_specialty": null,
+      "candidate_coes": []
+    }}
+  ],
+  "coe_contexts": []
+}}
+```
+`intent_type` is one of: "active_complaint_or_diagnosis", "specialty_or_doctor_appointment",
+"coe_package_or_service", "new_diagnostic_test_request", "completed_diagnostic_results_inquiry",
+"administrative_request".
+
+Explicitly:
+- Do not infer Diabetes from an HbA1c/blood-sugar test name alone.
+- Do not infer IBD, Nutrition, or Cardiology from a cholesterol test name alone.
+- Do not treat an agent's app-download/results-retrieval response as a COE recommendation for
+  any COE.
+- Do not generate multiple COE contexts from multiple test names in a results-retrieval
+  request — a results inquiry produces ZERO coe_contexts, regardless of how many test names it
+  lists.
+- The SUPPORTING/REFERRAL REFERENCE section and any CRM record are classification references
+  describing what is POSSIBLE — never transcript evidence that something was actually said.
+- Only intents you marked coe_eligible=true may produce a coe_context.
+- Every coe_context you return must cite its own patient-side evidence (a verbatim excerpt),
+  never evidence borrowed from a different intent or a different COE.
+- A multi-context output (more than one entry in coe_contexts) requires at least two
+  DISTINCT eligible canonical specialties belonging to at least two DISTINCT COEs — never
+  produce two contexts for the same COE, and never produce two contexts merely because two
+  test names or two keywords appeared.
+
+## RULES
+- Never invent a complaint, COE, or doctor name that is not actually present in the transcript.
+- A qualifying medical complaint alone, without any COE/specialized-center discussion, is
+  already excluded by the deterministic trigger check — you do not need to re-verify that.
+- Do not decide whether an extracted doctor is an "approved" COE doctor — that is decided
+  separately, deterministically, after your extraction.
+- A deterministic check, not this prompt, has final authority over campaign_coe and over
+  whether your recommended_coe is grounded in real agent evidence — your job here is only to
+  extract and cite evidence honestly, not to guess a value that "should" be true.
+
+════════════════════════════════════════════════════════════
+WHY THIS CALL TRIGGERED COE VALIDATION
+════════════════════════════════════════════════════════════
+{trigger_reason or "(not available)"}
+
+════════════════════════════════════════════════════════════
+SUPPORTING/REFERRAL REFERENCE — NOT COE RECOMMENDATION ELIGIBILITY
+(first clinic + approved script + any CRM specialty/member data per COE — context only; see
+STRICT COE RECOMMENDATION ELIGIBILITY above. Nothing in this section, including a specialty
+or doctor name it lists, may by itself make an intent coe_eligible or ground a coe_context.)
+════════════════════════════════════════════════════════════
+{coe_reference or "(not available)"}
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -837,10 +1347,7 @@ CALL METADATA
 Call ID   : {call.call_id}
 Agent     : {call.agent_name}
 Date      : {call.call_date}
-Duration  : {call.call_duration_seconds}s
-Department: {call.department}
 
-{crm_section}
 ════════════════════════════════════════════════════════════
 TRANSCRIPT
 ════════════════════════════════════════════════════════════
@@ -850,24 +1357,25 @@ TRANSCRIPT
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 ════════════════════════════════════════════════════════════
 {{
-  "package_outcome": "<SUITABLE_PACKAGE_RECOMMENDED | PACKAGE_SKIPPED | UNRELATED_PACKAGE_RECOMMENDED | PACKAGE_MISREPRESENTED | INCOMPLETE_PACKAGE_PRESENTATION | NO_PACKAGE_AVAILABLE | PACKAGE_NOT_APPLICABLE>",
-  "package_reasoning": "<2-3 sentences citing specific transcript evidence. 
-                        If you chose SUITABLE_PACKAGE_RECOMMENDED, you MUST state which package from the 
-                        AVAILABLE CRM PACKAGES list matched what the agent said (include the package name 
-                        and code from the CRM list). If you chose UNRELATED_PACKAGE_RECOMMENDED, explain 
-                        that the package mentioned by the agent does not appear in the CRM list.>",
-  "package_flags": [
-    {{
-      "type": "<C2B | NC | positive>",
-      "severity": "<critical | positive>",
-      "description": "<1-2 sentences. If positive flag, state the CRM package name and code that matched.>",
-      "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
-    }}
-  ]
+  "primary_complaint": "<1 sentence, patient's own words/summary, or null>",
+  "primary_complaint_category": "<IBD | Headache | Asthma | Diabetes | null>",
+  "primary_complaint_evidence": "<verbatim patient excerpt supporting the category above, or null>",
+  "campaign_detected": <true | false>,
+  "campaign_candidate_coe": "<IBD | Headache | Asthma | Diabetes | null — the COE the campaign message's OWN text names, regardless of relevance>",
+  "campaign_relevance": "<engaged | diverted | pending | uncertain | null — see CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT>",
+  "campaign_relevance_evidence": "<verbatim excerpt justifying the relevance verdict above, or null>",
+  "active_campaign_coe": "<campaign_candidate_coe when campaign_relevance is engaged, else null>",
+  "campaign_coe": "<same as active_campaign_coe — only set when trigger_path is campaign_origin AND campaign_relevance is engaged>",
+  "campaign_coe_evidence": "<verbatim campaign/patient excerpt, or null>",
+  "recommended_coe": "<IBD | Headache | Asthma | Diabetes | null>",
+  "coe_recommendation_evidence": "<verbatim excerpt the recommended_coe value is based on, or null>",
+  "recommended_coe_source": "<campaign | patient | agent | null — who the coe_recommendation_evidence excerpt is actually quoted from>",
+  "initial_doctors": ["<doctor's personal name only, offered/selected/confirmed/booked for the INITIAL appointment>"],
+  "referral_only_doctors": ["<doctor name mentioned ONLY as a possible later referral>"],
+  "existing_patient_exception": <true | false>,
+  "existing_patient_evidence": "<verbatim patient excerpt establishing an existing treating-doctor relationship, or null>",
+  "reasoning": "<2-3 sentences grounded only in the transcript above>"
 }}
-
-IMPORTANT: package_flags must be an EMPTY LIST [] when the outcome is
-NO_PACKAGE_AVAILABLE or PACKAGE_NOT_APPLICABLE.
 """
 
 
@@ -989,161 +1497,102 @@ Transcript:
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE F — Doctor Validation Name-Extraction Prompt
+#   Focus: same conversation-reading judgment APPOINTMENT_EXTRACTION_PROMPT
+#   already gets right (e.g. it correctly returns doctor_name='وصال',
+#   specialty_name='اورام' for a call that also contains "وصال بعيادة
+#   الاورام" and "دكتور اورام") — reused here as its OWN dedicated prompt
+#   for app.service_hub.doctor_validation's factual-information check,
+#   never by calling or altering the appointment-extraction flow itself
+#   (that node only runs on a booking intent; doctor validation must work
+#   with or without one). Consumed by app.agent.nodes.
+#   extract_doctor_semantic_context via the SAME app.agent.nodes.
+#   _focused_llm_call helper appointment extraction uses.
+#
+#   The output is an ADDITIVE quality layer, never the sole gate: when it
+#   returns nothing usable (LLM failure, or a genuinely doctor-less call),
+#   app.service_hub.doctor_validation's existing deterministic candidate
+#   extraction is left to decide on its own, unchanged — see
+#   validate_doctor_information's semantic_doctor_name docstring. The one
+#   exception is "doctor_role" == "agent_self_introduction": that is a
+#   POSITIVE assertion the LLM actively made (never a default/empty
+#   value), and app.agent.nodes.validate_doctor_node treats it as an
+#   authoritative signal to skip Doctor Validation entirely — see that
+#   node's docstring.
+# ─────────────────────────────────────────────────────────────────────────────
 
-def build_crm_lead_validation_prompt(
-    call: CallTranscript,
-    lookup: dict[str, any],
-    appointment_details: dict[str, any] | None = None,
-    appointment_verification: dict[str, any] | None = None,
-    is_booking_intent: bool = False,
-) -> str:
-    """Build the focused semantic comparison prompt for one fetched CRM lead."""
-    details = appointment_details or {}
-    verification = appointment_verification or {}
-    crm_record = lookup.get("record") or {}
-    return f"""\
-Validate the fetched Dynamics CRM lead against the authoritative chat facts.
-This is a focused CRM data-quality check. Do not evaluate tone, scripts, offers,
-or any compliance topic unrelated to the CRM lead.
+DOCTOR_NAME_EXTRACTION_PROMPT = """
+You are extracting which HUMAN DOCTOR, if any, is the active booking/inquiry target in this call-center transcript — nothing else.
 
-VALIDATION RULES
-1. modifiedbyname must identify the same agent as the chat agent. Allow harmless
-   ordering, title, Arabic/English transliteration, spacing, and case differences.
-2. new_clinicbu must match the chat business unit. Treat known code
-   and full-name representations as equivalent. Known input mappings include
-   MKR=BU-MKR/ADC, LCH=BU-LCH/CHT/ALW, SNB=BU-SNB/AFW, ALW=BU-ALW, AKW=BU-AKW, and HJH=BU-AHJ/HJH/LIVE.
-3. When the objective is booking, new_doctor must match the extracted/verified
-   doctor and new_reservationdate must match the appointment date. The supplied
-   Booking intent boolean is a broad routing hint that may include appointment
-   inquiries/reschedules; classify the actual objective from the transcript and
-   do not apply these two checks unless a booking was created.
-4. Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
-   wording differences are acceptable; contradictory or unrelated descriptions are not.
-5. new_lastcallresult must match the final outcome actually reached in the chat
-   (for example booked, rescheduled, inquiry answered, callback/pending, patient
-   declined, or disconnected). Do not confuse the requested objective with outcome.
-6. A CRM field required for an applicable check but null/blank is a mismatch.
-7. Return one field_check per field. Every mismatch must produce a C2B/moderate
-   flag. Use a concise transcript excerpt supporting the expected value, or "N/A"
-   when the expectation comes only from authoritative metadata/database evidence.
-8. Return no positive flags. Limit crm_leads_flags to the first 4 mismatches.
+════════════════════════════════════════════════════════════
+RULE #1 (HIGHEST PRIORITY) — AGENT SELF-INTRODUCTION
+════════════════════════════════════════════════════════════
+Before accepting ANY doctor name, first determine whether that name belongs to the speaking AGENT introducing himself/herself, rather than to a doctor being discussed, recommended, or booked for the patient.
 
-AUTHORITATIVE CHAT FACTS
-Call ID: {call.call_id}
-Agent: {call.agent_name}
-Business unit: {call.business_unit or "unknown"}
-Report date: {call.call_date}
-Booking intent: {is_booking_intent}
-Extracted appointment details: {json.dumps(details, ensure_ascii=False, default=str)}
-Appointment database verification: {json.dumps(verification, ensure_ascii=False, default=str)}
+Names introduced in phrases such as "مع حضرتك دكتور X", "مع حضرتك د X", "معك دكتور X", "أنا دكتور X", "أنا الدكتور X", or any equivalent greeting/self-identification pattern (in Arabic or English: "this is Dr X", "you're speaking with Dr X", "I'm Dr X") are the AGENT'S OWN IDENTITY, never a doctor target. This applies to EVERY agent turn in the conversation, not only the first greeting — a call can be transferred through multiple agents, each introducing themselves the same way, and NONE of those names is ever a doctor target.
 
-FETCHED CRM LEAD
-{json.dumps(crm_record, ensure_ascii=False, default=str)}
+A Patient turn that merely ADDRESSES that same agent by the name/title they introduced themselves with — a greeting, a thanks, an acknowledgement ("حياك الله دكتور محمد", "شكرا دكتور محمد", "اهلا دكتور محمد") — does NOT change this. That name stays the agent's identity; it does not become patient_selected, agent_recommended, a booking_target, or a booking_confirmation just because the patient used it too.
 
-TRANSCRIPT
-{call.transcript}
+When the ONLY doctor-shaped name(s) anywhere in the conversation come from self-introduction(s) (optionally echoed back by the patient), you MUST return:
+  "doctor_name": null
+  "doctor_role": "agent_self_introduction"
+  "doctor_validation_needed": false
+Do not partially "rescue" a self-introduced name into any other role.
 
-Return ONLY valid JSON with this shape:
+This exclusion is NEVER global or permanent for that name string, only for THAT specific self-introduction mention: if a SEPARATE, later, independent part of the SAME conversation clearly and unambiguously names a real third-party clinical doctor for the patient to see (a recommendation, a booking, an inquiry) — even one who happens to share the same first name as an agent who introduced themselves earlier — that later mention IS a real doctor target and must be extracted normally, with doctor_role reflecting that real interaction (e.g. "agent_recommended", "patient_selected").
+
+Examples that must produce doctor_name=null / doctor_role="agent_self_introduction" / doctor_validation_needed=false:
+- "السلام عليكم مع حضرتك دكتور محمد من مجموعة اندلسية صحة"
+- "السلام عليكم مع حضرتك د ابانوب من قسم الرعاية المنزلية"
+- "مع حضرتك دكتور هشام" / "مع حضرتك د ابانوب"
+- "انا الدكتور محمد" / "أنا دكتور يوسف"
+- "السلام عليكم مع حضرتك دكتور محمد" followed later by "Patient: حياك الله دكتور محمد" / "شكرا دكتور محمد"
+
+Examples that ARE real doctor targets (do NOT treat as self-introduction):
+- "متاح معانا دكتور شريف" -> شريف, agent_recommended
+- "متاح معنا الاستشاري اسامة عبد السلام" -> اسامة عبد السلام, agent_recommended
+- "متاح معانا دكتورة وصال" -> وصال, agent_recommended
+- "ابغى احجز مع دكتور احمد أفندي" -> احمد أفندي, patient_selected
+- An agent who introduced themselves as "دكتور محمد" earlier, followed LATER by a genuinely separate "متاح معانا دكتور شريف عظام" -> شريف is still the valid target; محمد stays excluded
+
+════════════════════════════════════════════════════════════
+RULE #2 — ONLY A PLAUSIBLE HUMAN NAME, NEVER A FRAGMENT
+════════════════════════════════════════════════════════════
+Before returning a doctor name, you must be able to answer YES to this exact question: "Is this text actually being used as the name of a human doctor in this conversation?" If the answer is no, unclear, or the text is anything else, return null — do not guess, do not soften a rejection into a weaker candidate.
+
+A دكتور/طبيب/Dr TITLE does NOT automatically mean whatever word or phrase follows it is a name. Read the surrounding sentence and judge what the word is actually doing.
+
+Never return any of the following as a doctor name, even when they immediately follow a doctor title:
+- a verb, verb phrase, or sentence fragment (e.g. "بعدين", "بتكتب", "بيكون", "لعمل", "وبعدها بتذهب للاستقبال", "تجنبا لطلب", "وبتسال الاستقبال")
+- a medical specialty, subspecialty, or service name (e.g. "اورام", "عصب", "مخ واعصاب", "عصب ود تركيبات", "تركيبات") — "دكتور اورام" means the specialty is Oncology, not a doctor literally named "اورام"
+- a department/team name (e.g. "التمريض" nursing, "قسم الاشعة" the radiology department) — "التمريض بيكون" is a sentence fragment about the nursing team, never a name
+- a generic, unnamed doctor role or reference ("الطبيب المعالج", "الطبيب المختص", "اى طبيب", "زيارة طبيب", "مين", "مين / يوم ايه", "اخصائيين ممتازين")
+- a restrictive/quantifying word attached to the title ("دكتور فقط" = "male doctors ONLY" — "فقط" is not a name; if a list follows such as "دكتور فقط\\nدكتور شريف\\nودكتور احمد", the real names are شريف and احمد, "فقط" is excluded)
+- a question, booking/administrative/temporal phrase, location, price, or duration ("حجز موعد مع اى طبيب؟", "مواعيد متاحة", "في الطوارئ")
+- any other text that is not, on its own, a plausible human personal name
+
+A doctor name MAY be just ONE token (a first name only) when that is genuinely all the conversation ever states — never require two tokens, and never invent or pad a second token. Just as important: never let a real first name absorb an adjacent specialty/location/service word into the returned name. For example, "دكتورة وصال بعيادة الاورام" must yield doctor_name "وصال" (specialty context "اورام"), never "وصال بعياده" or "وصال بعيادة الاورام".
+
+When the SAME doctor is referred to more than once in the conversation at different levels of completeness (e.g. "وصال" earlier, then the fuller "وصال محمد" later), return only the FULLEST name actually stated anywhere in the conversation — never both forms, never the shorter one once a fuller one appears.
+
+If a doctor title appears with no name attached at all and no specific person is ever named ("ممكن نعمل زيارة طبيب في البداية", "ممكن نعمل زيارة طبيب عظام في البداية"), doctor_name is null — never invent a placeholder doctor. Still extract the specialty context when one is present ("عظام" in the second example).
+
+════════════════════════════════════════════════════════════
+SPECIALTY CONTEXT
+════════════════════════════════════════════════════════════
+Separately, extract the medical specialty/service/department context surrounding the doctor mention — or, when no doctor name qualifies at all, whatever specialty is still being discussed (e.g. "اورام" for oncology, "عصب" / "تركيبات" for endodontic/prosthodontic dental work, "الأنف والأذن والحنجرة" for ENT). This is conversational context only — never treat it as the doctor's authoritative CRM specialty, and never let it leak into the doctor name itself.
+
+Do not guess or infer information that is not explicitly stated in the transcript. Do not include any additional commentary or explanation.
+
+Respond ONLY with a valid JSON object, no markdown fences, with exactly these keys:
 {{
-  "crm_lead_status": "match | violation",
-  "objective": "reschedule | booking | inquiry",
-  "final_outcome": "<short normalized outcome>",
-  "summary": "<concise validation summary>",
-  "field_checks": [
-    {{
-      "field": "<CRM field name>",
-      "matches": true,
-      "expected": "<chat/database value>",
-      "actual": "<CRM value>",
-      "reason": "<concise evidence-based reason>"
-    }}
-  ],
-  "crm_leads_flags": [
-    {{
-      "type": "C2B",
-      "severity": "moderate",
-      "description": "CRM lead mismatch: <field and concise reason>",
-      "transcript_excerpt": "<verbatim excerpt or N/A>"
-    }}
-  ]
+  "doctor_name": "<the single fullest plausible human doctor name actually used as the active target in this conversation, or null if none qualifies>",
+  "doctor_role": "<one of: agent_self_introduction, patient_selected, agent_recommended, booking_confirmation, mention, or null if no doctor name qualifies>",
+  "doctor_context_specialty": "<the specialty/service/department phrase discussed around the doctor (or, if no doctor qualifies, around the request generally), or null if none is mentioned>",
+  "doctor_validation_needed": <true if doctor_name is a genuine third-party clinical doctor target, false if it is null or the only mention was an agent self-introduction>
 }}
-"""
 
-
-def build_faq_validation_prompt(
-    call: CallTranscript,
-    lookup: dict[str, any],
-    compliance_pillars: str = "",
-) -> str:
-    """Build the focused comparison prompt for one same-day FAQ record."""
-    faq_record = lookup.get("record") or {}
-    return f"""\
-Validate the fetched FAQ record against the authoritative call metadata and
-transcript. Evaluate only FAQ submission accuracy and data quality. Do not
-evaluate tone, scripts, offers, services, packages, or reservations.
-
-AUTHORITATIVE CALL FACTS
-Call ID: {call.call_id}
-AgentName: {call.agent_name}
-AgentEmail: {call.agent_email or "unknown"}
-mobile_phone: {call.Patient_Phone}
-Date: {call.call_date}
-BU: {call.business_unit or "unknown"}
-
-FETCHED FAQ RECORD
-{json.dumps(faq_record, ensure_ascii=False, default=str)}
-
-TRANSCRIPT
-{call.transcript}
-
-EXISTING REGULATION CATALOG
-{compliance_pillars or "(not loaded)"}
-
-VALIDATION RULES
-1. Check AgentName, AgentEmail, mobile_phone, and Date against the call metadata.
-   The lookup already required the same normalized phone, exact day, and matching
-   agent email or name, but report any contradictory selected-row value.
-2. Check CustomerName against the patient/client name stated in the transcript.
-   Allow harmless spelling, spacing, Arabic/English transliteration, and word
-   order differences. If no patient/client name is stated, do not invent one or
-   flag the CSV name solely because it cannot be verified.
-3. Check BU against the call business unit. Treat LIVE and AHJ as equivalent.
-   Other business-unit codes must describe the same unit.
-4. Check Inquiry semantically against every customer inquiry in the transcript.
-   Do not require exact wording.
-5. Check whether Response is present or blank and whether its content agrees with
-   what the agent communicated. A blank response can be correct while a request
-   is genuinely awaiting the responsible department.
-6. Check End Call Result against the actual outcome. "In Progress" is correct
-   when the responsible department has not answered or work remains pending.
-   "Closed" is correct only when the FAQ inquiry has a completed response or
-   resolution consistent with the chat.
-7. Use C2B_021 for missing or wrong FAQ fields. Use C2C_023 only when affirmative
-   evidence proves the agent gave the customer false information about the
-   submission, response, or status.
-8. Use C2C_024 only when affirmative evidence proves escalation was required but
-   was not performed. A missing same-day record is handled outside this prompt
-   by the deterministic C2B_017 rule.
-9. Return one field_check for each of AgentName, AgentEmail, mobile_phone, Date,
-   CustomerName, BU, Inquiry, Response, and End Call Result. Do not return
-   positive flags and do not create rules outside C2B_017, C2B_021, C2C_023,
-   and C2C_024.
-
-Return ONLY valid JSON with this shape:
-{{
-  "faq_status": "match | violation",
-  "summary": "<concise evidence-based summary>",
-  "field_checks": [
-    {{
-      "field": "<FAQ column name>",
-      "matches": true,
-      "expected": "<call/transcript value>",
-      "actual": "<FAQ value>",
-      "rule_id": "<C2B_021 | C2C_023 | C2C_024>",
-      "reason": "<concise evidence-based reason>",
-      "transcript_excerpt": "<verbatim excerpt or N/A>"
-    }}
-  ],
-  "faq_flags": []
-}}
+Transcript:
+{transcript}
 """
