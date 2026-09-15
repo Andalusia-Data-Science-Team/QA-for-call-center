@@ -1011,14 +1011,13 @@ VALIDATION RULES
    ordering, title, Arabic/English transliteration, spacing, and case differences.
 2. new_clinicbu must match the chat business unit. Treat known code
    and full-name representations as equivalent. Known input mappings include
-   MKR=BU-MKR, LCH=BU-LCH, SNB=BU-SNB, ALW=BU-ALW, AKW=BU-AKW, and LIVE=BU-AHJ.
+   MKR=BU-MKR/ADC, LCH=BU-LCH/CHT/ALW, SNB=BU-SNB/AFW, ALW=BU-ALW, AKW=BU-AKW, and HJH=BU-AHJ/HJH/LIVE.
 3. When the objective is booking, new_doctor must match the extracted/verified
    doctor and new_reservationdate must match the appointment date. The supplied
    Booking intent boolean is a broad routing hint that may include appointment
    inquiries/reschedules; classify the actual objective from the transcript and
    do not apply these two checks unless a booking was created.
-4. description must be a short note that accurately describes the chat objective.
-   Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
+4. Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
    wording differences are acceptable; contradictory or unrelated descriptions are not.
 5. new_lastcallresult must match the final outcome actually reached in the chat
    (for example booked, rescheduled, inquiry answered, callback/pending, patient
