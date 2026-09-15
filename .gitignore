@@ -21,6 +21,8 @@ ENV/
 
 chats/
 output_json/
+Passcode.json
+passcode.json
 logs/*.log*
 Passcode.json
 passcode.json
