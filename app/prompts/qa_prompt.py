@@ -23,6 +23,8 @@ Design philosophy
   QAAnalysisResult schema — output shape is UNCHANGED.
 """
 
+import json
+
 from app.models.input import CallTranscript
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,6 +145,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 def build_compliance_prompt(
     call: CallTranscript,
     compliance_pillars: str = "",
+    eligibility_context: str = "",
 ) -> str:
     return f"""\
 Evaluate the call below against the official COMPLIANCE PILLARS only.
@@ -156,6 +159,14 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
 - minor      → small deviation, negligible impact.
 - NOT a violation: a callback promise within a stated window, a patient citing a prior unresolved inquiry,
   the agent deferring a medication availability check to a specialist or pharmacy team.
+
+## ELIGIBILITY ACCURACY - critical rule
+{eligibility_context or "No conclusive eligibility result is available; do not infer or flag eligibility accuracy."}
+When a conclusive eligibility result is provided above, compare it with explicit eligibility statements by the agent.
+If the agent told the patient the opposite eligibility outcome, flag exactly one critical C2C violation under
+"Provide complete accurate and relevant information" / `C2C_030`.
+Do not flag uncertainty, a pending-check statement, or an eligibility conclusion made without a conclusive
+reference result.
 
 ## WHAT DOES NOT CONSTITUTE "INACCURATE INFORMATION"
   Saying "we will contact you within 30 minutes" is a service commitment — not inaccurate information.
@@ -202,7 +213,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
     {{
       "type": "<C2Com | C2C | C2B | NC>",
       "severity": "<critical | positive>",
-      "description": "<1-2 sentences referencing the exact pillar name>",
+      "description": "<1-2 sentences referencing the exact pillar name and id>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
   ]
@@ -219,12 +230,18 @@ def build_reservation_prompt(
     call: CallTranscript,
     appointment_verification: str,
     reservation_pillars: str = "",
+    eligibility_result: dict | None = None,
 ) -> str:
     return f"""\
 Evaluate the call below against the official RESERVATION PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Check the appointment details extracted from the transcript against the hospital's reservation database.
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
+
+## APPOINTMENT VERIFICATION IS AUTHORITATIVE
+When APPOINTMENT VERIFICATION says `found: true`, the booking has been verified against the database.
+Do NOT flag a wrong doctor, wrong specialty, wrong appointment assignment, or `C2C_005` from the
+transcript in that case. The only exception is the explicit ineligible-patient rule below.
 
 ## SEVERITY REMINDER — apply before flagging anything as critical
 - critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
@@ -249,6 +266,14 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
   - The agent attempted to re-engage or used proper farewell before system timeout
   Do NOT flag automated closings or system messages as violations when the agent followed proper protocol.
   This includes: "Close the call on time", "Didn't Commit to call script", "Professional Closing" violations.
+
+## INELIGIBLE PATIENT WITH PERSISTED RESERVATION
+Eligibility result: {eligibility_result or "(not checked)"}
+If the eligibility result is conclusively not eligible and APPOINTMENT VERIFICATION says `found: true`,
+flag exactly one critical C2C violation using the existing reservation item:
+"Submitting the right action on the system" / `C2C_005` / "Made wrong reservation".
+Do not apply this rule when eligibility was not checked, the API response was inconclusive, or no persisted
+reservation was found.
 
 DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT over-evaluate.
 
@@ -280,7 +305,7 @@ APPOINTMENT VERIFICATION
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 ════════════════════════════════════════════════════════════
 {{
-  "compliance_flags": [
+  "reservation_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
       "severity": "<critical | positive>",
@@ -380,6 +405,8 @@ def build_scoring_prompt(
     # skip_coe_validation. None/"not applicable" when no COE trigger was
     # detected for this call — see app.service_hub.coe_validation.
     coe_summary: str = "",
+    crm_lead_summary: str = "",
+    faq_summary: str = "",
 ) -> str:
     """
     Prompt that synthesizes the three focused sub-evaluations into a final score.
@@ -398,6 +425,7 @@ evaluated in three separate passes. Your job is to:
   7. Aggregate strengths and improvements from behavioral sub-evaluation.
   8. Assign Agent Classification based on the violation counts below.
   9. Assign Profiling Comment ONLY if there is a clear performance issue — otherwise omit it (null).
+  10. if there is a misrepresented or said any incorrect information about offer, service, package flag the conversations as needs review and mention the misrepresented offer, service, package in the assessment_reasoning.
 
 Agent Classification criteria:
 A  -> No C2C, C2B, C2Com or NC violations
@@ -442,6 +470,16 @@ SUB-EVALUATION 3 — RESERVATION PILLARS
 SUB-EVALUATION 4 — SCRIPT MATCHING
 ════════════════════════════════════════════════════════════
 {script_summary or "(not available)"}
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 5 — CRM LEAD VALIDATION
+════════════════════════════════════════════════════════════
+{crm_lead_summary or "(not available)"}
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 6 — FAQ VALIDATION
+════════════════════════════════════════════════════════════
+{faq_summary or "(not available)"}
+
+
 
 ════════════════════════════════════════════════════════════
 SUB-EVALUATION 5 — DETERMINISTIC KSA BANK VALIDATION
@@ -677,6 +715,8 @@ offer to the patient during the call below.
 3. Compare what the agent said (if anything) against the available CRM offers
    provided below.
 4. Choose exactly ONE outcome from the list and produce the appropriate flags.
+5. If there is a offer fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched offer
+
 
 ## OUTCOME DEFINITIONS
 - SUITABLE_OFFER_RECOMMENDED   : Agent identified and correctly presented a matching offer → positive flag.
@@ -843,6 +883,90 @@ penalize based on age — proceed on the other evidence only.
   DOCUMENTED scope — ground every claim in the CRM reference text given below, not in your
   own general medical knowledge.
 - Do not invent scope-of-service content that isn't present in the reference below.
+# NODE F — Service Recommendation Evaluation Prompt
+#   Focus: did the agent correctly recommend services available for the
+#          patient's specialty from the CRM/hospital database?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_service_prompt(
+    call: "CallTranscript",
+    crm_services_context: str = "",
+) -> str:
+    """
+    Evaluate whether the agent correctly handled service recommendations during
+    the call.
+
+    Parameters
+    ----------
+    call : CallTranscript
+        The call being evaluated.
+    crm_services_context : str
+        Optional: a JSON-serialised list of active services available for
+        the patient's specialty at call time. Pass "" when services cannot
+        be fetched.
+    """
+    crm_section = (
+        f"""
+════════════════════════════════════════════════════════════
+AVAILABLE CRM SERVICES  (active services for this specialty at call time)
+════════════════════════════════════════════════════════════
+{crm_services_context}
+"""
+        if crm_services_context
+        else """
+════════════════════════════════════════════════════════════
+AVAILABLE CRM SERVICES
+════════════════════════════════════════════════════════════
+(CRM service data not available for this evaluation — infer from transcript only)
+"""
+    )
+
+    return f"""
+Evaluate whether the agent correctly identified and recommended appropriate
+services to the patient during the call below.
+
+## YOUR TASK
+1. Determine if the call type warrants a service recommendation check.
+2. Identify whether the agent mentioned any services.
+3. Compare what the agent said against the available CRM services provided below.
+4. Choose exactly ONE outcome and produce appropriate flags.
+5. If there is a service fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched service
+
+## OUTCOME DEFINITIONS
+- SUITABLE_SERVICE_RECOMMENDED    : Agent correctly identified and presented a matching service → positive flag.
+                                    ONLY use this when the service name mentioned by the agent matches a service 
+                                    in the AVAILABLE CRM SERVICES list (check both cr301_service and cr301_servicear fields).
+                                    The match must be exact or semantically equivalent (e.g., "Dental Cleaning" ≈ "تنظيف الأسنان").
+                                    Price and details must also be accurate.
+- SERVICE_SKIPPED                 : Relevant service existed in the CRM list but agent never mentioned it → C2B flag.
+- UNRELATED_SERVICE_RECOMMENDED   : Agent presented a service that does NOT appear in the AVAILABLE CRM SERVICES list → C2B flag.
+- SERVICE_MISREPRESENTED          : Agent mentioned a service that exists in the CRM list but stated incorrect 
+                                    price, name spelling, or details → C2B flag.
+- INCOMPLETE_SERVICE_PRESENTATION : Service mentioned correctly but key details (price, code) omitted → NC flag.
+- NO_SERVICE_AVAILABLE            : No active service exists for this specialty in the CRM list → no flag.
+- SERVICE_NOT_APPLICABLE          : Call type doesn't warrant service check (complaint, admin, etc.) → no flag.
+
+## IMPORTANT RULES — READ CAREFULLY
+- **STRICT MATCHING REQUIRED**: You can ONLY select SUITABLE_SERVICE_RECOMMENDED if:
+  1. The agent mentioned a service by name (in Arabic or English)
+  2. That exact service name appears in the AVAILABLE CRM SERVICES section below
+  3. The agent provided accurate price and details matching the CRM record
+  4. If the service name does NOT appear in the CRM list → choose UNRELATED_SERVICE_RECOMMENDED or SERVICE_SKIPPED
+  
+- Do NOT penalise when CRM services context is absent (shows "CRM service data not available").
+- Do NOT penalise when patient explicitly declined a correctly presented service.
+- Short calls (< 90 seconds) with no specialty signal → SERVICE_NOT_APPLICABLE.
+- **KEYWORD DETECTION**: If the agent mentioned any of these patterns in the transcript:
+  • English words in Arabic context (e.g., "CBC", "CT Scan", "MRI", "X-Ray", "ECG", "Ultrasound") → extract the English word as the service name
+  • Arabic service trigger words: فحص، فحوصات، تحليل، تحاليل، أشعة، تصوير، صورة، سونار، رنين، مقطعية، إيكو، دوبلر
+    → extract the 2-4 words AFTER the trigger as the actual service name (e.g., "فحص السكر" → extract "السكر")
+  • Then check if that extracted name matches any service in the AVAILABLE CRM SERVICES list below
+  • The trigger words themselves (فحص، تحليل، etc.) are NOT the service name — they indicate intent only
+- **CRITICAL**: If the agent mentioned a service but you cannot find it in the AVAILABLE CRM SERVICES list below, 
+  you MUST choose UNRELATED_SERVICE_RECOMMENDED or NO_SERVICE_AVAILABLE — never SUITABLE_SERVICE_RECOMMENDED.
+- **MULTIPLE MATCHED SERVICES**: Return a concise suitability decision only. Do not enumerate a long list
+  of CRM services in the JSON response; the system appends the complete CRM-verified name, code, and price
+  summary after parsing. Never use raw line breaks inside JSON strings.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -1356,7 +1480,10 @@ You are a medical-call data extractor. Given the following call transcript, extr
 2. The doctor's full name (exactly as mentioned, or null if not mentioned).
 3. The medical specialty name (e.g. "cardiology", "dermatology", or null if not mentioned).
 4. Patient Name for the reservation (exactly as mentioned, or null if not mentioned).
-5. The name of any promotional offer explicitly mentioned by name (e.g. "باقة الصحة المتكاملة", "عرض الليزر"), or null if no specific offer name was mentioned.
+5. The name of any promotional offer explicitly mentioned. Follow these rules:
+   - If the word "عرض" appears, extract the words that immediately follow it as the offer name (e.g. "عرض الليزر" → "عرض الليزر", "عرض تنظيف الأسنان" → "عرض تنظيف الأسنان").
+   - Also capture named packages introduced by "باقة" (e.g. "باقة الصحة المتكاملة").
+   - If neither pattern is found, return null.
 
 Do not guess or infer information that is not explicitly stated in the transcript.
 Do not refine any information

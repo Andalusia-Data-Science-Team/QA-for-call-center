@@ -37,7 +37,10 @@ class LLMClient:
     # ── Public interface ──────────────────────────────────────────────────────
 
     async def complete(
-        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int | None = None,
     ) -> tuple[str, dict]:
         """
         Send a completion request and return (raw_text, usage_metadata).
@@ -54,17 +57,34 @@ class LLMClient:
         for attempt in range(1, settings.llm_max_retries + 1):
             try:
                 start = time.perf_counter()
-                text, usage = await self._call(system_prompt, user_prompt, max_tokens)
+                text, usage = await self._call(system_prompt, user_prompt, max_tokens=max_tokens)
+                usage["provider"] = self.provider
+                usage["model"] = self.model
+                if usage.get("cost_usd") is None:
+                    prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+                    completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+                    input_rate = settings.LLM_INPUT_COST_PER_MILLION_USD
+                    output_rate = settings.LLM_OUTPUT_COST_PER_MILLION_USD
+                    if input_rate or output_rate:
+                        usage["cost_usd"] = (
+                            (prompt_tokens * input_rate)
+                            + (completion_tokens * output_rate)
+                        ) / 1_000_000
+                        usage["cost_source"] = "configured_rates"
+                    else:
+                        usage["cost_usd"] = None
+                        usage["cost_source"] = "unavailable"
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 logger.info(
                     "LLM call succeeded | provider=%s model=%s attempt=%d latency=%.0fms "
-                    "prompt_tokens=%s completion_tokens=%s",
+                    "prompt_tokens=%s completion_tokens=%s cost_usd=%s",
                     self.provider,
                     self.model,
                     attempt,
                     elapsed_ms,
                     usage.get("prompt_tokens") or usage.get("input_tokens"),
                     usage.get("completion_tokens") or usage.get("output_tokens"),
+                    usage.get("cost_usd"),
                 )
                 usage["latency_ms"] = elapsed_ms
                 return text, usage
@@ -90,16 +110,19 @@ class LLMClient:
     # Provider dispatcher
 
     async def _call(
-        self, system_prompt: str, user_prompt: str, max_tokens: int | None = None,
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int | None = None,
     ) -> tuple[str, dict]:
         if self.provider == "anthropic":
-            return await self._call_anthropic(system_prompt, user_prompt, max_tokens)
+            return await self._call_anthropic(system_prompt, user_prompt, max_tokens=max_tokens)
         elif self.provider == "openai":
-            return await self._call_openai(system_prompt, user_prompt, max_tokens)
+            return await self._call_openai(system_prompt, user_prompt, max_tokens=max_tokens)
         elif self.provider == "huggingface":
-            return await self._call_huggingface(system_prompt, user_prompt, max_tokens)
+            return await self._call_huggingface(system_prompt, user_prompt, max_tokens=max_tokens)
         elif self.provider == "openrouter":
-            return await self._call_openrouter(system_prompt, user_prompt, max_tokens)
+            return await self._call_openrouter(system_prompt, user_prompt, max_tokens=max_tokens)
         raise LLMError(f"Unknown provider: {self.provider}")
 
     # Anthropic
@@ -221,7 +244,7 @@ class LLMClient:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:8000",  # Optional: for rankings
+            "HTTP-Referer": "http://localhost:8005",  # Optional: for rankings
             "X-Title": "QA System",  # Optional: shows in rankings
         }
         
@@ -233,6 +256,7 @@ class LLMClient:
             ],
             "max_tokens": max_tokens or settings.llm_max_tokens,
             "temperature": 0,
+            "response_format": {"type": "json_object"},
         }
 
         try:
@@ -258,12 +282,20 @@ class LLMClient:
             if not text:
                 raise LLMError(f"OpenRouter returned empty content: {data}")
 
-            usage = {}
-            if "usage" in data:
-                usage = {
-                    "prompt_tokens": data["usage"].get("prompt_tokens"),
-                    "completion_tokens": data["usage"].get("completion_tokens"),
-                }
+            usage_data = data.get("usage") or {}
+            prompt_details = usage_data.get("prompt_tokens_details") or {}
+            completion_details = usage_data.get("completion_tokens_details") or {}
+            usage = {
+                "finish_reason": data["choices"][0].get("finish_reason"),
+                "prompt_tokens": usage_data.get("prompt_tokens"),
+                "completion_tokens": usage_data.get("completion_tokens"),
+                "total_tokens": usage_data.get("total_tokens"),
+                "reasoning_tokens": completion_details.get("reasoning_tokens"),
+                "cached_tokens": prompt_details.get("cached_tokens"),
+                "cache_write_tokens": prompt_details.get("cache_write_tokens"),
+                "cost_usd": usage_data.get("cost"),
+                "cost_source": "provider_reported",
+            }
             
             return text, usage
 

@@ -18,4 +18,5 @@ SELECT
     ,[new_servicecodedataset]        AS DotCare_Code
     ,[createdon]                     AS Created_On
 FROM new_offer_equest
+where [new_offerstatusnewname] = 'Active'
 ORDER BY [createdon] DESC

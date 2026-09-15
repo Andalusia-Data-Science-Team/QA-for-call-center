@@ -6,8 +6,6 @@ SELECT
       ,[owneridname]
       ,[statecode]
       ,[statecodename]
-      ,[statuscode]
-      ,[statuscodename]
       ,[cr301_title]
       ,[cr301_code]
       ,[cr301_is_deleted]
@@ -28,5 +26,6 @@ SELECT
       ,[cr18c_buname]
   FROM [dbo].[cr301_ksaservicedataset]
   where cr301_status = 'Active'
-  and cr18c_buname in ('HJH','AHJ','LCH','MKR','AKW','ALW','SNB','AFW','ADC')
+  and cr18c_buname = :bu_name
+  and cr301_servicecategoryname != 'Package'
   order by createdon desc

@@ -92,6 +92,23 @@ ConvSummary AS
           AND m3.Discriminator = 'ConversationForwardedSystemMessage'
         ORDER BY m3.CreationDateTime
     ) fw
+    WHERE
+        (@ConversationId IS NULL OR c.UniqueId = @ConversationId)
+        AND (@AgentFullName IS NULL OR (p.FirstName + ' ' + p.LastName) LIKE '%' + @AgentFullName + '%')
+        AND (@AgentEmail IS NULL OR p.UserEmailAddress LIKE '%' + @AgentEmail + '%')
+        AND (
+            @FilterDate IS NULL
+            OR (
+                c.StartDateTime >= DATEADD(HOUR, -3, CAST(@FilterDate AS DATETIME))
+                AND c.StartDateTime < DATEADD(HOUR, -3, DATEADD(DAY, 1, CAST(@FilterDate AS DATETIME)))
+            )
+        )
+),
+TopConversations AS
+(
+    SELECT TOP (10) *
+    FROM ConvSummary
+    ORDER BY Start_DateTime DESC
 )
 SELECT
     tc.*,

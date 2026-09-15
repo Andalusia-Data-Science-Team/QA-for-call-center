@@ -97,8 +97,16 @@ class CMDatabaseHandler:
         
         self.connection = None
     
-    def connect(self):
-        """Establish connection to SQL Server"""
+    def connect(self, connection_timeout: int = 30, query_timeout: int = 120):
+        """
+        Establish connection to SQL Server.
+
+        Args:
+            connection_timeout: Seconds to wait for the initial TCP connection (default 30).
+            query_timeout:      Seconds to wait for a query to complete (default 120).
+                                Increase this when the server uses linked-server queries
+                                that fan out to a remote host.
+        """
         try:
             if self.username and self.password:
                 # SQL Server Authentication
@@ -108,6 +116,7 @@ class CMDatabaseHandler:
                     f'Database={self.database};'
                     f'UID={self.username};'
                     f'PWD={self.password};'
+                    f'Connection Timeout={connection_timeout};'
                 )
             else:
                 # Windows Authentication
@@ -116,9 +125,11 @@ class CMDatabaseHandler:
                     f'Server={self.server};'
                     f'Database={self.database};'
                     f'Trusted_Connection=yes;'
+                    f'Connection Timeout={connection_timeout};'
                 )
-            
-            self.connection = pyodbc.connect(connection_string)
+
+            self.connection = pyodbc.connect(connection_string, timeout=connection_timeout)
+            self.connection.timeout = query_timeout  # per-statement timeout
             print(f"✓ Connected to {self.server}.{self.database}")
             return True
         except Exception as e:
@@ -147,52 +158,40 @@ class CMDatabaseHandler:
         """
         if not self.connection:
             raise ConnectionError("No active database connection")
-
-        with open(query_file, 'r') as f:
-            query = f.read()
-
-        print(f"Executing query from: {query_file}")
-
-        # Substitute parameters if provided
-        if params:
-            for key, value in params.items():
-                # Convert None to NULL string for SQL, otherwise wrap in quotes
-                if value is None:
-                    sql_value = "NULL"
-                elif isinstance(value, (int, float)):
-                    sql_value = str(value)
-                else:
-                    # Escape single quotes in string values
-                    sql_value = f"'{str(value).replace(chr(39), chr(39)+chr(39))}'"
-
-                # Replace only :ParameterName patterns (not @ParameterName which are variable names)
-                query = re.sub(rf':\s*{re.escape(key)}\b', sql_value, query, flags=re.IGNORECASE)
-
-            print(f"Parameters substituted: {list(params.keys())}")
-
-        for attempt in range(1, max_retries + 2):  # 1 initial try + N retries
-            try:
-                df = pd.read_sql(query, self.connection)
-                print(f"✓ Query executed successfully. Retrieved {len(df)} rows.")
-                return df
-            except Exception as e:
-                is_last_attempt = attempt > max_retries
-                if is_last_attempt or not _is_transient_db_error(e):
-                    print(f"✗ Query execution failed: {e}")
-                    raise
-                delay = retry_delay_seconds * (2 ** (attempt - 1))
-                print(
-                    f"✗ Transient query failure (attempt {attempt}/{max_retries + 1}) — "
-                    f"reconnecting and retrying in {delay:.1f}s: {e}"
-                )
-                try:
-                    self.connection.close()
-                except Exception:
-                    pass  # the connection is already dead; nothing to clean up
-                time.sleep(delay)
-                if not self.connect():
-                    print("✗ Reconnect failed — giving up without retrying further.")
-                    raise
+        
+        try:
+            with open(query_file, 'r') as f:
+                query = f.read()
+            
+            print(f"Executing query from: {query_file}")
+            
+            # Substitute parameters if provided
+            if params:
+                for key, value in params.items():
+                    # Convert None to NULL string for SQL, otherwise wrap in quotes
+                    if value is None:
+                        sql_value = "NULL"
+                    elif isinstance(value, (int, float)):
+                        sql_value = str(value)
+                    else:
+                        # Escape single quotes in string values
+                        sql_value = f"'{str(value).replace(chr(39), chr(39)+chr(39))}'"
+                    
+                    # Replace only :ParameterName patterns (not @ParameterName which are variable names)
+                    query = re.sub(rf':\s*{re.escape(key)}\b', sql_value, query, flags=re.IGNORECASE)
+                
+                print(f"Parameters substituted: {list(params.keys())}")
+            
+            df = pd.read_sql(query, self.connection)
+            print(f"✓ Query executed successfully. Retrieved {len(df)} rows.")
+            return df
+        except Exception as e:
+            print(f"✗ Query execution failed: {e}")
+            # Error 258 = TCP wait operation timed out.  This usually means the
+            # linked server referenced in the SQL file is unreachable from the
+            # target SQL Server instance.  Increase query_timeout in connect()
+            # or check the linked-server connectivity on the remote host.
+            raise
     
     def save_to_excel(self, dataframe, output_file=None, sheet_name='Sheet1'):
         """

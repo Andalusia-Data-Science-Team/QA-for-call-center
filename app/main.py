@@ -216,7 +216,7 @@ async def list_agent_emails(
     handler = CMDatabaseHandler(json_file=str(json_path), db_key=db_key)
     if not handler.connect():
         raise HTTPException(status_code=503, detail="Cannot connect to CM database.")
- 
+
     sql_file = str(SQL_DIR / "CM_users.sql")
     try:
         df = handler.execute_query_from_file(sql_file)
@@ -305,6 +305,7 @@ async def retrieve_and_analyze(
         result = await safe_analyze(call)
         results.append(result)
  
+
     summary = {
         "total":        len(results),
         "pass":         sum(1 for r in results if r.overall_assessment == "pass"),

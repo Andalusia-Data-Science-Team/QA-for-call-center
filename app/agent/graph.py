@@ -101,11 +101,14 @@ Stage 2 (focused LLM calls, parallel):
   infer_behavioral_evaluation  — tone, empathy, professionalism, red flags
   infer_compliance_evaluation  — 15 compliance pillars (C2Com/C2C/C2B/NC)
   infer_script_matching        — greeting / closing script adherence
+  infer_offer_evaluation       — offer recommendation (via fetch_crm_offers_for_call)
+  infer_service_evaluation     — service recommendation (via fetch_crm_services_for_call)
+  infer_package_evaluation     — package recommendation (via fetch_crm_packages_for_call)
   Each node calls the LLM with a narrow prompt and stores a partial result.
 
 Stage 3 (sequential synthesis):
-  infer_overall_scoring   — synthesises the three sub-results + scoring weights
-  aggregate_results       — merges all four dicts → QAAnalysisResult (Pydantic)
+  infer_overall_scoring   — synthesises all sub-results + scoring weights
+  aggregate_results       — merges all dicts → QAAnalysisResult (Pydantic)
   integrity_check         — fixes escalation_required ↔ overall_assessment
   finalize                — logs summary, closes trace
 
@@ -147,16 +150,25 @@ from app.agent.nodes import (
     infer_behavioral_evaluation,
     infer_compliance_evaluation,
     infer_reservation_evaluation,
+    enforce_ineligible_reservation_violation,
     infer_offer_evaluation,
+    infer_service_evaluation,
+    infer_package_evaluation,
     fetch_crm_offers_for_call,
+    fetch_crm_services_for_call,
+    fetch_crm_packages_for_call,
     infer_script_matching,
     infer_overall_scoring,
     aggregate_results,
     integrity_check,
     save_to_database,
     finalize,
+    validate_crm_lead,
+    detect_faq_escalation,
+    validate_faq_record,
     handle_error,
     detect_intent,
+    detect_insurance_intent,
     extract_appointment_details,
     verify_appointment_in_db,
     validate_bank_information_node,
@@ -180,6 +192,9 @@ from app.service_hub.doctor_validation import (
     doctor_scope_validation_needed,
     patient_describes_medical_complaint,
     raw_doctor_title_tails,
+    check_patient_eligibility,
+    handle_ineligible_patient,
+    _eligibility_router,
 )
 from app.service_hub.coe_validation import classify_coe_trigger
 from app.services.llm_client import LLMClient
@@ -198,10 +213,12 @@ def _error_router(state: AgentState) -> Literal["continue", "handle_error"]:
     return "continue"
 
 
-def _booking_router(state: AgentState) -> Literal["booking", "skip_booking"]:
-    """Route to the booking sub-flow when a booking intent was detected."""
+def _booking_router(state: AgentState) -> Literal["booking", "offer_only", "skip_booking"]:
+    """Route the general booking intent without inspecting insurance status."""
     if state.get("is_booking_intent"):
         return "booking"
+    if state.get("is_offer_intent"):
+        return "offer_only"
     return "skip_booking"
 
 
@@ -372,6 +389,16 @@ def _coe_intent_router(state: AgentState) -> Literal["infer_coe_validation", "sk
         call.call_id, ctx["triggered"], ctx["trigger_path"], ctx["trigger_reason"],
     )
     return "infer_coe_validation" if ctx["triggered"] else "skip_coe"
+def _insurance_router(state: AgentState) -> Literal["insurance", "continue"]:
+    """Prioritize a separately detected insurance intent before booking routing."""
+    if state.get("is_insurance_intent"):
+        return "insurance"
+    return "continue"
+
+
+def _faq_router(state: AgentState) -> Literal["validate", "skip"]:
+    """Route escalation claims through FAQ validation."""
+    return "validate" if state.get("is_faq_escalation") else "skip"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -417,7 +444,9 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         "infer_reservation_evaluation",
         functools.partial(infer_reservation_evaluation, llm_client=llm_client),
     )
-    builder.add_node("fetch_crm_offers_for_call", fetch_crm_offers_for_call)
+    builder.add_node("fetch_crm_offers_for_call",   fetch_crm_offers_for_call)
+    builder.add_node("fetch_crm_services_for_call",  fetch_crm_services_for_call)
+    builder.add_node("fetch_crm_packages_for_call",  fetch_crm_packages_for_call)
     builder.add_node(
         "infer_offer_evaluation",
         functools.partial(infer_offer_evaluation, llm_client=llm_client),
@@ -448,6 +477,23 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         functools.partial(infer_coe_validation, llm_client=llm_client),
     )
     builder.add_node("skip_coe_validation", skip_coe_validation)
+    builder.add_node(
+        "infer_service_evaluation",
+        functools.partial(infer_service_evaluation, llm_client=llm_client),
+    )
+    builder.add_node(
+        "validate_crm_lead",
+        functools.partial(validate_crm_lead, llm_client=llm_client),
+    )
+    builder.add_node("detect_faq_escalation", detect_faq_escalation)
+    builder.add_node(
+        "validate_faq_record",
+        functools.partial(validate_faq_record, llm_client=llm_client),
+    )
+    builder.add_node(
+        "infer_package_evaluation",
+        functools.partial(infer_package_evaluation, llm_client=llm_client),
+    )
 
     # Stage 4: scoring synthesis (fan-in barrier — waits for all 3 focused nodes)
     builder.add_node(
@@ -468,11 +514,20 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     #   • infer_behavioral_evaluation     (direct from inference_gate)
     #   • infer_compliance_evaluation     (direct from inference_gate)
     #   • infer_offer_evaluation          (via fetch_crm_offers_for_call)
+    #   • infer_service_evaluation        (via fetch_crm_services_for_call)
+    #   • infer_package_evaluation        (via fetch_crm_packages_for_call)
     #   • infer_script_matching           (direct from inference_gate)
     #   • EITHER infer_doctor_scope_validation OR skip_doctor_scope_validation
     #   • EITHER infer_coe_validation OR skip_coe_validation
     # Exactly 6 arrivals in one superstep.
     builder.add_node("inference_ready", lambda state: {})
+    builder.add_node("behavioral_done", lambda state: {})
+    builder.add_node("compliance_done", lambda state: {})
+    builder.add_node("offer_done", lambda state: {})
+    builder.add_node("service_done", lambda state: {})
+    builder.add_node("package_done", lambda state: {})
+    builder.add_node("script_done", lambda state: {})
+
 
     # Stage 5: aggregate + validate merged result
     builder.add_node("aggregate_results", aggregate_results)
@@ -487,6 +542,8 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
 
     # ── Booking intent sub-flow (inserted after infer_behavioral_evaluation) ──
     builder.add_node("detect_intent", detect_intent)
+    builder.add_node("detect_insurance_intent", detect_insurance_intent)
+    builder.add_node("route_booking_intent", lambda state: {})
     builder.add_node(
         "extract_appointment_details",
         functools.partial(extract_appointment_details, llm_client=llm_client),
@@ -515,6 +572,9 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # needs all three branches to have finished, independently of each
     # other (any combination of the three must be supported).
     builder.add_node("loc_bank_ready", lambda state: {})
+    builder.add_node("enforce_ineligible_reservation_violation", enforce_ineligible_reservation_violation)
+    builder.add_node("check_patient_eligibility", check_patient_eligibility)
+    builder.add_node("handle_ineligible_patient", handle_ineligible_patient)
 
     # ── Edges ─────────────────────────────────────────────────────────────
 
@@ -551,11 +611,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Its result (is_booking_intent) determines which branch runs next.
     builder.add_edge("criteria_ready", "detect_intent")
 
-    # ── Step 2: booking sub-flow OR skip — both end at infer_behavioral ───
-    #
-    # BOOKING:    detect_intent → extract → verify → infer_reservation_evaluation
-    #             → infer_behavioral_evaluation (fan-in start)
-    # SKIP:       detect_intent → infer_behavioral_evaluation directly
+    # ── Step 2: independent insurance intent, then booking routing ────────
     #
     # This ensures infer_reservation_evaluation ALWAYS completes (or is
     # skipped) BEFORE the parallel behavioral+compliance LLM calls begin.
@@ -592,19 +648,58 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_edge("skip_doctor_validation", "loc_bank_ready")
     builder.add_conditional_edges(
         "loc_bank_ready",
+    # Identity/IQAMA requests are insurance intent unless the patient explicitly
+    # selected cash or stated they are uninsured. The detector always runs; a
+    # successful check returns to the unchanged booking router.
+    builder.add_edge("detect_intent", "detect_insurance_intent")
+    builder.add_conditional_edges(
+        "detect_insurance_intent",
+        _insurance_router,
+        {
+            "insurance": "check_patient_eligibility",
+            "continue":  "route_booking_intent",
+        },
+    )
+    builder.add_conditional_edges(
+        "check_patient_eligibility",
+        _eligibility_router,
+        {
+            "eligible":     "route_booking_intent",
+            "not_eligible": "handle_ineligible_patient",
+            "error":        "handle_error",
+        },
+    )
+    builder.add_conditional_edges(
+        "route_booking_intent",
         _booking_router,
         {
             "booking":      "extract_appointment_details",
+            "offer_only":   "extract_appointment_details",
             "skip_booking": "inference_gate",
         },
     )
-    builder.add_edge("extract_appointment_details", "verify_appointment_in_db")
+
+    # Ineligible bookings are still extracted and verified to catch an improper reservation.
+    builder.add_edge("handle_ineligible_patient", "extract_appointment_details")
+    # Booking path: extract → verify DB → infer_reservation → inference_gate
+    # Offer-only path: extract → inference_gate (skips DB + reservation eval)
+    builder.add_node("offer_extraction_done", lambda state: {})  # no-op barrier
+    builder.add_conditional_edges(
+        "extract_appointment_details",
+        lambda s: "booking" if s.get("is_booking_intent") else "offer_only",
+        {
+            "booking":    "verify_appointment_in_db",
+            "offer_only": "offer_extraction_done",
+        },
+    )
+    builder.add_edge("offer_extraction_done",       "inference_gate")
     builder.add_edge("verify_appointment_in_db",    "infer_reservation_evaluation")
     builder.add_conditional_edges(
         "infer_reservation_evaluation",
         _error_router,
-        {"continue": "inference_gate", "handle_error": "handle_error"},
+        {"continue": "enforce_ineligible_reservation_violation", "handle_error": "handle_error"},
     )
+    builder.add_edge("enforce_ineligible_reservation_violation", "inference_gate")
 
     # ── Step 3: inference_gate fan-out ────────────────────────────────────
     #
@@ -641,27 +736,24 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # skip_doctor_validation before the booking split, not from
     # fetch_crm_offers_for_call itself; infer_coe_validation reads only
     # state["call"] and its own CRM COE fetch).
+    # The offer/service/package paths each have one extra sequential step:
+    #   inference_gate → fetch_crm_offers_for_call → infer_offer_evaluation
+    #   inference_gate → fetch_crm_services_for_call → infer_service_evaluation
+    #   inference_gate → fetch_crm_packages_for_call → infer_package_evaluation
+    # This ensures live CRM data is fetched BEFORE the LLM prompt runs.
+    builder.add_edge("inference_gate", "infer_behavioral_evaluation")
+    builder.add_edge("inference_gate", "infer_compliance_evaluation")
+    builder.add_edge("inference_gate", "infer_script_matching")
     builder.add_edge("inference_gate", "fetch_crm_offers_for_call")
     builder.add_edge("fetch_crm_offers_for_call", "infer_behavioral_evaluation")
     builder.add_edge("fetch_crm_offers_for_call", "infer_compliance_evaluation")
     builder.add_edge("fetch_crm_offers_for_call", "infer_script_matching")
     builder.add_edge("fetch_crm_offers_for_call", "infer_offer_evaluation")
-    builder.add_conditional_edges(
-        "fetch_crm_offers_for_call",
-        _doctor_scope_intent_router,
-        {
-            "infer_doctor_scope_validation": "infer_doctor_scope_validation",
-            "skip_doctor_scope": "skip_doctor_scope_validation",
-        },
-    )
-    builder.add_conditional_edges(
-        "fetch_crm_offers_for_call",
-        _coe_intent_router,
-        {
-            "infer_coe_validation": "infer_coe_validation",
-            "skip_coe": "skip_coe_validation",
-        },
-    )
+    # Services and packages run with their fetch → infer chain in parallel
+    builder.add_edge("inference_gate", "fetch_crm_services_for_call")
+    builder.add_edge("fetch_crm_services_for_call", "infer_service_evaluation")
+    builder.add_edge("inference_gate", "fetch_crm_packages_for_call")
+    builder.add_edge("fetch_crm_packages_for_call", "infer_package_evaluation")
 
     # ── Step 4: all six branches fan-in → inference_ready ─────────────────
     #
@@ -671,22 +763,43 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_conditional_edges(
         "infer_behavioral_evaluation",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "behavioral_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
         "infer_compliance_evaluation",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "compliance_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
         "infer_offer_evaluation",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "offer_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
         "infer_script_matching",
         _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
+        {"continue": "script_done", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "infer_service_evaluation",
+        _error_router,
+        {"continue": "service_done", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "infer_package_evaluation",
+        _error_router,
+        {"continue": "package_done", "handle_error": "handle_error"},
+    )
+    builder.add_edge(
+        [
+            "behavioral_done",
+            "compliance_done",
+            "offer_done",
+            "service_done",
+            "package_done",
+            "script_done",
+        ],
+        "inference_ready",
     )
     builder.add_conditional_edges(
         "infer_doctor_scope_validation",
@@ -701,8 +814,23 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     )
     builder.add_edge("skip_coe_validation", "inference_ready")
 
-    # ── Step 5: inference_ready → infer_overall_scoring ───────────────────
-    builder.add_edge("inference_ready", "infer_overall_scoring")
+    # ── Step 5: CRM lead validation → overall scoring → aggregation ───────
+    builder.add_edge("inference_ready", "validate_crm_lead")
+    builder.add_conditional_edges(
+        "validate_crm_lead",
+        _error_router,
+        {"continue": "detect_faq_escalation", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "detect_faq_escalation",
+        _faq_router,
+        {"validate": "validate_faq_record", "skip": "infer_overall_scoring"},
+    )
+    builder.add_conditional_edges(
+        "validate_faq_record",
+        _error_router,
+        {"continue": "infer_overall_scoring", "handle_error": "handle_error"},
+    )
     builder.add_conditional_edges(
         "infer_overall_scoring",
         _error_router,

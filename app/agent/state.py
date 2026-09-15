@@ -27,7 +27,14 @@ class AgentState(TypedDict, total=False):
     compliance_eval: dict[str, Any]   # from infer_compliance_evaluation
     reservation_eval: dict[str, Any]  # from infer_reservation_evaluation
     offer_eval: dict[str, Any]        # from infer_offer_evaluation
+    service_eval: dict[str, Any]      # from infer_service_evaluation
+    package_eval: dict[str, Any]      # from infer_package_evaluation
     script_eval: dict[str, Any]       # from infer_script_matching
+    crm_lead_lookup: dict[str, Any]    # from validate_crm_lead
+    crm_lead_eval: dict[str, Any]      # C2B findings from validate_crm_lead
+    is_faq_escalation: Optional[bool]  # from detect_faq_escalation
+    faq_lookup: dict[str, Any]         # from validate_faq_record
+    faq_eval: dict[str, Any]           # compliance findings from FAQ validation
     scoring_eval: dict[str, Any]      # from infer_overall_scoring
 
     # ── Per-node usage tracking (list so all 4 LLM calls are preserved) ───
@@ -39,7 +46,11 @@ class AgentState(TypedDict, total=False):
     # all fan into handle_error in the same step, the concurrent writes to
     # `result` do not raise InvalidUpdateError.
     result: Annotated[Optional[QAAnalysisResult], lambda _old, new: new]
-    is_booking_intent: Optional[bool]
+    is_booking_intent: Optional[bool]  # booking/appointment keywords matched
+    is_offer_intent: Optional[bool]    # offer/package keywords matched (no DB verify needed)
+    patient_is_insured: Optional[bool] # patient chose insurance after cash/insured prompt
+    patient_declined_insurance: Optional[bool] # patient explicitly selected cash or stated no insurance
+    is_insurance_intent: Optional[bool] # insurance flow detected unless the patient declined insurance
     intent_label: Optional[str]
     appointment_details: Optional[dict[str, Any]]
     appointment_verification: Optional[dict[str, Any]]
@@ -73,6 +84,23 @@ class AgentState(TypedDict, total=False):
     # skip_coe_validation — NOT_APPLICABLE when no COE/specialized-center
     # trigger was detected (see app.service_hub.coe_validation).
     coe_validation: Optional[dict[str, Any]]
+    crm_offers_context: Optional[str]    # written by fetch_crm_offers_for_call
+    crm_services_context: Optional[str]  # written by fetch_crm_services_for_call
+    crm_matched_services: list[dict[str, str]]  # CRM records that matched services mentioned by the agent
+    crm_packages_context: Optional[str]  # written by fetch_crm_packages_for_call
+
+    # ── Eligibility check sub-flow ────────────────────────────────────────
+    # iqama_number        — injected by the API layer from the booking request
+    # eligibility_result  — written by check_patient_eligibility
+    #   keys: iqama_number (int), http_status (int|None), api_status (str),
+    #         is_eligible (bool), insurance (dict|None), error_code (str|None),
+    #         transaction_name (str|None), checked_at (str), reason (str|None)
+    # ineligible_reason   — written by handle_ineligible_patient
+    # final_response      — written by handle_ineligible_patient (bilingual rejection message)
+    iqama_number: Optional[str]
+    eligibility_result: Optional[dict[str, Any]]
+    ineligible_reason: Optional[str]
+    final_response: Optional[str]
 
     # ── Error handling ────────────────────────────────────────────────────
     # Last-write-wins, for the same reason `result` above needs it: when
