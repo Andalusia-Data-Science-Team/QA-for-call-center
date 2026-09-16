@@ -23,6 +23,7 @@ To add a NEW node (e.g. criteria_lookup, human_review, re_rank):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -30,7 +31,7 @@ import unicodedata
 import urllib.parse
 from datetime import date as DateType
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text as sa_text
@@ -39,10 +40,12 @@ from arabic_reshaper import reshape
 
 from app.agent.state import AgentState
 from app.config import settings
+from app.models.input import CallTranscript
 from app.models.output import QAAnalysisResult
 from app.prompts.qa_prompt import (
     SYSTEM_PROMPT,
     APPOINTMENT_EXTRACTION_PROMPT,
+    DOCTOR_NAME_EXTRACTION_PROMPT,
     build_behavioral_prompt,
     build_compliance_prompt,
     build_reservation_prompt,
@@ -51,6 +54,8 @@ from app.prompts.qa_prompt import (
     build_package_prompt,
     build_script_prompt,
     build_scoring_prompt,
+    build_doctor_scope_prompt,
+    build_coe_prompt,
     build_user_prompt,   # kept for legacy path
     build_crm_lead_validation_prompt,
     build_faq_validation_prompt,
@@ -58,11 +63,60 @@ from app.prompts.qa_prompt import (
 from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient
 from app.services.sql_helpers import insert_qa_result
+from app.service_hub.bank_validation import bank_validation_needed, validate_ksa_bank_information, detect_bank_signals
+from app.service_hub.location_validation import detect_location_intent, detect_location_signals, is_home_service_location_text, location_validation_needed, validate_location_request
+from app.service_hub.doctor_validation import (
+    canonical_doctor_bu,
+    check_age_eligibility,
+    classify_doctor_context,
+    detect_doctor_signals,
+    doctor_validation_needed,
+    doctor_scope_skip_reason,
+    doctor_scope_validation_needed,
+    extract_doctor_context_specialty,
+    extract_doctor_turn_candidates,
+    extract_patient_clinical_need,
+    extract_patient_stated_age,
+    has_detailed_scope_evidence,
+    patient_describes_medical_complaint,
+    validate_doctor_information,
+)
+from app.service_hub.coe_validation import (
+    AUTHORITATIVE_PRIMARY_DOCTORS,
+    build_coe_evaluations,
+    build_coe_reference,
+    classify_coe_trigger,
+    clean_extracted_doctor_name,
+    existing_patient_exception_evidence,
+    ground_doctor_names,
+    ground_llm_coe_value,
+    is_plausible_coe_doctor_candidate,
+    normalize_doctor_name_for_match,
+    resolve_primary_complaint,
+    resolve_primary_doctor_identity,
+    resolve_recommended_coe,
+    scripts_from_reference,
+    unassociated_initial_doctors,
+)
 from app.services.text_helpers import (
     _normalize_arabic,
-    _arabic_like_pattern, 
+    _arabic_like_pattern,
     _strip_markdown_fences,
     _norm_score,
+    normalize_arabic_text,
+    split_transcript_turns,
+)
+from app.service_hub.crm_leads_validation import (
+    fetch_crm_lead,
+    missing_lead_evaluation,
+    matched_crm_lead_attributes,
+    normalize_crm_lead_evaluation,
+)
+from app.FAQs.faq_validation import (
+    detect_faq_escalation as transcript_has_faq_escalation,
+    lookup_faq_record,
+    missing_faq_evaluation,
+    normalize_faq_evaluation,
 )
 from app.service_hub.crm_leads_validation import (
     fetch_crm_lead,
@@ -344,6 +398,8 @@ async def _focused_llm_call(
     user_prompt: str,
     llm_client: LLMClient,
     state: AgentState,
+    max_tokens: int | None = None,
+    max_json_retries: int = 2,
     max_tokens: int | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Call the LLM and retry generation when its JSON is invalid or truncated."""
@@ -1701,6 +1757,14 @@ async def infer_overall_scoring(
     script_summary     = json.dumps(state.get("script_eval") or {},     ensure_ascii=False)
     crm_lead_summary   = json.dumps(state.get("crm_lead_eval") or {},   ensure_ascii=False)
     faq_summary        = json.dumps(state.get("faq_eval") or {},        ensure_ascii=False)
+    # Include the masked deterministic outcomes in scoring; otherwise these
+    # graph nodes would run without being able to influence the final
+    # assessment. Bank and location are independent nodes/state keys now.
+    bank_summary       = json.dumps(state.get("bank_validation") or {}, ensure_ascii=False)
+    location_summary   = json.dumps(state.get("location_validation") or {}, ensure_ascii=False)
+    doctor_summary       = json.dumps(state.get("doctor_validation") or {}, ensure_ascii=False)
+    doctor_scope_summary = json.dumps(state.get("doctor_scope_validation") or {}, ensure_ascii=False)
+    coe_summary          = json.dumps(state.get("coe_validation") or {}, ensure_ascii=False)
 
     user_prompt = build_scoring_prompt(
         call,
@@ -1711,6 +1775,11 @@ async def infer_overall_scoring(
         crm_lead_summary=crm_lead_summary,
         faq_summary=faq_summary,
         script_summary=script_summary,
+        bank_summary=bank_summary,
+        location_summary=location_summary,
+        doctor_summary=doctor_summary,
+        doctor_scope_summary=doctor_scope_summary,
+        coe_summary=coe_summary,
     )
     logger.debug(
         "infer_overall_scoring | call_id=%s prompt_len=%d",
@@ -1781,6 +1850,35 @@ def _filter_unsubstantiated_reservation_flags(
 #   Pydantic validation.  No LLM call — pure Python merge.
 # ---------------------------------------------------------------------------
 
+def _normalize_flag_type(flag: dict) -> dict:
+    """The ComplianceFlag schema's `type` field only ever accepts
+    {C2C, C2B, C2Com, NC} (see app.models.output.FlagType) — "positive" is
+    a valid SEVERITY value instead (app.models.output.Severity), and every
+    focused-evaluation prompt shows the LLM "positive" as an example
+    severity ("severity": "<critical | positive>", see qa_prompt.py). The
+    offer-evaluation prompt specifically also shows "positive" as an
+    example TYPE value ("type": "<C2B | NC | positive>"), but this mix-up
+    is not unique to that one node — any of the behavioral/compliance/
+    reservation/offer/script/scoring LLM calls can (and in production has)
+    echoed "positive" into `type` instead of `severity`. Real regression:
+    call 57C946E6-1F85-F111-B337-000D3AA9D4A7 crashed aggregate_results'
+    Pydantic validation with type='positive' from a NON-offer flag list,
+    because the fix used to be applied only to offer_flags.
+
+    Mapped uniformly, regardless of which sub-evaluation produced the
+    flag, so this can't recur just because a different node's LLM makes
+    the same mix-up: type -> "NC" (a positive/no-violation finding is
+    reported as an informational NC-shaped flag), severity -> "positive"
+    (the value the LLM actually meant). A flag whose type is already
+    valid is returned unchanged (never copied unnecessarily)."""
+    if flag.get("type") != "positive":
+        return flag
+    flag = dict(flag)
+    flag["type"] = "NC"
+    flag["severity"] = "positive"
+    return flag
+
+
 async def aggregate_results(state: AgentState) -> dict:
     """
     Merge sub-evaluation results into a single QAAnalysisResult-compatible dict.
@@ -1812,18 +1910,85 @@ async def aggregate_results(state: AgentState) -> dict:
     package     = state.get("package_eval")     or {}
     script      = state.get("script_eval")      or {}
     scoring     = state.get("scoring_eval")     or {}
+    bank        = state.get("bank_validation") or {}
+    location    = state.get("location_validation") or {}
+    doctor        = state.get("doctor_validation") or {}
+    doctor_scope  = state.get("doctor_scope_validation") or {}
+    coe           = state.get("coe_validation") or {}
 
-    # Normalise offer_flags: the offer node uses "C2B"/"NC"/"positive" as type
-    # but the ComplianceFlag schema expects type in {C2Com,C2C,C2B,NC}.
-    # Map "positive" type to "NC" with severity "positive" so Pydantic validates.
-    _raw_offer_flags: list[dict] = offer.get("offer_flags", [])
-    _offer_flags: list[dict] = []
-    for f in _raw_offer_flags:
+    _offer_flags: list[dict] = offer.get("offer_flags", [])
+
+    # Persist masked C2B findings through the existing DWH flag path. Both
+    # comparisons were already completed deterministically — bank and
+    # location are independent nodes, so each gets its own flag when it
+    # independently flags a violation.
+    bank_flags = []
+    if bank.get("is_violation"):
+        bank_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": bank.get("reason", "KSA bank-account validation failed."),
+            "transcript_excerpt": "Bank information supplied by agent (identifier masked).",
+        })
+    location_flags = []
+    if location.get("is_violation"):
+        location_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": location.get("reason", "KSA branch/location validation failed."),
+            "transcript_excerpt": "Location information supplied by agent.",
+        })
+    # Doctor is two independent checks (deterministic + semantic) — each
+    # gets its own flag when it independently flags a violation, same
+    # pattern as bank/location.
+    doctor_flags = []
+    if doctor.get("is_violation"):
+        doctor_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": doctor.get("reason", "Doctor information validation failed."),
+            "transcript_excerpt": "Doctor information supplied by agent.",
+        })
+    if doctor_scope.get("is_violation"):
+        doctor_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": doctor_scope.get("reasoning", "The recommended doctor's documented scope does not match the patient's stated need."),
+            "transcript_excerpt": "Doctor recommendation given by agent.",
+        })
+    # COE (Center of Excellence) is a separate, independent check bundling
+    # two sub-results (correct COE recommendation + correct primary doctor)
+    # — never double-flagged for the same underlying issue: each sub-result
+    # gets its OWN flag only when IT independently indicates a violation.
+    coe_flags = []
+    if coe.get("coe_match_status") == "fail":
+        coe_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": coe.get("reason", "The agent recommended a Center of Excellence that does not match the patient's primary complaint."),
+            "transcript_excerpt": (coe.get("evidence") or [""])[0] or "COE recommendation given by agent.",
+        })
+    if coe.get("primary_doctor_status") == "fail":
+        coe_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": coe.get("reason", "The initial COE booking did not start with an approved primary doctor."),
+            "transcript_excerpt": "Initial COE doctor offered by agent.",
+        })
+
+    # Normalise service_flags
+    _raw_service_flags: list[dict] = service.get("service_flags", [])
+    _service_flags: list[dict] = []
+    for f in _raw_service_flags:
         flag = dict(f)
         if flag.get("type") == "positive":
             flag["type"] = "NC"
             flag["severity"] = "positive"
-        _offer_flags.append(flag)
+        _service_flags.append(flag)
+
+    # Normalise package_flags
+    _raw_package_flags: list[dict] = package.get("package_flags", [])
+    _package_flags: list[dict] = []
+    for f in _raw_package_flags:
+        flag = dict(f)
+        if flag.get("type") == "positive":
+            flag["type"] = "NC"
+            flag["severity"] = "positive"
+        _package_flags.append(flag)
 
     # Normalise service_flags
     _raw_service_flags: list[dict] = service.get("service_flags", [])
@@ -1855,13 +2020,22 @@ async def aggregate_results(state: AgentState) -> dict:
         + faq.get("faq_flags", [])
         + _service_flags
         + _package_flags
+        + bank_flags
+        + location_flags
+        + doctor_flags
+        + coe_flags
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
 
     all_flags = _filter_unsubstantiated_reservation_flags(all_flags, state)
 
-    # Keep distinct metadata findings when no transcript excerpt is available.
+    # Keep distinct metadata findings when no transcript excerpt is available. — every flag is
+    # normalised (see _normalize_flag_type) BEFORE the dedup key is built,
+    # so a "positive"-typed flag from ANY source (not just the offer node)
+    # is corrected before it ever reaches Pydantic validation below, and so
+    # two flags that only differ by this mix-up still dedup against a
+    # genuinely equivalent already-normalised "NC" flag from another source.
     seen: set[tuple] = set()
     deduped_flags: list[dict] = []
     for flag in all_flags:
@@ -1910,6 +2084,11 @@ async def aggregate_results(state: AgentState) -> dict:
         "escalation_required": scoring.get("escalation_required", False),
         "escalation_reason":   scoring.get("escalation_reason"),
         "conversation_link":   state["call"].conversation_link,
+        "bank_validation":  bank,
+        "location_validation": location,
+        "doctor_validation": doctor,
+        "doctor_scope_validation": doctor_scope,
+        "coe_validation": coe,
     }
 
     logger.debug(
@@ -1966,6 +2145,18 @@ async def integrity_check(state: AgentState) -> dict:
             call_id,
         )
         result = result.model_copy(update={"overall_assessment": "escalate"})
+
+    # A bank, location, or doctor violation cannot remain a pass even if the
+    # LLM overlooks the deterministic scoring context; severity/escalation
+    # stay policy-driven. All are independent checks — any ONE alone is
+    # enough to trigger this.
+    bank_violation = (state.get("bank_validation") or {}).get("is_violation")
+    location_violation = (state.get("location_validation") or {}).get("is_violation")
+    doctor_violation = (state.get("doctor_validation") or {}).get("is_violation")
+    doctor_scope_violation = (state.get("doctor_scope_validation") or {}).get("is_violation")
+    coe_violation = (state.get("coe_validation") or {}).get("is_violation")
+    if (bank_violation or location_violation or doctor_violation or doctor_scope_violation or coe_violation) and result.overall_assessment == "pass":
+        result = result.model_copy(update={"overall_assessment": "needs_review"})
 
     if result.overall_assessment == "escalate" and not result.escalation_required:
         logger.warning(
@@ -2398,6 +2589,7 @@ async def detect_insurance_intent(state: AgentState) -> dict:
 async def extract_appointment_details(
     state: AgentState, llm_client: LLMClient
 ) -> dict:
+    pass
     """
     LLM-based extraction node for appointment attributes.
 
@@ -2571,6 +2763,8 @@ async def extract_appointment_details(
 
 
 async def verify_appointment_in_db(state: AgentState) -> dict:
+    pass
+
     """
     Database-lookup node for appointment verification.
 
@@ -2990,3 +3184,1761 @@ async def handle_ineligible_patient(state: AgentState) -> dict:
         ),
     }
 
+"""
+eligibility_node.py
+───────────────────
+LangGraph node: check_patient_eligibility
+
+Position in the booking graph
+──────────────────────────────
+  detect_intent
+       │
+       ▼ (booking intent confirmed)
+  check_patient_eligibility          ← NEW
+       │
+       ├──(eligible)──────────────→  extract_appointment_details
+       ├──(not_eligible)──────────→  handle_ineligible_patient
+       └──(error / timeout)────────→ handle_error
+
+What this node does
+───────────────────
+1. Reads `iqama_number` from state (set by detect_intent or injected by the API layer).
+2. Calls Beneficiary_api() → /check-insurance → insurance coverage snapshot.
+3. Parses the response:
+     • ApiStatus == "Success" + at least one Insurance entry  → eligible
+     • ApiStatus != "Success" or empty Insurance list         → not_eligible
+     • Network / timeout / unexpected exception               → error
+4. Writes the parsed result back into state so downstream nodes
+   (infer_reservation_evaluation, scoring, etc.) can reference it.
+
+NOTE: EligibilityService.process_visit() requires a visit_id (post-booking).
+      Do NOT call it here. Wire it after the appointment is created in the DB.
+"""
+
+#from __future__ import annotations
+
+import logging
+import time
+import random
+from datetime import datetime
+from typing import Any
+
+from app.agent.state import AgentState          # adjust import to your project layout
+from app.eligibilty.eligibility import Beneficiary_api
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_beneficiary_response(iqama: int, raw_response: Any) -> dict:
+    """Parse the `/check-insurance` response into one authoritative outcome."""
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    default = {
+        "iqama_number": iqama,
+        "http_status": None,
+        "api_status": "Unknown",
+        "is_eligible": False,
+        "insurance": None,
+        "error_code": None,
+        "reason": "Invalid eligibility API response",
+        "transaction_name": None,
+        "checked_at": checked_at,
+    }
+    if not isinstance(raw_response, dict):
+        return default
+
+    http_status = raw_response.get("status_code")
+    response = raw_response.get("response")
+    if not isinstance(response, dict):
+        return {**default, "http_status": http_status, "reason": "Missing response payload"}
+
+    api_status = response.get("ApiStatus", "Unknown")
+    insurance_list = response.get("Insurance")
+    error_code = response.get("ErrorCode")
+    error_description = response.get("ErrorDescription")
+    transaction_name = response.get("TransactionName")
+    insurance_entry = (
+        insurance_list[0]
+        if isinstance(insurance_list, list) and insurance_list and isinstance(insurance_list[0], dict)
+        else None
+    )
+
+    is_eligible = (
+        http_status == 200
+        and api_status == "Success"
+        and insurance_entry is not None
+    )
+    if is_eligible:
+        reason = None
+    elif http_status != 200:
+        reason = f"Eligibility API returned HTTP status {http_status!r}"
+    elif api_status == "Fail":
+        reason = error_description or error_code or "Eligibility API reported no coverage"
+    elif api_status == "Success":
+        reason = "Eligibility API returned Success without a valid Insurance entry"
+    else:
+        reason = error_description or "Unknown eligibility API status"
+
+    return {
+        "iqama_number": iqama,
+        "http_status": http_status,
+        "api_status": api_status,
+        "is_eligible": is_eligible,
+        "insurance": insurance_entry,
+        "error_code": error_code,
+        "reason": reason,
+        "transaction_name": transaction_name,
+        "checked_at": checked_at,
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Node
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_patient_eligibility(state: AgentState) -> dict:
+    """
+    LangGraph node — runs BEFORE appointment extraction.
+
+    Reads
+    -----
+    state["iqama_number"]  : str | int   (required)
+
+    Writes
+    ------
+    state["eligibility_result"]  : dict   (always set, even on error)
+    state["error"]               : str    (only on hard failure)
+    """
+    raw_iqama = state.get("iqama_number")
+
+    # ── Guard: iqama_number must be present ─────────────────────────────────
+    if not raw_iqama:
+        logger.warning("check_patient_eligibility: iqama_number missing from state")
+        return {
+            "eligibility_result": {
+                "iqama_number": None,
+                "api_status":   "Fail",
+                "is_eligible":  False,
+                "insurance":    None,
+                "checked_at":   datetime.now().isoformat(timespec="seconds"),
+                "reason":       "iqama_number not provided",
+            }
+        }
+
+    # ── Normalise: convert to int (Beneficiary_api expects int) ─────────────
+    try:
+        iqama = int(str(raw_iqama).strip())
+    except (ValueError, TypeError) as exc:
+        logger.error("check_patient_eligibility: cannot coerce iqama to int — %s", exc)
+        return {
+            "error": f"Invalid Iqama number format: {raw_iqama!r}",
+            "eligibility_result": {
+                "iqama_number": raw_iqama,
+                "api_status":   "Fail",
+                "is_eligible":  False,
+                "insurance":    None,
+                "checked_at":   datetime.now().isoformat(timespec="seconds"),
+                "reason":       f"Non-numeric Iqama: {raw_iqama}",
+            },
+        }
+
+    # ── Call Beneficiary API ─────────────────────────────────────────────────
+    logger.info("check_patient_eligibility: calling Beneficiary_api for iqama=%d", iqama)
+
+    try:
+        # Small random jitter — matches the pattern in Iqama_table()
+        jitter_ms = random.uniform(10, 30)
+        time.sleep(jitter_ms / 1000)
+
+        raw_response = Beneficiary_api(iqama)
+
+    except Exception as exc:
+        logger.exception(
+            "check_patient_eligibility: Beneficiary_api raised an exception: %s", exc
+        )
+        return {
+            "error": f"Eligibility API call failed: {exc}",
+            "eligibility_result": {
+                "iqama_number": iqama,
+                "api_status":   "Fail",
+                "is_eligible":  False,
+                "insurance":    None,
+                "checked_at":   datetime.now().isoformat(timespec="seconds"),
+                "reason":       str(exc),
+            },
+        }
+
+    # ── Parse & classify ─────────────────────────────────────────────────────
+    result = _parse_beneficiary_response(iqama, raw_response)
+
+    if result["is_eligible"]:
+        logger.info(
+            "check_patient_eligibility: iqama=%d → ELIGIBLE (insurer: %s)",
+            iqama,
+            result["insurance"].get("InsuranceCompanyEN", "unknown"),
+        )
+    else:
+        logger.warning(
+            "check_patient_eligibility: iqama=%d → NOT ELIGIBLE (api_status=%s)",
+            iqama,
+            result["api_status"],
+        )
+
+    return {"eligibility_result": result}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Router (add this to graph.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _eligibility_router(state: AgentState):
+    """
+    Conditional edge after check_patient_eligibility.
+
+    Returns
+    -------
+    "eligible"      → proceed to extract_appointment_details
+    "not_eligible"  → route to handle_ineligible_patient (graceful rejection)
+    "error"         → route to handle_error
+    """
+    if state.get("error"):
+        return "error"
+
+    result = state.get("eligibility_result", {})
+
+    if result.get("is_eligible"):
+        return "eligible"
+
+    return "not_eligible"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ineligible handler (simple, no LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def handle_ineligible_patient(state: AgentState) -> dict:
+    """
+    Pure-Python node — no LLM call needed.
+    Records the rejection reason and surfaces a human-readable message
+    that the downstream response builder can include in the agent's reply.
+    """
+    result = state.get("eligibility_result", {})
+    iqama  = result.get("iqama_number", "unknown")
+
+    api_status = result.get("api_status", "Unknown")
+    reason     = result.get("reason", "Insurance coverage not found")
+
+    logger.info(
+        "handle_ineligible_patient: iqama=%s api_status=%s reason=%s",
+        iqama, api_status, reason,
+    )
+
+    return {
+        "ineligible_reason": reason,
+        "final_response": (
+            "عذراً، لم نتمكن من التحقق من تغطيتك التأمينية. "
+            "يرجى التواصل مع شركة التأمين أو زيارة أقرب فرع. "
+            f"(رقم الإقامة: {iqama})"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node – validate_bank_information (app.service_hub)
+#   Fully independent of validate_location — separate graph node, separate
+#   CRM fetch/cache (app.service_hub.crm_bank), separate state key
+#   (bank_validation). The only thing the two share is the transcript-turn
+#   splitter in app.services.text_helpers.
+# ---------------------------------------------------------------------------
+def _not_applicable_bank_result(resolved_bu: str | None) -> dict:
+    """Shared NOT_APPLICABLE shape for when bank validation does not apply.
+    Used by BOTH the graph-level skip path (see skip_bank_validation below —
+    no bank intent at all, so validate_bank_information_node is never
+    reached) and validate_bank_information_node's own internal gate, kept
+    as a defensive fallback in case the node is ever reached without the
+    graph router having confirmed intent first."""
+    return {
+        "outcome": "NOT_APPLICABLE", "applicable": False,
+        "request_detected": False, "requested_business_unit": resolved_bu,
+        "provided_identifiers": [], "is_violation": False,
+        "reason": "No bank request within bank-validation scope (AFW/AHJ/AKW/ALW) was detected.",
+    }
+
+
+def skip_bank_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's bank-intent router
+    (_bank_intent_router) when there is no bank intent at all — reusing the
+    exact same gate validate_bank_information_node itself uses
+    (bank_validation_needed / detect_bank_signals), so the decision is never
+    duplicated. validate_bank_information is not on this path: no CRM
+    fetch, no business-unit bank resolution beyond the cheap keyword signal
+    already used for routing, and — deliberately — no node_trace entry for
+    'validate_bank_information', since the node never actually ran.
+    """
+    call = state["call"]
+    signals = detect_bank_signals(call)
+    logger.info("bank validation skipped | call_id=%s reason=no_bank_intent", call.call_id)
+    return {"bank_validation": _not_applicable_bank_result(signals[4])}
+
+
+async def validate_bank_information_node(state: AgentState) -> dict:
+    pass
+    """Run deterministic KSA-only bank validation.
+
+    Under normal graph execution this node is only reached at all when
+    app.agent.graph's bank-intent router (_bank_intent_router) has already
+    confirmed bank_validation_needed — see
+    app.service_hub.bank_validation.bank_validation_needed /
+    detect_bank_signals, which the router reuses directly rather than
+    duplicating. The gate below is kept as a defensive fallback (not the
+    primary mechanism any more): it re-checks the same condition so that
+    even if this node were ever reached without going through the router,
+    it would still degrade to a safe, non-punitive NOT_APPLICABLE instead
+    of running CRM lookups it has no real signal to justify.
+
+    Business-Unit resolution (app.service_hub.bank_validation.resolve_business_unit)
+    is keyword-map-driven, not CRM-location-based — this node no longer
+    depends on app.service_hub's location CRM fetch at all, unlike before.
+    """
+    call = state["call"]
+    signals = detect_bank_signals(call)
+    # Avoid CRM access for conversations with no supported BU / no bank
+    # request / no agent-provided financial identifier; keeps unrelated
+    # flows (and out-of-scope BUs) untouched.
+    if not bank_validation_needed(call, signals):
+        result = _not_applicable_bank_result(signals[4])
+    else:
+        try:
+            from app.service_hub.crm_bank import fetch_bank_accounts
+            banks = fetch_bank_accounts()
+            # Missing reference data is non-punitive: correctness cannot be
+            # verified safely, so report an unresolved system-data condition.
+            if not banks:
+                result = {
+                    "outcome": "BUSINESS_UNIT_UNRESOLVED", "applicable": False,
+                    "request_detected": True, "requested_business_unit": signals[4],
+                    "provided_identifiers": [], "is_violation": False,
+                    "reason": "Authoritative CRM bank data is unavailable; no agent violation was inferred.",
+                }
+            else:
+                result = validate_ksa_bank_information(call, banks, signals)
+        except Exception as exc:  # Reference-data failures are non-punitive.
+            logger.warning("bank validation unavailable | call_id=%s | %s", call.call_id, exc)
+            result = {
+                "outcome": "BUSINESS_UNIT_UNRESOLVED", "applicable": False,
+                "request_detected": True, "requested_business_unit": signals[4],
+                "provided_identifiers": [], "is_violation": False,
+                "reason": "Authoritative CRM bank data could not be read; no agent violation was inferred.",
+            }
+    logger.info("bank validation | call_id=%s outcome=%s bu=%s", call.call_id, result["outcome"], signals[4])
+    return {"bank_validation": result, "node_trace": _trace(state, "validate_bank_information")}
+
+
+def _not_applicable_location_result() -> dict:
+    """Shared NOT_APPLICABLE shape for when location validation does not
+    apply. Used by BOTH the graph-level skip path (see
+    skip_location_validation below — no location intent at all, so
+    validate_location_node is never reached) and validate_location_node's
+    own internal gate, kept as a defensive fallback in case the node is
+    ever reached without the graph router having confirmed intent first."""
+    return {
+        "outcome": "NOT_APPLICABLE", "applicable": False,
+        "request_detected": False, "requested_branch": None,
+        "crm_location": None, "provided_location": None,
+        "match_confidence": None, "is_violation": False,
+        "reason": "No location/address request or agent-provided address was detected.",
+    }
+
+
+def skip_location_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's location-intent
+    router (_location_intent_router) when there is no location intent at
+    all — reusing the exact same gate validate_location_node itself uses
+    (location_validation_needed / detect_location_intent), so the decision
+    is never duplicated. validate_location is not on this path: no CRM
+    fetch, no branch resolution, and — deliberately — no node_trace entry
+    for 'validate_location', since the node never actually ran.
+    """
+    call = state["call"]
+    _requested, patient_text, agent_text = detect_location_signals(call)
+    reason = "home_service_location" if is_home_service_location_text(patient_text, agent_text) else "no_location_intent"
+    logger.info("location validation skipped | call_id=%s reason=%s", call.call_id, reason)
+    print(f"[location] skipped | call_id={call.call_id} reason={reason}", flush=True)
+    return {"location_validation": _not_applicable_location_result()}
+
+
+# ---------------------------------------------------------------------------
+# Node – validate_location (app.service_hub)
+#   Fully independent of validate_bank_information — see above.
+# ---------------------------------------------------------------------------
+async def validate_location_node(state: AgentState) -> dict:
+    pass
+    """Run deterministic KSA-only branch/location validation.
+
+    Under normal graph execution this node is only reached at all when
+    app.agent.graph's location-intent router (_location_intent_router) has
+    already confirmed patient_has_location_intent OR
+    agent_has_location_information — see
+    app.service_hub.location_validation.detect_location_intent /
+    location_validation_needed, which the router reuses directly rather
+    than duplicating. The gate below is kept as a defensive fallback (not
+    the primary mechanism any more): it re-checks the same condition so
+    that even if this node were ever reached without going through the
+    router, it would still degrade to a safe, non-punitive NOT_APPLICABLE
+    instead of running CRM lookups it has no real signal to justify.
+    """
+    call = state["call"]
+    signals = detect_location_signals(call)
+    requested, patient_text, agent_text = signals
+    patient_intent, agent_intent = detect_location_intent(patient_text, agent_text)
+    logger.info(
+        "location intent | call_id=%s patient_request=%s agent_provided=%s",
+        call.call_id, patient_intent, agent_intent,
+    )
+    if not location_validation_needed(call, signals):
+        logger.info("location validation skipped | call_id=%s reason=no_location_intent", call.call_id)
+        result = _not_applicable_location_result()
+    else:
+        try:
+            from app.service_hub.crm_location import fetch_ksa_locations
+            locations = fetch_ksa_locations()
+            if not locations:
+                logger.warning("[location_validation] CRM location lookup failed | call_id=%s reason=empty_result", call.call_id)
+                result = {
+                    "outcome": "BRANCH_UNRESOLVED", "applicable": False,
+                    "request_detected": requested, "requested_branch": None,
+                    "crm_location": None, "provided_location": None,
+                    "match_confidence": None, "is_violation": False,
+                    "reason": "Authoritative CRM location data is unavailable; no agent violation was inferred.",
+                }
+            else:
+                result = validate_location_request(
+                    call, locations, patient_text=patient_text, agent_text=agent_text,
+                )
+        except Exception as exc:  # Reference-data failures are non-punitive.
+            logger.warning("[location_validation] CRM location lookup failed | call_id=%s | %s", call.call_id, exc)
+            result = {
+                "outcome": "BRANCH_UNRESOLVED", "applicable": False,
+                "request_detected": requested, "requested_branch": None,
+                "crm_location": None, "provided_location": None,
+                "match_confidence": None, "is_violation": False,
+                "reason": "Authoritative CRM location data could not be read; no agent violation was inferred.",
+            }
+        logger.info(
+            "location validation | call_id=%s outcome=%s branch=%s",
+            call.call_id, result["outcome"], result.get("requested_branch"),
+        )
+    return {"location_validation": result, "node_trace": _trace(state, "validate_location")}
+
+
+def _not_applicable_doctor_result(context_specialty: str | None = None) -> dict:
+    """Shared NOT_APPLICABLE shape for when doctor validation does not
+    apply. Used by BOTH the graph-level skip path (see
+    skip_doctor_validation below — no named-doctor mention at all, so
+    validate_doctor_node is never reached) and validate_doctor_node's own
+    internal gate, kept as a defensive fallback.
+
+    context_specialty carries the deterministic doctor_context_specialty
+    (see app.service_hub.doctor_validation.extract_doctor_context_specialty)
+    even when no doctor name qualified — e.g. "دكتور اورام" alone must
+    still surface doctor_context_specialty='اورام' even though
+    doctor_name/doctor_validation_needed are correctly None/False."""
+    return {
+        "applicable": False, "outcome": "NOT_APPLICABLE", "doctor_resolved": False,
+        "doctor_key": None, "doctor_name_ar": None, "doctor_name_en": None,
+        "business_unit": None, "status": None, "opd_flag": None,
+        "candidate_count": 0, "validated_fields": {}, "scope_reference": None,
+        "doctor_context_specialty": context_specialty,
+        "is_violation": False,
+        "reason": "No named-doctor mention or recommendation was detected.",
+    }
+
+
+def skip_doctor_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's doctor-intent
+    router (_doctor_intent_router) when there is no named-doctor mention at
+    all — reusing the exact same gate validate_doctor_node itself uses
+    (doctor_validation_needed / detect_doctor_signals), so the decision is
+    never duplicated. validate_doctor is not on this path: no CRM fetch, no
+    doctor resolution, and — deliberately — no node_trace entry for
+    'validate_doctor', since the node never actually ran.
+    """
+    call = state["call"]
+    context_specialty = extract_doctor_context_specialty(call)
+    logger.info("doctor validation skipped | call_id=%s reason=no_doctor_mention", call.call_id)
+    print(
+        f"[doctor] extraction:\n"
+        f"[doctor]     doctors=[]\n"
+        f"[doctor]     specialty_context={context_specialty!r}\n"
+        f"[doctor] outcome:\n"
+        f"[doctor]     N/A",
+        flush=True,
+    )
+    return {"doctor_validation": _not_applicable_doctor_result(context_specialty)}
+
+
+# ---------------------------------------------------------------------------
+# Helper – extract_doctor_semantic_context
+#   Additive, LLM-based doctor-name/specialty extraction for Doctor
+#   Validation, using the SAME _focused_llm_call helper and prompt-response
+#   pattern extract_appointment_details already uses, but as its OWN
+#   dedicated prompt (DOCTOR_NAME_EXTRACTION_PROMPT) and its OWN call — it
+#   never reuses or changes the appointment-extraction flow itself, and it
+#   runs regardless of is_booking_intent (a doctor can be discussed without
+#   ever booking). On any failure (LLM error / malformed JSON) this
+#   degrades to (None, None) rather than raising — validate_doctor_
+#   information's semantic_doctor_name docstring covers exactly how that
+#   safely falls back to the existing deterministic extraction.
+# ---------------------------------------------------------------------------
+async def extract_doctor_semantic_context(
+    call, llm_client: LLMClient, state: AgentState,
+) -> tuple[str | None, str | None, str | None]:
+    """Returns (doctor_name, doctor_context_specialty, doctor_role).
+
+    doctor_role is read straight from DOCTOR_NAME_EXTRACTION_PROMPT's own
+    "doctor_role" field — an ADDITIVE signal, exactly like doctor_name/
+    doctor_context_specialty: on any failure (LLM error, malformed JSON,
+    or simply a missing/unrecognised key — including under the plain
+    "{}" a stub/degenerate LLM response produces) it degrades to None,
+    never to "agent_self_introduction". Only validate_doctor_node's guard
+    treats "agent_self_introduction" specially, and only because that
+    string can ONLY come from a real, positive LLM classification — never
+    a default — so it is safe to trust as an authoritative skip signal.
+    """
+    try:
+        user_prompt = DOCTOR_NAME_EXTRACTION_PROMPT.format(transcript=call.transcript)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("extract_doctor_semantic_context | call_id=%s prompt build failed | %s", call.call_id, exc)
+        return None, None, None
+
+    data, err = await _focused_llm_call(
+        "extract_doctor_semantic_context", call.call_id, user_prompt, llm_client, state,
+    )
+    if err or not isinstance(data, dict):
+        return None, None, None
+
+    data_lower = {k.lower(): v for k, v in data.items()}
+    doctor_name = data_lower.get("doctor_name")
+    specialty = data_lower.get("doctor_context_specialty")
+    doctor_role = data_lower.get("doctor_role")
+    doctor_name = doctor_name.strip() if isinstance(doctor_name, str) and doctor_name.strip() else None
+    specialty = specialty.strip() if isinstance(specialty, str) and specialty.strip() else None
+    doctor_role = doctor_role.strip() if isinstance(doctor_role, str) and doctor_role.strip() else None
+    return doctor_name, specialty, doctor_role
+
+
+# ---------------------------------------------------------------------------
+# Node – validate_doctor (app.service_hub.doctor_validation)
+#   Deterministic factual-information check. Fully independent of
+#   validate_bank_information / validate_location — separate graph node,
+#   separate CRM fetch/cache (app.service_hub.crm_doctors), separate state
+#   key (doctor_validation).
+# ---------------------------------------------------------------------------
+async def validate_doctor_node(state: AgentState, llm_client: LLMClient) -> dict:
+    """Run deterministic doctor-information validation.
+
+    Under normal graph execution this node is only reached at all when
+    app.agent.graph's doctor-intent router (_doctor_intent_router) has
+    already confirmed doctor_validation_needed — see
+    app.service_hub.doctor_validation.doctor_validation_needed /
+    detect_doctor_signals, which the router reuses directly rather than
+    duplicating. The gate below is kept as a defensive fallback only.
+
+    This is the ONE place a call's clean doctor-name/specialty extraction,
+    routing, CRM resolution, and outcome are all printed at INFO level —
+    see extract_doctor_semantic_context and validate_doctor_information's
+    semantic_doctor_name parameter for how the LLM-vetted name (when
+    available) both drives this logging AND becomes the query CRM
+    resolution actually uses.
+
+    Self-introduction guard: when extract_doctor_semantic_context
+    positively classifies doctor_role as "agent_self_introduction", this
+    node exits immediately with the same NOT_APPLICABLE/N/A result the
+    graph-level skip path (skip_doctor_validation) uses — no CRM doctor
+    fetch, no resolution, no degree/specialty/notes/scope checks. This is
+    a defense-in-depth safety net alongside the deterministic gate above
+    (doctor_validation_needed/is_agent_self_introduction already correctly
+    excludes the common self-introduction phrasings before this node is
+    even reached — see app.agent.graph._doctor_intent_router): it only
+    fires on an EXPLICIT, positive string the LLM actively asserted, never
+    on an empty/default response (a stub or failed LLM call returns
+    doctor_role=None here, which never matches — see extract_doctor_
+    semantic_context's own docstring), so it can never turn a real,
+    resolvable doctor call into a false skip.
+    """
+    call = state["call"]
+    signals = detect_doctor_signals(call)
+    if not doctor_validation_needed(call, signals):
+        result = _not_applicable_doctor_result(extract_doctor_context_specialty(call))
+        return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
+    semantic_name, semantic_specialty, semantic_role = await extract_doctor_semantic_context(call, llm_client, state)
+    if semantic_role == "agent_self_introduction":
+        result = _not_applicable_doctor_result(semantic_specialty)
+        logger.info("doctor validation skipped | call_id=%s reason=agent_self_introduction (semantic)", call.call_id)
+        print(
+            f"[doctor] extraction:\n"
+            f"[doctor]     doctors=[]\n"
+            f"[doctor]     specialty_context={semantic_specialty!r}\n"
+            f"[doctor] outcome:\n"
+            f"[doctor]     N/A",
+            flush=True,
+        )
+        return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
+    intent_ctx = classify_doctor_context(call)
+    call_bu = getattr(call, "business_unit", None)
+    canonical_bu = canonical_doctor_bu(call_bu)
+
+    try:
+        from app.service_hub.crm_doctors import fetch_doctors
+        doctors = fetch_doctors()
+        if not doctors:
+            logger.warning("[doctor_validation] CRM doctor lookup failed | call_id=%s reason=empty_result", call.call_id)
+            result = {
+                **_not_applicable_doctor_result(),
+                "outcome": "INSUFFICIENT_REFERENCE_DATA",
+                "reason": "Authoritative CRM doctor data is unavailable; no agent violation was inferred.",
+            }
+        else:
+            result = validate_doctor_information(
+                call, doctors, signals,
+                semantic_doctor_name=semantic_name,
+                semantic_specialty_context=semantic_specialty,
+            )
+    except Exception as exc:  # Reference-data failures are non-punitive.
+        logger.warning("[doctor_validation] CRM doctor lookup failed | call_id=%s | %s", call.call_id, exc)
+        result = {
+            **_not_applicable_doctor_result(),
+            "outcome": "INSUFFICIENT_REFERENCE_DATA",
+            "reason": "Authoritative CRM doctor data could not be read; no agent violation was inferred.",
+        }
+
+    logger.info(
+        "doctor validation | call_id=%s outcome=%s doctor_key=%s",
+        call.call_id, result["outcome"], result.get("doctor_key"),
+    )
+    _resolved_name = result.get("doctor_name_ar") or result.get("doctor_name_en")
+    _requested_name = semantic_name or result.get("input_name")
+    _source = result.get("resolution_source") or ""
+    # bu_scoped: True/False once a resolution attempt actually ran (see
+    # _resolve_and_validate_one_doctor's resolution_source values), None
+    # when resolution never got that far at all (e.g. INSUFFICIENT_
+    # REFERENCE_DATA before any CRM pool existed).
+    _bu_scoped = ("bu_scoped" in _source) if _source else None
+    _match_method = (
+        None if not result.get("doctor_resolved")
+        else "partial" if (_requested_name and _resolved_name and normalize_arabic_text(_requested_name) != normalize_arabic_text(_resolved_name))
+        else "exact"
+    )
+    # Field-level breakdown for WHY a PASS/FAIL outcome was reached — the
+    # doctor was already correctly resolved by this point (see the
+    # resolution block above); PASS/FAIL is a SEPARATE, later check of
+    # which factual claims the Agent actually made about that doctor
+    # against their CRM record (degree/specialty/subspecialty/business
+    # unit/notes/scope/qualifications/examination age/fee — see
+    # _resolve_and_validate_one_doctor's field-by-field validation). Shown
+    # here so a FAIL is never a bare, unexplained verdict.
+    _validated_fields = result.get("validated_fields") or {}
+    _fields_summary = {k: v.get("outcome") for k, v in _validated_fields.items()}
+    print(
+        f"[doctor] extraction:\n"
+        f"[doctor]     doctors={[semantic_name] if semantic_name else []}\n"
+        f"[doctor]     specialty_context={semantic_specialty or result.get('doctor_context_specialty')!r}\n"
+        f"[doctor] routing:\n"
+        f"[doctor]     business_unit={call_bu}\n"
+        + (f"[doctor]     canonical_business_unit={canonical_bu}\n" if canonical_bu != call_bu else "")
+        + f"[doctor]     doctor_role={intent_ctx.get('doctor_role')}\n"
+        f"[doctor]     doctor_validation_needed=True\n"
+        f"[doctor] resolution:\n"
+        f"[doctor]     requested_name={_requested_name!r}\n"
+        f"[doctor]     requested_business_unit={call_bu!r}\n"
+        + (f"[doctor]     canonical_business_unit={canonical_bu!r}\n" if canonical_bu != call_bu else "")
+        + f"[doctor]     match_method={_match_method}\n"
+        f"[doctor]     bu_scoped={_bu_scoped}\n"
+        f"[doctor]     resolved_name={_resolved_name!r}\n"
+        f"[doctor]     resolved_business_unit={result.get('business_unit')!r}\n"
+        f"[doctor]     doctor_key={result.get('doctor_key')}\n"
+        f"[doctor] outcome:\n"
+        f"[doctor]     {result['outcome']}\n"
+        + (f"[doctor]     reason={result.get('reason')}\n" if result.get("reason") else "")
+        + (f"[doctor]     fields_checked={_fields_summary}" if _fields_summary else ""),
+        flush=True,
+    )
+    return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
+
+# ---------------------------------------------------------------------------
+# Node – infer_doctor_scope_validation (semantic, LLM-based)
+#   Separate from validate_doctor_node: judges whether the ALREADY-RESOLVED
+#   doctor's documented CRM scope is a reasonable fit for the patient's
+#   stated complaint. Runs one hop past inference_gate (via
+#   fetch_crm_offers_for_call), alongside behavioral/compliance/script/
+#   offer, so every inference branch stays at an EQUAL hop count from
+#   inference_gate — see graph.py's Step 3 comment: a mismatched hop count
+#   there previously caused the whole downstream chain to fire twice.
+#   Applicability is checked INLINE (not via a graph-level skip): when the
+#   gate fails, this still returns NOT_APPLICABLE without calling the LLM,
+#   the same pattern infer_offer_evaluation already uses for
+#   NO_OFFER_AVAILABLE/OFFER_NOT_APPLICABLE.
+# ---------------------------------------------------------------------------
+def _not_applicable_doctor_scope_result(reason: str) -> dict:
+    return {
+        "applicable": False, "outcome": "NOT_APPLICABLE",
+        "patient_need_summary": None, "doctor_scope_summary": None,
+        "matched_scope_evidence": [], "reasoning": reason,
+        "is_violation": False,
+    }
+
+
+def _normalize_doctor_scope_result(data: dict, fallback_outcome: str) -> dict:
+    """Guarantee the outgoing doctor_scope_validation state is always a
+    complete, safe structure — even when the LLM response was malformed or
+    incomplete (e.g. an empty {} from a weak/degenerate completion). This
+    node is only ever reached after the gate confirmed scope validation
+    IS applicable, so applicable=True always holds here; a genuinely
+    undeterminable semantic result degrades to the safe, non-punitive
+    UNCLEAR outcome rather than leaking outcome=None/applicable=None into
+    the final state. is_violation is never left non-boolean, and is never
+    True without an outcome that actually says so."""
+    if not isinstance(data.get("outcome"), str) or not data.get("outcome"):
+        data["outcome"] = fallback_outcome if isinstance(fallback_outcome, str) and fallback_outcome else "UNCLEAR"
+        data.setdefault(
+            "reasoning",
+            "Doctor scope validation could not be determined from the model response.",
+        )
+    data.setdefault("applicable", True)
+    if not isinstance(data.get("is_violation"), bool):
+        data["is_violation"] = data.get("outcome") == "UNSUITABLE"
+    data.setdefault("patient_need_summary", None)
+    data.setdefault("doctor_scope_summary", None)
+    data.setdefault("matched_scope_evidence", [])
+    data.setdefault("reasoning", "")
+    return data
+
+
+def skip_doctor_scope_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's doctor-scope
+    conditional edge off fetch_crm_offers_for_call (_doctor_scope_intent_router)
+    when doctor_scope_validation_needed() is False — reusing the exact same
+    gate (doctor_scope_skip_reason / doctor_scope_validation_needed)
+    infer_doctor_scope_validation itself uses defensively, so the routing
+    decision and the node's own fallback can never drift apart. This mirrors
+    skip_doctor_validation/skip_bank_validation/skip_location_validation:
+    infer_doctor_scope_validation is NOT on this path — no clinical-need
+    extraction, no scope-reference JSON, no LLM prompt is built, no LLM call
+    is made — and, deliberately, no node_trace entry for
+    'infer_doctor_scope_validation', since the node never actually ran. This
+    is what keeps a no-doctor (or doctor-but-no-clinical-need) call's trace
+    from ever showing a semantic scope evaluation that didn't happen.
+    """
+    call = state["call"]
+    doctor_result = state.get("doctor_validation")
+    _p_mentions, _a_mentions, patient_text, _agent_text = detect_doctor_signals(call)
+    reason = doctor_scope_skip_reason(doctor_result, patient_text, call) or "no_resolved_doctor"
+    logger.info("doctor_scope routing | call_id=%s needed=False reason=%s", call.call_id, reason)
+    print(f"[doctor_scope] skipped | call_id={call.call_id} reason={reason}", flush=True)
+    return {
+        "doctor_scope_validation": _not_applicable_doctor_scope_result(
+            "No medical complaint, unresolved doctor, or no scope evidence available.",
+        ),
+    }
+
+
+def _doctor_has_scope_evidence(scope_ref: dict) -> bool:
+    """Same broad evidence check as doctor_scope_skip_reason's condition
+    #2 (specialty/subspecialty/scope_of_service/scope_of_service_ar — at
+    least one), reused per-doctor in the multi-doctor recommendation-set
+    path below."""
+    return any(scope_ref.get(k) for k in ("scope_of_service", "scope_of_service_ar", "subspecialty", "specialty"))
+
+
+async def _infer_scope_for_one_doctor(
+    call, scope_ref: dict, clinical_need: str, patient_text: str, llm_client: LLMClient, state: AgentState,
+) -> tuple[dict, dict | None]:
+    """Judge ONE resolved doctor's fit for *clinical_need* — the exact LLM-
+    call + two deterministic safety-net body infer_doctor_scope_validation
+    has always used, now a reusable unit so a multi-doctor recommendation
+    set (see validate_doctor_information's docstring) can call it once per
+    INDEPENDENTLY-resolved doctor, each with its own CRM scope evidence,
+    all within this ONE graph node (never as separate graph nodes/hops —
+    see infer_doctor_scope_validation's docstring). Returns (data, err);
+    err is non-None only on an LLM/parse failure, letting the caller decide
+    whether to hard-fail (single-doctor path, unchanged behaviour) or soft-
+    degrade just this one doctor to UNCLEAR while the rest of the
+    recommendation set still gets evaluated (multi-doctor path).
+
+    The LLM never independently selects a doctor — it only judges fit for
+    a doctor validate_doctor_node already resolved; that resolution
+    (doctor_key/doctor_name_ar/doctor_name_en/business_unit) is the sole
+    authority here.
+
+    scope_of_service/scope_of_service_ar are the primary evidence handed to
+    the LLM — a bare specialty/subspecialty label is supporting context
+    only (see qa_prompt.build_doctor_scope_prompt's evidence hierarchy and
+    has_detailed_scope_evidence()). When that detailed scope text is
+    missing, a deterministic safety net below downgrades an LLM SUITABLE
+    verdict built on specialty alone back to UNCLEAR, rather than trusting
+    the LLM to always follow that instruction unprompted.
+    """
+    scope_ref = dict(scope_ref)
+
+    # Deterministic, precomputed evidence handed to the LLM alongside the raw
+    # CRM fields — see qa_prompt.build_doctor_scope_prompt's "SPECIALTY-ALONE
+    # SAFEGUARD" and "AGE-ELIGIBILITY RULE" sections. Never invents a patient
+    # age; a missing/ambiguous mention correctly yields a null hint.
+    detailed_scope = has_detailed_scope_evidence(scope_ref)
+    patient_age = extract_patient_stated_age(patient_text)
+    age_hint = check_age_eligibility(patient_age, scope_ref.get("examination_age"))
+    scope_ref["has_detailed_scope"] = detailed_scope
+    scope_ref["patient_age"] = patient_age
+    scope_ref["age_eligibility_hint"] = age_hint
+
+    doctor_reference_json = json.dumps(scope_ref, ensure_ascii=False)
+    doctor_label = scope_ref.get("doctor_name_ar") or scope_ref.get("doctor_name_en")
+    print(
+        f"[doctor_scope] recommendation candidate:\n"
+        f"[doctor_scope]   doctor_key={scope_ref.get('doctor_key')}\n"
+        f"[doctor_scope]   doctor={doctor_label}\n"
+        f"[doctor_scope]   patient_need={clinical_need.strip()[:200]}\n"
+        f"[doctor_scope]   scope_source={'scope_of_service' if detailed_scope else 'specialty_only'} "
+        f"age_eligibility_hint={age_hint}",
+        flush=True,
+    )
+
+    user_prompt = build_doctor_scope_prompt(call, patient_complaint=clinical_need, doctor_reference=doctor_reference_json)
+    logger.debug(
+        "infer_doctor_scope_validation | call_id=%s doctor_key=%s prompt_len=%d",
+        call.call_id, scope_ref.get("doctor_key"), len(user_prompt),
+    )
+
+    data, err = await _focused_llm_call(
+        "infer_doctor_scope_validation", call.call_id, user_prompt, llm_client, state
+    )
+    if err:
+        return {}, err
+
+    outcome = data.get("outcome", "UNCLEAR")
+
+    # Deterministic safety net #1 — never let a confident SUITABLE stand on
+    # specialty/subspecialty alone when no detailed scope text or relevant
+    # doctor note backs it up (belt-and-suspenders alongside the prompt's
+    # own "SPECIALTY-ALONE SAFEGUARD" instruction).
+    if outcome == "SUITABLE" and not detailed_scope and not (scope_ref.get("doctor_notes") or "").strip():
+        outcome = "UNCLEAR"
+        data["outcome"] = "UNCLEAR"
+        data["is_violation"] = False
+        data["reasoning"] = (
+            "Downgraded from SUITABLE: no documented scope_of_service text or doctor note "
+            "supports this doctor for the stated need — only a specialty/subspecialty label "
+            "was available, which is insufficient evidence on its own. "
+            + str(data.get("reasoning") or "")
+        ).strip()
+        print(f"[doctor_scope]   outcome=UNCLEAR reason=missing_scope_data (downgraded from SUITABLE)", flush=True)
+
+    # Deterministic safety net #2 — an explicit, confidently-parsed
+    # patient-age violation of the doctor's documented eligibility range is
+    # strong enough to override a false SUITABLE; it never manufactures a
+    # positive when age_eligibility_hint is unavailable.
+    elif outcome == "SUITABLE" and age_hint == "outside_range":
+        outcome = "UNSUITABLE"
+        data["outcome"] = "UNSUITABLE"
+        data["is_violation"] = True
+        data["reasoning"] = (
+            f"Downgraded from SUITABLE: the patient's stated age ({patient_age}) falls outside "
+            f"the doctor's documented examination_age eligibility ({scope_ref.get('examination_age')}). "
+            + str(data.get("reasoning") or "")
+        ).strip()
+        print(f"[doctor_scope]   outcome=UNSUITABLE reason=age_ineligible (downgraded from SUITABLE)", flush=True)
+
+    data = _normalize_doctor_scope_result(data, outcome)
+    outcome = data["outcome"]
+    print(f"[doctor_scope]   outcome={outcome}", flush=True)
+    data["doctor_key"] = scope_ref.get("doctor_key")
+    return data, None
+
+
+def _aggregate_doctor_scope_outcomes(per_doctor: list[dict]) -> tuple[str, bool, str]:
+    """Combine N independent per-doctor scope verdicts (a recommendation
+    SET — see infer_doctor_scope_validation's multi-doctor path) into one
+    overall (outcome, is_violation, reasoning) using the SAME business
+    semantics as _aggregate_doctor_recommendation_outcomes on the
+    deterministic side: the first doctor's verdict never stands in for the
+    whole set.
+      - any UNSUITABLE           -> overall UNSUITABLE (a real violation)
+      - none UNSUITABLE, any UNCLEAR/NOT_APPLICABLE -> overall UNCLEAR
+      - every doctor SUITABLE    -> overall SUITABLE
+    """
+    outcomes = [d.get("outcome") for d in per_doctor]
+    if any(o == "UNSUITABLE" for o in outcomes):
+        bad = [d for d in per_doctor if d.get("outcome") == "UNSUITABLE"]
+        names = ", ".join(str(d.get("doctor_key")) for d in bad)
+        return "UNSUITABLE", True, f"{len(bad)} of {len(per_doctor)} recommended doctor(s) judged unsuitable (doctor_key(s): {names})."
+    if any(o != "SUITABLE" for o in outcomes):
+        return "UNCLEAR", False, f"{len(per_doctor)} recommended doctor(s) evaluated — at least one could not be confidently judged suitable."
+    return "SUITABLE", False, f"All {len(per_doctor)} recommended doctors are documented as suitable for the stated need."
+
+
+async def infer_doctor_scope_validation(state: AgentState, llm_client: LLMClient) -> dict:
+    """Call the LLM to judge doctor-recommendation suitability. Under normal
+    graph execution this node is only reached at all when app.agent.graph's
+    doctor-scope conditional edge (_doctor_scope_intent_router) has already
+    confirmed doctor_scope_validation_needed — see
+    app.service_hub.doctor_validation.doctor_scope_validation_needed /
+    doctor_scope_skip_reason, which the router reuses directly rather than
+    duplicating. The gate below is kept as a defensive fallback only (same
+    pattern as validate_doctor_node's internal gate).
+
+    Supports TWO shapes, mirroring validate_doctor_node/
+    validate_doctor_information's own single-vs-multi-doctor split:
+      - Single doctor (state["doctor_validation"] has no "doctors" list, or
+        exactly one entry) — the original, unchanged behaviour.
+      - A genuine recommendation SET (state["doctor_validation"]["doctors"]
+        has 2+ entries) — every INDEPENDENTLY RESOLVED doctor in the set is
+        judged against the SAME patient clinical need, concurrently
+        (asyncio.gather), all within this ONE graph node — never as
+        separate graph nodes/hops, so downstream single-execution
+        guarantees (infer_overall_scoring/aggregate_results/
+        integrity_check/save_to_database/finalize) are entirely
+        unaffected. The result adds a "doctors" list (one per-doctor scope
+        verdict) and an aggregated top-level outcome/is_violation (see
+        _aggregate_doctor_scope_outcomes) — never one LLM verdict applied
+        to all doctors, and never the first doctor's verdict standing in
+        for the whole set.
+    """
+    call = state["call"]
+    doctor_result = state.get("doctor_validation")
+    _p_mentions, _a_mentions, patient_text, _agent_text = detect_doctor_signals(call)
+
+    if not doctor_scope_validation_needed(doctor_result, patient_text, call):
+        reason = doctor_scope_skip_reason(doctor_result, patient_text, call) or "no_resolved_doctor"
+        logger.info("doctor_scope validation skipped | call_id=%s reason=%s", call.call_id, reason)
+        print(f"[doctor_scope] skipped | call_id={call.call_id} reason={reason}", flush=True)
+        return {
+            "doctor_scope_validation": _not_applicable_doctor_scope_result(
+                "No medical complaint, unresolved doctor, or no scope evidence available.",
+            ),
+            "node_trace": _trace(state, "infer_doctor_scope_validation"),
+        }
+
+    clinical_need = extract_patient_clinical_need(call) or patient_text
+    recommended = (doctor_result or {}).get("doctors") or []
+
+    if len(recommended) <= 1:
+        # Single-doctor path — EXACT current behaviour, including the
+        # hard-fail-on-LLM-error return, unchanged.
+        scope_ref = dict((doctor_result or {}).get("scope_reference") or {})
+        print(
+            f"[doctor_scope] validation started | call_id={call.call_id} "
+            f"doctor_key={scope_ref.get('doctor_key')} doctor='{scope_ref.get('doctor_name_ar') or scope_ref.get('doctor_name_en')}'",
+            flush=True,
+        )
+        data, err = await _infer_scope_for_one_doctor(call, scope_ref, clinical_need, patient_text, llm_client, state)
+        if err:
+            return err
+        logger.info("infer_doctor_scope_validation | call_id=%s outcome=%s", call.call_id, data["outcome"])
+        return {
+            "doctor_scope_validation": data,
+            "usage_list": [data.get("_usage", {})],
+            "node_trace": _trace(state, "infer_doctor_scope_validation"),
+        }
+
+    # ── Multi-doctor recommendation set: judge EVERY independently-resolved
+    # doctor against the SAME clinical need, concurrently, within this one
+    # node — never one LLM call whose verdict gets copy-pasted across all
+    # doctors. ──
+    print(f"[doctor_scope] validation started | call_id={call.call_id} recommended_doctor_count={len(recommended)}", flush=True)
+    print(f"[doctor_scope] patient_need: {clinical_need.strip()[:200]}", flush=True)
+
+    resolvable = [d for d in recommended if d.get("doctor_resolved") and _doctor_has_scope_evidence(d.get("scope_reference") or {})]
+    tasks = [
+        _infer_scope_for_one_doctor(call, d["scope_reference"], clinical_need, patient_text, llm_client, state)
+        for d in resolvable
+    ]
+    results = await asyncio.gather(*tasks) if tasks else []
+
+    usage_list = []
+    per_doctor: list[dict] = []
+    for d, (data, err) in zip(resolvable, results):
+        if err:
+            data = _normalize_doctor_scope_result(
+                {"reasoning": f"Scope evaluation failed for this doctor: {err.get('error', 'unknown error')}"},
+                "UNCLEAR",
+            )
+            data["doctor_key"] = d["scope_reference"].get("doctor_key")
+        usage_list.append(data.get("_usage", {}))
+        per_doctor.append(data)
+
+    # Doctors that never resolved (see validate_doctor_information's
+    # "doctors" list) or had no CRM scope evidence at all get an explicit
+    # NOT_APPLICABLE scope entry — never silently dropped from the set.
+    _resolvable_ids = {id(d) for d in resolvable}
+    for d in recommended:
+        if id(d) not in _resolvable_ids:
+            per_doctor.append({
+                **_not_applicable_doctor_scope_result(
+                    "Doctor was not resolved or has no CRM scope evidence to evaluate."
+                    if not d.get("doctor_resolved") else
+                    "No CRM specialty/subspecialty/scope-of-service evidence available for this doctor.",
+                ),
+                "doctor_key": (d.get("scope_reference") or {}).get("doctor_key"),
+                "input_name": d.get("input_name"),
+            })
+
+    if not per_doctor:
+        result = _not_applicable_doctor_scope_result("No resolved doctor in the recommendation set had scope evidence to evaluate.")
+        return {"doctor_scope_validation": result, "node_trace": _trace(state, "infer_doctor_scope_validation")}
+
+    judged = [d for d in per_doctor if d.get("outcome") in ("SUITABLE", "UNSUITABLE", "UNCLEAR")]
+    outcome, is_violation, reasoning = (
+        _aggregate_doctor_scope_outcomes(judged) if judged
+        else ("NOT_APPLICABLE", False, "No recommended doctor had evaluable scope evidence.")
+    )
+    logger.info(
+        "doctor_scope recommendation set | call_id=%s requested=%d judged=%d outcome=%s",
+        call.call_id, len(recommended), len(judged), outcome,
+    )
+    print(f"[doctor_scope] outcome: {outcome}", flush=True)
+
+    final = {
+        "applicable": True,
+        "outcome": outcome,
+        "patient_need_summary": clinical_need.strip()[:300],
+        "doctor_scope_summary": None,
+        "matched_scope_evidence": [],
+        "reasoning": reasoning,
+        "is_violation": is_violation,
+        "doctors": per_doctor,
+        "recommended_doctor_count": len(recommended),
+    }
+    return {
+        "doctor_scope_validation": final,
+        "usage_list": usage_list,
+        "node_trace": _trace(state, "infer_doctor_scope_validation"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node – infer_coe_validation (COE / Center of Excellence validation)
+#   Two related checks bundled in one result:
+#     1. Did the human agent recommend the COE that matches the patient's
+#        primary complaint?
+#     2. Did the human agent start the new COE booking with an approved
+#        primary doctor from that COE's first clinic?
+#   Trigger detection (app.service_hub.coe_validation.classify_coe_trigger)
+#   is fully deterministic and is decided at the GRAPH level by
+#   _coe_intent_router (app.agent.graph) — when it's not applicable, this
+#   node never executes at all (see skip_coe_validation). Its own internal
+#   gate remains as a defensive fallback only, mirroring
+#   infer_doctor_scope_validation/validate_doctor_node.
+#   The LLM is used ONLY for the semantic sub-tasks a regex genuinely
+#   cannot do reliably (identifying the primary complaint among several,
+#   recognising a faithful paraphrase of the approved script, and telling
+#   an INITIAL-appointment doctor apart from a later-referral mention) —
+#   every extracted doctor name is re-grounded against the deterministic
+#   transcript extraction, and doctor approval itself is always decided
+#   deterministically (coe_validation.resolve_primary_doctor_identity,
+#   which resolves an Arabic OR English extracted name to its canonical
+#   approved-doctor identity via an explicit alias table — never by
+#   comparing an Arabic string to an English one with fuzzy similarity),
+#   never by the LLM. A COE reference/CRM lookup failure never crashes the
+#   pipeline — it degrades to the safe DEFAULT_SCRIPTS_AR fallback.
+# ---------------------------------------------------------------------------
+def _doctor_offering_evidence(call: CallTranscript, initial_grounded: list[str]) -> str | None:
+    """Find the Agent turn that actually offered/booked one of
+    *initial_grounded*'s doctors, for use as speaker-attributed evidence
+    (see infer_coe_validation) — the doctor-offering/booking excerpt
+    itself, not just the COE introductory-script excerpt. Returns the
+    ORIGINAL raw turn text (never a translated/altered form)."""
+    if not initial_grounded:
+        return None
+    targets = {normalize_doctor_name_for_match(d) for d in initial_grounded if d}
+    targets.discard("")
+    if not targets:
+        return None
+    for speaker, text in split_transcript_turns(call.transcript):
+        if speaker != "agent":
+            continue
+        norm_text = normalize_doctor_name_for_match(text)
+        if any(t in norm_text for t in targets):
+            return text.strip()[:300]
+    return None
+
+
+def _not_applicable_coe_result(reason: str, campaign_info: dict[str, Any] | None = None) -> dict:
+    """*campaign_info* (see classify_campaign_relevance) is threaded
+    through even for a call whose COE validation was entirely SKIPPED —
+    a detected-but-diverted/pending/uncertain campaign is still useful QA
+    context, even though it never triggered validation or created a
+    context (see CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT)."""
+    campaign_info = campaign_info or {}
+    return {
+        "applicable": False,
+        "triggered": False,
+        "trigger_path": None,
+        "trigger_reason": reason,
+        "primary_complaint": None,
+        "expected_coe": None,
+        "recommended_coe": None,
+        "coe_match_status": "not_applicable",
+        "booking_discussed": False,
+        "recommended_or_selected_doctors": [],
+        "approved_primary_doctors": [],
+        "matched_primary_doctors": [],
+        "campaign_coe": None,
+        "campaign_detected": campaign_info.get("campaign_detected", False),
+        "campaign_candidate_coe": campaign_info.get("campaign_candidate_coe"),
+        "campaign_relevance": campaign_info.get("campaign_relevance"),
+        "active_campaign_coe": None,
+        "campaign_relevance_evidence": campaign_info.get("campaign_relevance_evidence"),
+        "validation_coe": None,
+        "primary_doctor_status": "not_applicable",
+        "existing_patient_exception": False,
+        "evidence": [],
+        "reason": reason,
+        "confidence": 1.0,
+        "is_violation": False,
+        # Multi-context representation (see app.service_hub.coe_validation.
+        # build_coe_evaluations) — empty/neutral when the node never ran.
+        "trigger_paths": [],
+        "coe_evaluations": [],
+        "overall_coe_status": "not_applicable",
+        "unassociated_initial_doctors": [],
+        "validated_coes": [],
+        "campaign_coes": [],
+        "explicit_agent_recommended_coes": [],
+        "missed_recommendation_coes": [],
+    }
+
+
+def _print_campaign_detection(campaign_info: dict[str, Any]) -> None:
+    """[coe] campaign | detected=... candidate=... relevance=... active=...
+    — logs ONLY the classification fields, NEVER the raw patient inquiry
+    text (see "avoid logging raw patient names/IDs/full complaints" — a
+    turn index or reason code belongs in the routing/skip lines instead,
+    never a verbatim excerpt here). No-op when no campaign was detected at
+    all, so an ordinary (non-campaign) call never prints a noise line."""
+    if not campaign_info.get("campaign_detected"):
+        return
+    print(
+        f"[coe] campaign | detected={campaign_info.get('campaign_detected')} "
+        f"candidate={campaign_info.get('campaign_candidate_coe')} "
+        f"relevance={campaign_info.get('campaign_relevance')} "
+        f"active={campaign_info.get('active_campaign_coe')}",
+        flush=True,
+    )
+
+
+def skip_coe_validation(state: AgentState) -> dict:
+    """Graph-level skip path, taken by app.agent.graph's COE-intent router
+    (_coe_intent_router) when classify_coe_trigger found no COE/specialized-
+    center trigger at all — reusing the exact same deterministic gate
+    infer_coe_validation itself uses defensively, so the decision is never
+    duplicated. infer_coe_validation is not on this path: no CRM COE fetch,
+    no LLM call, and — deliberately — no node_trace entry for
+    'infer_coe_validation', since the node never actually ran.
+    """
+    call = state["call"]
+    trigger_ctx = classify_coe_trigger(call)
+    campaign_info = trigger_ctx.get("campaign_info") or {}
+    reason_code = (
+        "completed_diagnostic_results_inquiry"
+        if trigger_ctx["trigger_reason"].startswith("completed_diagnostic_results_inquiry")
+        else trigger_ctx["trigger_reason"]
+    )
+    logger.info("coe validation skipped | call_id=%s reason=%s", call.call_id, reason_code)
+    _print_campaign_detection(campaign_info)
+    print(
+        f"[coe] routing | triggered=False reason={reason_code} eligible_specialties=[] coes=[]",
+        flush=True,
+    )
+    print(f"[coe] validation skipped | reason={reason_code}", flush=True)
+    return {"coe_validation": _not_applicable_coe_result(trigger_ctx["trigger_reason"], campaign_info)}
+
+
+async def infer_coe_validation(state: AgentState, llm_client: LLMClient) -> dict:
+    """Run COE validation. See module-level comment above for the overall
+    deterministic-gate + LLM-semantic-extraction + deterministic-safety-net
+    design, mirroring infer_doctor_scope_validation's architecture.
+    """
+    call = state["call"]
+    trigger_ctx = classify_coe_trigger(call)
+    if not trigger_ctx["triggered"]:
+        # Defensive fallback only — the graph router (_coe_intent_router)
+        # never routes here when classify_coe_trigger says untriggered
+        # (it routes to skip_coe_validation instead, before any CRM/LLM
+        # call); this branch exists for direct/test invocation of this
+        # node. Logs the same routing/skip lines skip_coe_validation
+        # prints, so a completed-results-inquiry or diverted-campaign call
+        # reads identically regardless of which path reached this
+        # conclusion.
+        campaign_info = trigger_ctx.get("campaign_info") or {}
+        reason_code = (
+            "completed_diagnostic_results_inquiry"
+            if trigger_ctx["trigger_reason"].startswith("completed_diagnostic_results_inquiry")
+            else trigger_ctx["trigger_reason"]
+        )
+        _print_campaign_detection(campaign_info)
+        print(
+            f"[coe] routing | triggered=False reason={reason_code} eligible_specialties=[] coes=[]",
+            flush=True,
+        )
+        print(f"[coe] validation skipped | reason={reason_code}", flush=True)
+        result = _not_applicable_coe_result(trigger_ctx["trigger_reason"], campaign_info)
+        return {"coe_validation": result, "node_trace": _trace(state, "infer_coe_validation")}
+
+    # ── Deterministic extraction (never depends on the LLM) ────────────────
+    det_primary, det_categories = resolve_primary_complaint(call)
+    patient_doctors, agent_doctors, _ignored = extract_doctor_turn_candidates(call)
+    # Trim a trailing clinic/department/specialty connector (e.g. "بعياده
+    # المخ") that the shared extraction engine's stop-marker regex doesn't
+    # catch when fused with a leading "ب" — see clean_extracted_doctor_
+    # name's docstring. COE-local cleanup only; the shared extraction
+    # engine itself (used by other, unrelated validators) is untouched.
+    agent_doctors = [clean_extracted_doctor_name(d) for d in agent_doctors]
+    # Reject candidates that are actually a specialty/clinic/connector phrase
+    # (e.g. "جهاز هضمي" out of "لدكتور جهاز هضمي") or a generic referral
+    # phrase (e.g. "تحويل طبي") rather than an actual doctor name — additive,
+    # COE-local safeguard; the shared extraction engine itself is untouched
+    # (see is_plausible_coe_doctor_candidate's docstring).
+    agent_doctors = [d for d in agent_doctors if is_plausible_coe_doctor_candidate(d)]
+    booking_discussed = bool(agent_doctors)
+    existing_evidence_det = existing_patient_exception_evidence(call)
+    # A structured campaign identifier proves only WHERE the conversation
+    # originated — never that the patient's substantive inquiry is
+    # actually about that campaign's COE (see CAMPAIGN DETECTION IS NOT
+    # CAMPAIGN ENGAGEMENT). campaign_coe (the legacy scalar AND the
+    # authoritative value primary-doctor eligibility is checked against
+    # below) is therefore the ENGAGED campaign only — active_campaign_coe
+    # — never the bare candidate a diverted/pending/uncertain campaign
+    # still names (that candidate remains separately available as
+    # campaign_candidate_coe, metadata only, never an evaluation context
+    # or a recommendation requirement).
+    # Reuses trigger_ctx's OWN campaign_info (computed once, inside
+    # classify_coe_trigger) — never a second, independently-computed
+    # classify_campaign_relevance call, so the two can never diverge (see
+    # classify_coe_routing's docstring).
+    campaign_info = trigger_ctx.get("campaign_info") or {}
+    campaign_coe = campaign_info.get("active_campaign_coe")
+    _print_campaign_detection(campaign_info)
+
+    # ── COE reference (CRM, non-fatal on failure) ───────────────────────────
+    try:
+        from app.service_hub.crm_coe import fetch_coe_reference
+        coe_rows = fetch_coe_reference()
+    except Exception as exc:  # noqa: BLE001 — a COE lookup failure must never crash the pipeline
+        logger.warning("coe validation | call_id=%s CRM COE fetch failed (non-fatal) | %s", call.call_id, exc)
+        coe_rows = []
+    reference = build_coe_reference(coe_rows)
+    scripts = scripts_from_reference(reference)
+    # resolve_recommended_coe never trusts ungated fuzzy script similarity
+    # (see SCRIPT SIMILARITY GATING) — a generic agent wrap-up built
+    # entirely from shared script boilerplate can no longer be reported as
+    # an explicit recommendation for any COE.
+    det_recommended = resolve_recommended_coe(call, scripts)
+
+    # ── Multi-context evaluation (deterministic, additive) ──────────────────
+    # One INDEPENDENT context per grounded COE discussed in the call — never
+    # collapsed into a single scalar, and never cross-matching one doctor
+    # against an unrelated COE (see app.service_hub.coe_validation.
+    # build_coe_evaluations). This runs alongside, not instead of, the
+    # single-scalar computation below, which stays byte-for-byte the same
+    # for a genuinely single-COE call (see the backward-compatibility note
+    # further down where the two are reconciled).
+    coe_evaluations, _coe_rejected = build_coe_evaluations(call, scripts, return_rejected=True)
+    for _rejected_rec in _coe_rejected["recommendations"]:
+        print(
+            f"[coe] recommendation rejected | candidate={_rejected_rec['candidate']} "
+            f"method={_rejected_rec['method']} reason={_rejected_rec['reason']}",
+            flush=True,
+        )
+    for _rejected_ctx in _coe_rejected["contexts"]:
+        print(f"[coe] context rejected | coe={_rejected_ctx['coe']} reason={_rejected_ctx['reason']}", flush=True)
+    unassociated_doctors = unassociated_initial_doctors(call)
+
+    # ── Semantic extraction (LLM) — only for what regex genuinely can't do
+    # reliably: disambiguating a primary complaint among several, faithful-
+    # paraphrase recognition, and initial-vs-referral doctor intent. ───────
+    coe_reference_json = json.dumps(
+        {key: {"first_clinic": entry["first_clinic"], "approved_script": entry["script_ar"]} for key, entry in reference.items()},
+        ensure_ascii=False,
+    )
+    user_prompt = build_coe_prompt(
+        call,
+        coe_reference=coe_reference_json,
+        trigger_reason=trigger_ctx["trigger_reason"],
+        trigger_path=trigger_ctx["trigger_path"],
+    )
+    data, err = await _focused_llm_call("infer_coe_validation", call.call_id, user_prompt, llm_client, state)
+    if err:
+        # A COE check must never crash the whole pipeline — degrade to a
+        # safe, non-punitive uncertain result instead of propagating the
+        # LLM failure to handle_error.
+        logger.warning("coe validation | call_id=%s LLM call failed (non-fatal) | %s", call.call_id, err.get("error"))
+        data = {}
+    usage = [data.get("_usage", {})] if isinstance(data, dict) else []
+
+    llm_category = data.get("primary_complaint_category")
+    llm_category = llm_category if llm_category in AUTHORITATIVE_PRIMARY_DOCTORS else None
+    # An LLM-claimed recommended_coe is discarded unless an actual Agent
+    # turn contains real transcript evidence for it — never accepted
+    # merely because it's one of the four categories shown as reference
+    # data (see ground_llm_coe_value's docstring). This is what stops a
+    # hallucinated value (e.g. "IBD" with zero supporting agent evidence)
+    # from producing a false mismatch.
+    llm_recommended = ground_llm_coe_value(call, data.get("recommended_coe"))
+    llm_primary_complaint_text = data.get("primary_complaint") if isinstance(data.get("primary_complaint"), str) else None
+    initial_doctors_raw = data.get("initial_doctors") if isinstance(data.get("initial_doctors"), list) else []
+    referral_only_raw = data.get("referral_only_doctors") if isinstance(data.get("referral_only_doctors"), list) else []
+    llm_existing = bool(data.get("existing_patient_exception"))
+    llm_existing_evidence = data.get("existing_patient_evidence") if isinstance(data.get("existing_patient_evidence"), str) else None
+
+    # ── Deterministic safety net: a confident single-category keyword hit
+    # always wins over the LLM; the LLM's category is only trusted when the
+    # deterministic pass found nothing, or agrees with it. ──────────────────
+    if det_primary:
+        expected_coe = det_primary
+    elif llm_category and (not det_categories or llm_category in det_categories):
+        expected_coe = llm_category
+    else:
+        expected_coe = None
+    primary_complaint = llm_primary_complaint_text or det_primary
+
+    # Deterministic script/marker match wins over the LLM's own (now
+    # grounded) reading. recommended_coe represents ONLY an actual Agent
+    # recommendation/confirmation — never the campaign context (see
+    # validation_coe below for the value primary-doctor eligibility
+    # should actually be checked against).
+    recommended_coe = det_recommended or llm_recommended
+
+    # validation_coe is the COE whose primary-doctor rules apply — kept
+    # SEPARATE from recommended_coe so a campaign-established context is
+    # never misreported as something the human agent recommended (see
+    # module docstring / speaker-attribution rule):
+    #   1. campaign_origin conversation with an explicit campaign_coe ->
+    #      that campaign_coe is authoritative (an LLM value never
+    #      overrides deterministic campaign evidence).
+    #   2. otherwise, a grounded agent recommended_coe.
+    #   3. otherwise, an unambiguous expected_coe (patient's complaint).
+    if trigger_ctx["trigger_path"] == "campaign_origin" and campaign_coe:
+        validation_coe = campaign_coe
+    elif recommended_coe:
+        validation_coe = recommended_coe
+    else:
+        validation_coe = expected_coe
+
+    if not coe_evaluations:
+        # No independently-grounded, active COE context exists for this
+        # call at all (see LEGACY SCALAR FIELDS) — a detected campaign
+        # candidate or an ungrounded/rejected agent recommendation must
+        # never be compared against each other or reported as a mismatch
+        # (see the reported false Headache/IBD regression, where a
+        # diverted campaign candidate and a since-rejected fuzzy
+        # "recommendation" produced a false coe_match=fail). Campaign
+        # metadata (campaign_candidate_coe/campaign_relevance) remains
+        # separately available on the result even when every legacy
+        # scalar below goes None.
+        expected_coe = None
+        campaign_coe = None
+        recommended_coe = None
+        validation_coe = None
+        coe_match_status = "not_applicable"
+        coe_reason = (
+            "No independently-grounded, active COE context exists for this call — a detected "
+            "campaign or mention did not develop into a genuine active patient need or a "
+            "grounded agent recommendation."
+        )
+    elif expected_coe is None:
+        coe_match_status = "uncertain"
+        coe_reason = (
+            "No primary complaint mapping to a supported COE (IBD/Headache/Asthma/Diabetes) "
+            "could be reliably established."
+            if not det_categories and not llm_category else
+            "Multiple complaints were mentioned and no single primary complaint could be established."
+        )
+    elif recommended_coe is None:
+        if trigger_ctx["trigger_path"] == "campaign_origin" and campaign_coe:
+            # The COE context came from the campaign/post message, not
+            # from an explicit agent recommendation — never report a
+            # false "pass" attribution to the agent for this.
+            coe_match_status = "not_applicable"
+            coe_reason = (
+                f"The {campaign_coe} COE context was established by the marketing campaign/post "
+                "message, not by an explicit agent recommendation — no agent-recommendation "
+                "comparison applies for this call."
+            )
+        else:
+            coe_match_status = "uncertain"
+            coe_reason = "A COE trigger was detected but the specific COE recommended/confirmed by the agent could not be identified."
+    elif recommended_coe == expected_coe:
+        coe_match_status = "pass"
+        coe_reason = f"The agent recommended the {recommended_coe} COE, matching the patient's primary complaint ({expected_coe})."
+    else:
+        coe_match_status = "fail"
+        coe_reason = f"The patient's primary complaint maps to the {expected_coe} COE, but the agent recommended the {recommended_coe} COE."
+
+    # ── Doctor extraction, grounded against the deterministic transcript
+    # candidates — never trusting an LLM-invented name. ─────────────────────
+    referral_only_grounded = ground_doctor_names(referral_only_raw, agent_doctors)
+    initial_grounded = ground_doctor_names(initial_doctors_raw, agent_doctors)
+    if not initial_grounded:
+        # The LLM didn't (or couldn't) distinguish — fall back to every
+        # agent-named doctor that isn't already classified as referral-only.
+        initial_grounded = [d for d in agent_doctors if d not in referral_only_grounded]
+    # The same doctor can legitimately be named in more than one Agent turn
+    # (offered, then re-confirmed at booking) — dedupe by normalised
+    # identity (order-preserving, keeps the FIRST exact wording) so the
+    # reason/evidence never repeats the same doctor twice.
+    _seen_doctor_keys: set[str] = set()
+    _deduped_initial: list[str] = []
+    for _d in initial_grounded:
+        _key = normalize_doctor_name_for_match(_d) or _d
+        if _key not in _seen_doctor_keys:
+            _seen_doctor_keys.add(_key)
+            _deduped_initial.append(_d)
+    initial_grounded = _deduped_initial
+
+    existing_exception = bool(existing_evidence_det) or (
+        llm_existing and bool(llm_existing_evidence) and normalize_arabic_text(llm_existing_evidence) in normalize_arabic_text(call.transcript)
+    )
+    existing_evidence = existing_evidence_det or (llm_existing_evidence if existing_exception else None)
+
+    # Primary-doctor eligibility is checked against validation_coe (never
+    # an ungrounded LLM recommended_coe) — see its computation above.
+    coe_for_doctor_check = validation_coe
+    approved_list = AUTHORITATIVE_PRIMARY_DOCTORS.get(coe_for_doctor_check, []) if coe_for_doctor_check else []
+    # Resolve each initial doctor's CANONICAL approved identity — this is
+    # the fix for Arabic-vs-English cross-script matching: an Arabic
+    # extraction (e.g. "اسامه عبد السلام") is resolved against the
+    # explicit PRIMARY_DOCTOR_ALIASES table, never compared directly to the
+    # English canonical name via fuzzy string similarity. The ORIGINAL
+    # extracted string is preserved alongside its resolved identity so
+    # both can be reported (see doctor_reason below and
+    # recommended_or_selected_doctors, which always keeps the original
+    # transcript evidence unchanged).
+    matched_pairs = [
+        (extracted, canonical)
+        for extracted in initial_grounded
+        for canonical in [resolve_primary_doctor_identity(extracted, coe_for_doctor_check)]
+        if canonical
+    ]
+    matched_primary_doctors = []
+    for _extracted, canonical in matched_pairs:
+        if canonical not in matched_primary_doctors:
+            matched_primary_doctors.append(canonical)
+
+    def _describe_pair(extracted: str, canonical: str) -> str:
+        # Skip the redundant "(same text)" parenthetical only when the
+        # original extraction already IS the canonical spelling.
+        if normalize_doctor_name_for_match(extracted) == normalize_doctor_name_for_match(canonical):
+            return canonical
+        return f"{canonical} ({extracted})"
+
+    if existing_exception:
+        primary_doctor_status = "not_applicable"
+        doctor_reason = (
+            "Existing-patient exception: the transcript establishes an existing follow-up "
+            "relationship with a treating doctor, so normal follow-up booking is not judged "
+            "against the COE primary-doctor list."
+        )
+    elif not booking_discussed:
+        primary_doctor_status = "not_applicable"
+        doctor_reason = "The conversation did not reach doctor selection or booking."
+    elif coe_for_doctor_check is None:
+        primary_doctor_status = "uncertain"
+        doctor_reason = "A doctor was mentioned but the COE could not be confidently identified, so primary-doctor eligibility cannot be determined."
+    elif matched_pairs:
+        primary_doctor_status = "pass"
+        described = [_describe_pair(extracted, canonical) for extracted, canonical in matched_pairs]
+        doctor_reason = (
+            f"The initial {coe_for_doctor_check} COE booking included approved primary "
+            f"doctor(s): {', '.join(described)}."
+        )
+    elif initial_grounded:
+        primary_doctor_status = "fail"
+        doctor_reason = (
+            f"The initial {coe_for_doctor_check} COE booking started with a doctor "
+            f"({', '.join(initial_grounded)}) who is not on the approved primary-doctor list "
+            f"({', '.join(approved_list)})."
+        )
+    elif referral_only_grounded:
+        primary_doctor_status = "not_applicable"
+        doctor_reason = "Only a later-referral doctor was mentioned; no initial COE appointment doctor was established."
+    else:
+        primary_doctor_status = "uncertain"
+        doctor_reason = "A doctor was mentioned, but the transcript does not clearly establish whether they were intended for the initial appointment."
+
+    evidence: list[str] = []
+    if trigger_ctx.get("evidence"):
+        evidence.append(trigger_ctx["evidence"])
+    # The doctor-offering/booking excerpt itself — not only the COE
+    # introductory-script excerpt — so a reader can see WHICH doctor(s)
+    # were actually offered, in the agent's own words.
+    doctor_evidence = _doctor_offering_evidence(call, initial_grounded)
+    if doctor_evidence and doctor_evidence not in evidence:
+        evidence.append(doctor_evidence)
+    if existing_evidence:
+        evidence.append(existing_evidence)
+
+    # ── Backward-compatible reconciliation with the multi-context result ──
+    # The single-scalar fields above (expected_coe/campaign_coe/
+    # recommended_coe/validation_coe/coe_match_status) are computed EXACTLY
+    # as before and are NEVER changed here — for a genuinely single-COE
+    # call they already match coe_evaluations' own single entry (see
+    # coe_validation.py's module docstring). primary_doctor_status (and,
+    # through it, is_violation below) is the one field ESCALATED — never
+    # downgraded — when the multi-context evaluation surfaces a genuine
+    # violation the single-track computation above could not see on its
+    # own (e.g. a SECOND, independently-grounded COE context with its own
+    # unapproved doctor — see the module docstring's core requirement:
+    # one approved doctor must never make every other offered doctor pass).
+    _old_primary_doctor_status = primary_doctor_status
+    _context_statuses = [c["primary_doctor_status"] for c in coe_evaluations]
+    if "fail" in _context_statuses:
+        primary_doctor_status = "fail"
+    elif primary_doctor_status == "not_applicable" and "uncertain" in _context_statuses:
+        primary_doctor_status = "uncertain"
+    elif primary_doctor_status == "not_applicable" and unassociated_doctors:
+        # A doctor was offered but its COE association is genuinely
+        # ambiguous — reported as uncertain, never guessed (see
+        # coe_validation.unassociated_initial_doctors's docstring).
+        primary_doctor_status = "uncertain"
+
+    doctor_reason_text = doctor_reason
+    if primary_doctor_status != _old_primary_doctor_status:
+        # Explain the escalation explicitly so the reason text never
+        # contradicts the (now escalated) status.
+        failing = [
+            f"{c['coe']}: {d['reason']}"
+            for c in coe_evaluations
+            for d in c["doctors"]
+            if d["primary_doctor_status"] == primary_doctor_status
+        ]
+        doctor_reason_text = (
+            f"{doctor_reason} A separately-grounded COE context in this same call also applies: "
+            f"{' '.join(failing) if failing else 'a doctor mention could not be confidently associated with a specific COE context.'}"
+        ).strip()
+
+    # ── Aggregate status ─────────────────────────────────────────────────────
+    #   fail:          any grounded context has a definite failed applicable
+    #                  check or is_violation=True.
+    #   uncertain:     no context fails, but at least one REQUIRED APPLICABLE
+    #                  check is itself uncertain.
+    #   pass:          every required applicable check passes; a check that
+    #                  is legitimately not_applicable (e.g. coe_match_status
+    #                  when the agent never explicitly named a COE, or
+    #                  primary_doctor_status when no initial_primary doctor
+    #                  was offered) is IGNORED, never treated as uncertain.
+    #   not_applicable: no grounded COE context exists at all.
+    # Each context's own "context_status" (see build_coe_evaluations) has
+    # already applied this exact rule at the context level — filtering out
+    # legitimately not_applicable checks (e.g. coe_match_status when the
+    # agent never explicitly named a COE, or primary_doctor_status when no
+    # initial_primary doctor was offered) before looking for "uncertain",
+    # so a legitimately-skipped check never downgrades a passing call.
+    overall_coe_status = (
+        "fail" if any(c["is_violation"] for c in coe_evaluations)
+        else "uncertain" if (any(c["context_status"] == "uncertain" for c in coe_evaluations) or unassociated_doctors)
+        else "pass" if coe_evaluations
+        else "not_applicable"
+    )
+
+    # ── Multi-context authoritative aggregation ─────────────────────────────
+    # A single GLOBAL "patient's expected complaint vs. agent's recommended
+    # COE" scalar comparison cannot describe a call that legitimately
+    # discusses more than one independently-grounded COE context without
+    # comparing one context's own evidence against a COMPLETELY DIFFERENT
+    # context's evidence (e.g. an earlier Headache complaint vs. a later,
+    # separately-grounded IBD service discussion) — that false cross-context
+    # comparison is exactly what multi-context evaluation exists to prevent,
+    # so it must never drive is_violation/coe_match_status/confidence here.
+    # Each context's OWN coe_match_status/primary_doctor_status/is_violation
+    # (see build_coe_evaluations) is authoritative instead; the ambiguous
+    # single-scalar fields are set to None (excluded from aggregation) so a
+    # consumer can never mistake one context's value for a global verdict.
+    # A genuinely single-context (or zero-context) call keeps its EXACT
+    # pre-existing scalar behaviour, unchanged.
+    validated_coes = [c["coe"] for c in coe_evaluations]
+    campaign_coes = [c["coe"] for c in coe_evaluations if c["campaign_coe"]]
+    explicit_agent_recommended_coes = [c["coe"] for c in coe_evaluations if c["explicit_agent_recommended"]]
+    # A patient's independently-eligible need (diagnosis/complaint/
+    # requested specialty or appointment) that no human-agent turn ever
+    # recommended or explained the matching COE for — see
+    # build_coe_evaluations' recommendation_status/missed_recommendation
+    # (a passed service/doctor check never hides this).
+    missed_recommendation_coes = [c["coe"] for c in coe_evaluations if c["missed_recommendation"]]
+
+    # MULTI-CONTEXT ADMISSION — depends on the number of INDEPENDENT ACTIVE
+    # PATIENT CONTEXTS, never on how many campaign labels, agent-
+    # recommendation labels, fuzzy script matches, supporting specialties,
+    # or bare COE-name mentions happen to appear anywhere in the
+    # transcript. An "active" context is one with its OWN patient-side
+    # basis (patient_eligible — an approved complaint/diagnosis, or an
+    # ENGAGED campaign for that exact COE) OR a genuinely retained
+    # explicit agent recommendation (build_coe_evaluations has already
+    # dropped any agent recommendation that was merely an unsupported
+    # substitution conflicting with another eligible need — see AGENT
+    # RECOMMENDATION IS NOT AUTOMATICALLY A PATIENT CONTEXT — so a
+    # surviving explicit_agent_recommended context here is either a
+    # genuinely proactive, non-conflicting recommendation or one already
+    # justified by its own patient-side need). A campaign candidate the
+    # patient never engaged with, or an agent-only recommendation that WAS
+    # dropped as unsupported, never reaches coe_evaluations at all, so it
+    # can never inflate this count.
+    _active_patient_contexts = [
+        c for c in coe_evaluations
+        if c.get("patient_eligible") or c["explicit_agent_recommended"]
+    ]
+    is_multi_context = len(_active_patient_contexts) > 1
+    if is_multi_context:
+        expected_coe = None
+        campaign_coe = None
+        recommended_coe = None
+        validation_coe = None
+        coe_match_status = None
+        coe_reason = (
+            f"This call discusses {len(coe_evaluations)} independently-grounded COE "
+            f"contexts ({', '.join(validated_coes)}); a single global expected-vs-"
+            "recommended comparison does not apply — each context's own match and "
+            "primary-doctor result (see coe_evaluations) is authoritative."
+        )
+        is_violation = any(c["is_violation"] for c in coe_evaluations)
+        confidence = (
+            0.9
+            if not any(c["context_status"] == "uncertain" for c in coe_evaluations) and not unassociated_doctors
+            else 0.5
+        )
+    else:
+        # Escalate-only: the legacy scalar comparison predates the missed-
+        # COE-recommendation rule and has no concept of recommendation_
+        # status/missed_recommendation, so a single-context call whose
+        # ONLY problem is a missed recommendation (approved doctor, no
+        # legacy expected-vs-recommended mismatch) must still surface as
+        # a violation here — never silently pass while overall_coe_status
+        # (always computed from coe_evaluations) correctly reports "fail".
+        is_violation = (
+            coe_match_status == "fail"
+            or primary_doctor_status == "fail"
+            or any(c["is_violation"] for c in coe_evaluations)
+        )
+        confidence = 0.9 if coe_match_status in ("pass", "fail") and primary_doctor_status != "uncertain" else 0.5
+
+    trigger_paths: list[str] = [trigger_ctx["trigger_path"]]
+    for _c in coe_evaluations:
+        if "campaign" in _c["context_sources"] and "campaign_origin" not in trigger_paths:
+            trigger_paths.append("campaign_origin")
+        if "agent_recommendation" in _c["context_sources"] and "agent_recommendation" not in trigger_paths:
+            trigger_paths.append("agent_recommendation")
+
+    result = {
+        "applicable": True,
+        "triggered": True,
+        "trigger_path": trigger_ctx["trigger_path"],
+        "trigger_reason": trigger_ctx["trigger_reason"],
+        "primary_complaint": primary_complaint,
+        "expected_coe": expected_coe,
+        "campaign_coe": campaign_coe,
+        # CAMPAIGN DETECTION IS NOT CAMPAIGN ENGAGEMENT — see
+        # classify_campaign_relevance. campaign_coe above is already the
+        # ENGAGED value (== active_campaign_coe); these separately expose
+        # the raw candidate/relevance verdict even when diverted/pending/
+        # uncertain, so a diverted campaign is never silently invisible.
+        "campaign_detected": campaign_info["campaign_detected"],
+        "campaign_candidate_coe": campaign_info["campaign_candidate_coe"],
+        "campaign_relevance": campaign_info["campaign_relevance"],
+        "active_campaign_coe": campaign_info["active_campaign_coe"],
+        "campaign_relevance_evidence": campaign_info["campaign_relevance_evidence"],
+        "recommended_coe": recommended_coe,
+        "validation_coe": validation_coe,
+        "coe_match_status": coe_match_status,
+        "booking_discussed": booking_discussed,
+        "recommended_or_selected_doctors": initial_grounded,
+        "approved_primary_doctors": approved_list,
+        "matched_primary_doctors": matched_primary_doctors,
+        "primary_doctor_status": primary_doctor_status,
+        "existing_patient_exception": existing_exception,
+        "evidence": evidence,
+        "reason": f"{coe_reason} {doctor_reason_text}".strip(),
+        "confidence": confidence,
+        "is_violation": is_violation,
+        # Multi-context representation — one independent, fully-evaluated
+        # entry per grounded COE (see app.service_hub.coe_validation.
+        # build_coe_evaluations). The scalar fields above are kept unchanged
+        # for backward compatibility and already match this list's single
+        # entry when exactly one COE was discussed; for a call discussing
+        # MORE than one COE, expected_coe/campaign_coe/recommended_coe/
+        # validation_coe/coe_match_status above are deliberately None (see
+        # the multi-context aggregation block above) — read validated_coes/
+        # campaign_coes/explicit_agent_recommended_coes and coe_evaluations
+        # instead of trying to force a single global answer.
+        "trigger_paths": trigger_paths,
+        "coe_evaluations": coe_evaluations,
+        "overall_coe_status": overall_coe_status,
+        "unassociated_initial_doctors": unassociated_doctors,
+        "validated_coes": validated_coes,
+        "campaign_coes": campaign_coes,
+        "explicit_agent_recommended_coes": explicit_agent_recommended_coes,
+        "missed_recommendation_coes": missed_recommendation_coes,
+    }
+    print(
+        f"[coe] routing | triggered={trigger_ctx['triggered']} "
+        f"trigger_path={trigger_ctx['trigger_path']} coes={validated_coes}",
+        flush=True,
+    )
+    logger.info(
+        "coe validation | call_id=%s coe_match=%s primary_doctor=%s expected=%s campaign=%s "
+        "recommended=%s validation=%s contexts=%d overall=%s",
+        call.call_id, coe_match_status, primary_doctor_status, expected_coe, campaign_coe,
+        recommended_coe, validation_coe, len(coe_evaluations), overall_coe_status,
+    )
+    if is_multi_context:
+        # The single-scalar expected/campaign/recommended/validation
+        # comparison is deliberately None for a multi-context call (see
+        # above) — printing it here would repeat the exact misleading
+        # cross-context comparison this design exists to prevent. Each
+        # context's own line below (and validated_coes/campaign_coes/
+        # explicit_agent_recommended_coes) carries the real picture.
+        print(
+            f"[coe] outcome | multi_context=True contexts={len(coe_evaluations)} "
+            f"validated_coes={validated_coes} campaign_coes={campaign_coes} "
+            f"explicit_agent_recommended_coes={explicit_agent_recommended_coes} "
+            f"primary_doctor={primary_doctor_status}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[coe] outcome | coe_match={coe_match_status} primary_doctor={primary_doctor_status} "
+            f"expected={expected_coe} campaign={campaign_coe} recommended={recommended_coe} "
+            f"validation={validation_coe} doctors={initial_grounded}",
+            flush=True,
+        )
+    for _c in coe_evaluations:
+        _specialties = []
+        for _s in _c.get("specialties", []):
+            _name = _s.get("canonical_specialty")
+            if _name and _name not in _specialties:
+                _specialties.append(_name)
+        print(
+            f"[coe] context | coe={_c['coe']} specialties={_specialties} "
+            f"explicit_recommendation={_c['explicit_coe_recommendation_status']} "
+            f"service_alignment={_c['service_alignment_status']} "
+            f"recommendation={_c['recommendation_status']} "
+            f"offered_doctors={_c['offered_doctors']} "
+            f"selected_doctors={_c['selected_initial_doctors']} "
+            f"primary_doctor={_c['primary_doctor_status']} violation={_c['is_violation']}",
+            flush=True,
+        )
+        if _c["missed_recommendation"]:
+            print(f"[coe] missed | coe={_c['coe']} note={_c['note']!r}", flush=True)
+    print(
+        f"[coe] aggregate | coes={[_c['coe'] for _c in coe_evaluations]} "
+        f"contexts={len(coe_evaluations)} overall={overall_coe_status} "
+        f"violation={result['is_violation']}",
+        flush=True,
+    )
+    return {
+        "coe_validation": result,
+        "usage_list": usage,
+        "node_trace": _trace(state, "infer_coe_validation"),
+    }

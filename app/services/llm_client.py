@@ -45,6 +45,11 @@ class LLMClient:
         """
         Send a completion request and return (raw_text, usage_metadata).
 
+        *max_tokens* overrides settings.llm_max_tokens for this call only —
+        e.g. infer_overall_scoring (app.agent.nodes) needs more headroom
+        than the shared default, since it synthesises every other node's
+        output into one response. Omit it (None) to use the shared default.
+
         Retries up to settings.llm_max_retries times with exponential backoff.
         Raises LLMError if all attempts fail.
         """
@@ -137,6 +142,7 @@ class LLMClient:
         response = await client.messages.create(
             model=self.model,
             max_tokens=max_tokens or settings.llm_max_tokens,
+            max_tokens=max_tokens or settings.llm_max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -164,6 +170,7 @@ class LLMClient:
 
         response = await client.chat.completions.create(
             model=self.model,
+            max_tokens=max_tokens or settings.llm_max_tokens,
             max_tokens=max_tokens or settings.llm_max_tokens,
             response_format={"type": "json_object"},  # JSON mode
             messages=[
@@ -203,6 +210,7 @@ class LLMClient:
                 model=self.model,
                 messages=messages,
                 max_tokens=max_tokens or settings.llm_max_tokens,
+                max_tokens=max_tokens or settings.llm_max_tokens,
             )
         except Exception as exc:
             raise LLMError(f"HuggingFace API call failed: {exc}") from exc
@@ -241,6 +249,7 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            "max_tokens": max_tokens or settings.llm_max_tokens,
             "max_tokens": max_tokens or settings.llm_max_tokens,
             "temperature": 0,
             "response_format": {"type": "json_object"},

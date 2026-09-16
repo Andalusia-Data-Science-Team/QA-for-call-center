@@ -1,0 +1,21 @@
+{
+  "call_id": "COE-TEST-HEADACHE-001",
+  "conversation_link": null,
+  "agent_name": "COE Test Agent",
+  "agent_email": "coe.test@andalusiagroup.net",
+  "Patient_Phone": "0501234567",
+  "call_date": "2026-09-06",
+  "call_duration_seconds": 420,
+  "first_response_minutes": 0,
+  "department": "Scheduling",
+  "topic": "COE Headache Booking",
+  "business_unit": "AHJ",
+  "channel": "WhatsApp",
+  "answer_state": "OnTime",
+  "service_level_on_time": true,
+  "is_answered": true,
+  "was_forwarded": false,
+  "transcript": "Agent: السلام عليكم، مع حضرتك أحمد من مجموعة أندلسية صحة. أتشرف باسم حضرتك؟\nPatient: وعليكم السلام، معك محمد.\nAgent: أهلاً وسهلاً أستاذ محمد، كيف أقدر أساعد حضرتك؟\nPatient: أعاني من صداع نصفي متكرر من فترة وأريد أحجز عند طبيب متخصص.\nAgent: لضمان تحقيق أقصى استفادة والوصول إلى تشخيص دقيق لحالتك من جميع الجوانب الطبية، سيتم حجز موعد لحضرتك بمركز التميز المتخصص في تشخيص وعلاج الصداع، والذي يضم نخبة من أفضل الاستشاريين والأخصائيين في هذا المجال.\nPatient: تمام، أريد الحجز في مركز التميز.\nAgent: يبدأ الحجز أولاً في عيادة المخ والأعصاب، والمتاح لحضرتك دكتور أسامة عبد السلام أو دكتور عمر أيوب.\nPatient: أحجز مع دكتور عمر أيوب لو سمحت.\nAgent: تم تأكيد حجز موعدك مع دكتور عمر أيوب في عيادة المخ والأعصاب ضمن مركز التميز لعلاج الصداع.\nPatient: شكراً.",
+  "message_count": 10,
+  "bot_handoff_occurred": false
+}

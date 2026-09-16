@@ -54,6 +54,7 @@ class AgentState(TypedDict, total=False):
     intent_label: Optional[str]
     appointment_details: Optional[dict[str, Any]]
     appointment_verification: Optional[dict[str, Any]]
+
     crm_offers_context: Optional[str]    # written by fetch_crm_offers_for_call
     crm_services_context: Optional[str]  # written by fetch_crm_services_for_call
     crm_matched_services: list[dict[str, str]]  # CRM records that matched services mentioned by the agent
@@ -72,9 +73,47 @@ class AgentState(TypedDict, total=False):
     ineligible_reason: Optional[str]
     final_response: Optional[str]
 
+    crm_offers_context: Optional[str]   # written by fetch_crm_offers_for_call
+    # Bank and location are separate graph nodes (both backed by
+    # app/service_hub/) with separate state keys — each is independently
+    # NOT_APPLICABLE when its own request type isn't present in the call.
+    bank_validation: Optional[dict[str, Any]]      # written by validate_bank_information_node
+    location_validation: Optional[dict[str, Any]]  # written by validate_location_node
+    # Masked deterministic results retained so scoring and aggregation share
+    # the same conclusion without passing financial identifiers to the LLM.
+
+    # Doctor validation is TWO independent checks (same "separate concerns"
+    # philosophy as bank/location being separate from each other):
+    #   doctor_validation       — deterministic factual-information check,
+    #                             written by validate_doctor_node.
+    #   doctor_scope_validation — separate, LLM-based semantic
+    #                             recommendation-suitability check, written
+    #                             by infer_doctor_scope_validation. Depends
+    #                             on doctor_validation's resolved doctor
+    #                             (never independently guesses one).
+    doctor_validation: Optional[dict[str, Any]]
+    doctor_scope_validation: Optional[dict[str, Any]]
+
+    # COE (Center of Excellence) validation — a single independent check
+    # (separate graph node, separate CRM fetch via app.service_hub.crm_coe,
+    # separate state key) bundling two related sub-results: whether the
+    # agent recommended the correct COE for the patient's primary complaint,
+    # and whether the initial COE booking started with an approved primary
+    # doctor. Written by app.agent.nodes.infer_coe_validation /
+    # skip_coe_validation — NOT_APPLICABLE when no COE/specialized-center
+    # trigger was detected (see app.service_hub.coe_validation).
+    coe_validation: Optional[dict[str, Any]]
+
     # ── Error handling ────────────────────────────────────────────────────
-    error: Optional[str]
-    error_node: Optional[str]
+    # Last-write-wins, for the same reason `result` above needs it: when
+    # multiple parallel LLM nodes (behavioral/compliance/offer/script) fail
+    # in the same graph step — e.g. no LLM API key configured at all, so
+    # every concurrent LLM call fails together — they each try to write
+    # `error`/`error_node` in that same step. Without a reducer here,
+    # LangGraph raises InvalidUpdateError ("Can receive only one value per
+    # step") instead of cleanly routing to handle_error.
+    error: Annotated[Optional[str], lambda _old, new: new]
+    error_node: Annotated[Optional[str], lambda _old, new: new]
 
     # ── Booking / intent sub-flow ─────────────────────────────────────────
     # is_booking_intent / intent_label  — written by detect_intent

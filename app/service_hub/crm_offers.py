@@ -368,7 +368,11 @@ def fetch_offers(force_refresh: bool = False) -> list[dict]:
     Never raises — returns [] on failure so booking flow is unaffected.
     Thread-safe.
     """
+<<<<<<< HEAD
     from app.service_hub.crm_database import _run_query_with_retry, _is_configured
+=======
+    from app.services.crm_connector import _run_query_with_retry, _is_configured
+>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b
 
     if not _is_configured():
         return []
