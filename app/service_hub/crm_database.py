@@ -27,21 +27,6 @@ _doctor_cache: dict = {"doctors": [], "loaded_at": 0.0, "failed": False}
 _doctor_lock = threading.Lock()
 
 
-Dynamics 365 CRM connector — pulls doctor reference data (walk-in/cash price,
-specialty, etc.) from the CRM SQL/TDS endpoint using Azure AD auth.
- 
-Auth strategy (MSAL, public client):
-  1. Silent — read a cached refresh token from disk (works after first login).
-  2. Username+password — headless fallback when CRM_PASSWORD is set and MFA
-     is disabled on the account.
-  3. Interactive — opens a browser so the user can complete MFA. Only useful
-     on a dev machine; on the deployed server the token cache must already
-     exist (run scripts/check_crm_prices.py locally, then copy the cache).
- 
-Connection: pyodbc with the access token via SQL_COPT_SS_ACCESS_TOKEN.
-Cache: in-memory dict with a TTL (default 24h) — CRM data changes slowly
-and we never want to block the booking flow on CRM latency.
-"""
 import atexit
 import os
 import struct

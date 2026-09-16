@@ -181,6 +181,9 @@ from app.agent.nodes import (
     skip_doctor_scope_validation,
     infer_coe_validation,
     skip_coe_validation,
+    check_patient_eligibility,
+    handle_ineligible_patient,
+    _eligibility_router,
 )
 from app.service_hub.bank_validation import detect_bank_signals, bank_validation_needed
 from app.service_hub.location_validation import detect_location_signals, location_validation_needed
@@ -192,9 +195,6 @@ from app.service_hub.doctor_validation import (
     doctor_scope_validation_needed,
     patient_describes_medical_complaint,
     raw_doctor_title_tails,
-    check_patient_eligibility,
-    handle_ineligible_patient,
-    _eligibility_router,
 )
 from app.service_hub.coe_validation import classify_coe_trigger
 from app.services.llm_client import LLMClient
@@ -651,6 +651,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         _booking_router,
         {
             "booking":      "extract_appointment_details",
+            "offer_only":   "extract_appointment_details",
             "skip_booking": "inference_gate",
         },
     )

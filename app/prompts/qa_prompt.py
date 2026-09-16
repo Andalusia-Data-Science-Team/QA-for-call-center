@@ -883,11 +883,44 @@ penalize based on age — proceed on the other evidence only.
   DOCUMENTED scope — ground every claim in the CRM reference text given below, not in your
   own general medical knowledge.
 - Do not invent scope-of-service content that isn't present in the reference below.
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Department: {call.department}
+
+════════════════════════════════════════════════════════════
+PATIENT'S STATED COMPLAINT / NEED
+════════════════════════════════════════════════════════════
+{patient_complaint or "(not available)"}
+
+════════════════════════════════════════════════════════════
+DOCTOR CRM REFERENCE  (already resolved — the authoritative record for this specific doctor)
+════════════════════════════════════════════════════════════
+{doctor_reference or "(not available)"}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "outcome": "<SUITABLE | UNSUITABLE | UNCLEAR | NOT_APPLICABLE>",
+  "patient_need_summary": "<1 sentence, patient's own words/summary — no diagnosis>",
+  "doctor_scope_summary": "<1 sentence summarising the doctor's relevant documented scope>",
+  "matched_scope_evidence": ["<verbatim snippet(s) from the CRM reference that drove your decision>"],
+  "reasoning": "<2-3 sentences, grounded ONLY in the CRM reference text above>",
+  "is_violation": <true if outcome == "UNSUITABLE", else false>
+}}
+"""
+
+
 # NODE F — Service Recommendation Evaluation Prompt
 #   Focus: did the agent correctly recommend services available for the
 #          patient's specialty from the CRM/hospital database?
 # ─────────────────────────────────────────────────────────────────────────────
-
 def build_service_prompt(
     call: "CallTranscript",
     crm_services_context: str = "",
@@ -974,28 +1007,33 @@ CALL METADATA
 Call ID   : {call.call_id}
 Agent     : {call.agent_name}
 Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Department: {call.department}
 
+{crm_section}
 ════════════════════════════════════════════════════════════
-PATIENT'S STATED COMPLAINT / NEED
+TRANSCRIPT
 ════════════════════════════════════════════════════════════
-{patient_complaint or "(not available)"}
-
-════════════════════════════════════════════════════════════
-DOCTOR CRM REFERENCE  (already resolved — the authoritative record for this specific doctor)
-════════════════════════════════════════════════════════════
-{doctor_reference or "(not available)"}
+{call.transcript}
 
 ════════════════════════════════════════════════════════════
 OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 ════════════════════════════════════════════════════════════
 {{
-  "outcome": "<SUITABLE | UNSUITABLE | UNCLEAR | NOT_APPLICABLE>",
-  "patient_need_summary": "<1 sentence, patient's own words/summary — no diagnosis>",
-  "doctor_scope_summary": "<1 sentence summarising the doctor's relevant documented scope>",
-  "matched_scope_evidence": ["<verbatim snippet(s) from the CRM reference that drove your decision>"],
-  "reasoning": "<2-3 sentences, grounded ONLY in the CRM reference text above>",
-  "is_violation": <true if outcome == "UNSUITABLE", else false>
+  "service_outcome": "<SUITABLE_SERVICE_RECOMMENDED | SERVICE_SKIPPED | UNRELATED_SERVICE_RECOMMENDED | SERVICE_MISREPRESENTED | INCOMPLETE_SERVICE_PRESENTATION | NO_SERVICE_AVAILABLE | SERVICE_NOT_APPLICABLE>",
+  "service_reasoning": "<1-2 concise sentences citing transcript evidence.>",
+  "service_flags": [
+    {{
+      "type": "<C2B | NC | positive>",
+      "severity": "<critical | positive>",
+      "description": "<1-2 concise sentences; do not use raw line breaks.>",
+      "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
+    }}
+  ]
 }}
+
+IMPORTANT: service_flags must be an EMPTY LIST [] when the outcome is
+NO_SERVICE_AVAILABLE or SERVICE_NOT_APPLICABLE.
 """
 
 
@@ -1378,6 +1416,123 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 }}
 """
 
+def build_package_prompt(
+    call: "CallTranscript",
+    crm_packages_context: str = "",
+) -> str:
+    """
+    Evaluate whether the agent correctly handled package recommendations during
+    the call.
+
+    Parameters
+    ----------
+    call : CallTranscript
+        The call being evaluated.
+    crm_packages_context : str
+        Optional: a JSON-serialised list of active packages available for
+        the patient's specialty at call time. Pass "" when packages cannot
+        be fetched.
+    """
+    crm_section = (
+        f"""
+════════════════════════════════════════════════════════════
+AVAILABLE CRM PACKAGES  (active packages for this specialty at call time)
+════════════════════════════════════════════════════════════
+{crm_packages_context}
+"""
+        if crm_packages_context
+        else """
+════════════════════════════════════════════════════════════
+AVAILABLE CRM PACKAGES
+════════════════════════════════════════════════════════════
+(CRM package data not available for this evaluation — infer from transcript only)
+"""
+    )
+
+    return f"""
+Evaluate whether the agent correctly identified and recommended appropriate
+packages to the patient during the call below.
+
+## YOUR TASK
+1. Determine if the call type warrants a package recommendation check.
+2. Identify whether the agent mentioned any packages.
+3. Compare what the agent said against the available CRM packages provided below.
+4. Choose exactly ONE outcome and produce appropriate flags.
+5. If there is a package fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched package
+
+
+## OUTCOME DEFINITIONS
+- SUITABLE_PACKAGE_RECOMMENDED    : Agent correctly identified and presented a matching package → positive flag.
+                                    ONLY use this when the package name mentioned by the agent matches a package 
+                                    in the AVAILABLE CRM PACKAGES list (check both cr301_service and cr301_servicear fields).
+                                    The match must be exact or semantically equivalent (e.g., "Dental Package" ≈ "باقة الأسنان").
+                                    Price and details must also be accurate.
+- PACKAGE_SKIPPED                 : Relevant package existed in the CRM list but agent never mentioned it → C2B flag.
+- UNRELATED_PACKAGE_RECOMMENDED   : Agent presented a package that does NOT appear in the AVAILABLE CRM PACKAGES list → C2B flag.
+- PACKAGE_MISREPRESENTED          : Agent mentioned a package that exists in the CRM list but stated incorrect 
+                                    price, name spelling, or details → C2B flag.
+- INCOMPLETE_PACKAGE_PRESENTATION : Package mentioned correctly but key details (price, code) omitted → NC flag.
+- NO_PACKAGE_AVAILABLE            : No active package exists for this specialty in the CRM list → no flag.
+- PACKAGE_NOT_APPLICABLE          : Call type doesn't warrant package check (complaint, admin, etc.) → no flag.
+
+## IMPORTANT RULES — READ CAREFULLY
+- **STRICT MATCHING REQUIRED**: You can ONLY select SUITABLE_PACKAGE_RECOMMENDED if:
+  1. The agent mentioned a package by name (in Arabic or English)
+  2. That exact package name appears in the AVAILABLE CRM PACKAGES section below
+  3. The agent provided accurate price and details matching the CRM record
+  4. If the package name does NOT appear in the CRM list → choose UNRELATED_PACKAGE_RECOMMENDED or PACKAGE_SKIPPED
+  
+- Do NOT penalise when CRM packages context is absent (shows "CRM package data not available").
+- Do NOT penalise when patient explicitly declined a correctly presented package.
+- Short calls (< 90 seconds) with no specialty signal → PACKAGE_NOT_APPLICABLE.
+- **KEYWORD DETECTION**: If the agent mentioned any of these patterns in the transcript:
+  • English words in Arabic context (e.g., "VIP Package", "Prenatal Care", "Diabetes Package") → extract the English phrase as the package name
+  • Arabic package trigger words: باقة، باقات، برنامج، برامج، عرض، عروض، شامل، شاملة، كامل، كاملة، متكامل، متكاملة
+    → extract the 2-4 words AFTER the trigger as the actual package name (e.g., "باقة السكري المتكاملة" → extract "السكري المتكاملة")
+  • Then check if that extracted name matches any package in the AVAILABLE CRM PACKAGES list below
+  • The trigger words themselves (باقة، عرض، etc.) are NOT the package name — they indicate intent only
+- **CRITICAL**: If the agent mentioned a package but you cannot find it in the AVAILABLE CRM PACKAGES list below, 
+  you MUST choose UNRELATED_PACKAGE_RECOMMENDED or NO_PACKAGE_AVAILABLE — never SUITABLE_PACKAGE_RECOMMENDED.
+- Report at most 1 package flag per call.
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Department: {call.department}
+
+{crm_section}
+════════════════════════════════════════════════════════════
+TRANSCRIPT
+════════════════════════════════════════════════════════════
+{call.transcript}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "package_outcome": "<SUITABLE_PACKAGE_RECOMMENDED | PACKAGE_SKIPPED | UNRELATED_PACKAGE_RECOMMENDED | PACKAGE_MISREPRESENTED | INCOMPLETE_PACKAGE_PRESENTATION | NO_PACKAGE_AVAILABLE | PACKAGE_NOT_APPLICABLE>",
+  "package_reasoning": "<2-3 sentences citing specific transcript evidence. 
+                        If you chose SUITABLE_PACKAGE_RECOMMENDED, you MUST state which package from the 
+                        AVAILABLE CRM PACKAGES list matched what the agent said (include the package name 
+                        and code from the CRM list). If you chose UNRELATED_PACKAGE_RECOMMENDED, explain 
+                        that the package mentioned by the agent does not appear in the CRM list.>",
+  "package_flags": [
+    {{
+      "type": "<C2B | NC | positive>",
+      "severity": "<critical | positive>",
+      "description": "<1-2 sentences. If positive flag, state the CRM package name and code that matched.>",
+      "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
+    }}
+  ]
+}}
+
+IMPORTANT: package_flags must be an EMPTY LIST [] when the outcome is
+NO_PACKAGE_AVAILABLE or PACKAGE_NOT_APPLICABLE.
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LEGACY — build_user_prompt()
@@ -1596,3 +1751,163 @@ Respond ONLY with a valid JSON object, no markdown fences, with exactly these ke
 Transcript:
 {transcript}
 """
+
+
+def build_faq_validation_prompt(
+    call: CallTranscript,
+    lookup: dict[str, any],
+    compliance_pillars: str = "",
+) -> str:
+    """Build the focused comparison prompt for one same-day FAQ record."""
+    faq_record = lookup.get("record") or {}
+    return f"""\
+Validate the fetched FAQ record against the authoritative call metadata and
+transcript. Evaluate only FAQ submission accuracy and data quality. Do not
+evaluate tone, scripts, offers, services, packages, or reservations.
+
+AUTHORITATIVE CALL FACTS
+Call ID: {call.call_id}
+AgentName: {call.agent_name}
+AgentEmail: {call.agent_email or "unknown"}
+mobile_phone: {call.Patient_Phone}
+Date: {call.call_date}
+BU: {call.business_unit or "unknown"}
+
+FETCHED FAQ RECORD
+{json.dumps(faq_record, ensure_ascii=False, default=str)}
+
+TRANSCRIPT
+{call.transcript}
+
+EXISTING REGULATION CATALOG
+{compliance_pillars or "(not loaded)"}
+
+VALIDATION RULES
+1. Check AgentName, AgentEmail, mobile_phone, and Date against the call metadata.
+   The lookup already required the same normalized phone, exact day, and matching
+   agent email or name, but report any contradictory selected-row value.
+2. Check CustomerName against the patient/client name stated in the transcript.
+   Allow harmless spelling, spacing, Arabic/English transliteration, and word
+   order differences. If no patient/client name is stated, do not invent one or
+   flag the CSV name solely because it cannot be verified.
+3. Check BU against the call business unit. Treat LIVE and AHJ as equivalent.
+   Other business-unit codes must describe the same unit.
+4. Check Inquiry semantically against every customer inquiry in the transcript.
+   Do not require exact wording.
+5. Check whether Response is present or blank and whether its content agrees with
+   what the agent communicated. A blank response can be correct while a request
+   is genuinely awaiting the responsible department.
+6. Check End Call Result against the actual outcome. "In Progress" is correct
+   when the responsible department has not answered or work remains pending.
+   "Closed" is correct only when the FAQ inquiry has a completed response or
+   resolution consistent with the chat.
+7. Use C2B_021 for missing or wrong FAQ fields. Use C2C_023 only when affirmative
+   evidence proves the agent gave the customer false information about the
+   submission, response, or status.
+8. Use C2C_024 only when affirmative evidence proves escalation was required but
+   was not performed. A missing same-day record is handled outside this prompt
+   by the deterministic C2B_017 rule.
+9. Return one field_check for each of AgentName, AgentEmail, mobile_phone, Date,
+   CustomerName, BU, Inquiry, Response, and End Call Result. Do not return
+   positive flags and do not create rules outside C2B_017, C2B_021, C2C_023,
+   and C2C_024.
+
+Return ONLY valid JSON with this shape:
+{{
+  "faq_status": "match | violation",
+  "summary": "<concise evidence-based summary>",
+  "field_checks": [
+    {{
+      "field": "<FAQ column name>",
+      "matches": true,
+      "expected": "<call/transcript value>",
+      "actual": "<FAQ value>",
+      "rule_id": "<C2B_021 | C2C_023 | C2C_024>",
+      "reason": "<concise evidence-based reason>",
+      "transcript_excerpt": "<verbatim excerpt or N/A>"
+    }}
+  ],
+  "faq_flags": []
+}}
+"""
+
+def build_crm_lead_validation_prompt(
+    call: CallTranscript,
+    lookup: dict[str, any],
+    appointment_details: dict[str, any] | None = None,
+    appointment_verification: dict[str, any] | None = None,
+    is_booking_intent: bool = False,
+) -> str:
+    """Build the focused semantic comparison prompt for one fetched CRM lead."""
+    details = appointment_details or {}
+    verification = appointment_verification or {}
+    crm_record = lookup.get("record") or {}
+    return f"""\
+Validate the fetched Dynamics CRM lead against the authoritative chat facts.
+This is a focused CRM data-quality check. Do not evaluate tone, scripts, offers,
+or any compliance topic unrelated to the CRM lead.
+
+VALIDATION RULES
+1. modifiedbyname must identify the same agent as the chat agent. Allow harmless
+   ordering, title, Arabic/English transliteration, spacing, and case differences.
+2. new_clinicbu must match the chat business unit. Treat known code
+   and full-name representations as equivalent. Known input mappings include
+   MKR=BU-MKR, LCH=BU-LCH, SNB=BU-SNB, ALW=BU-ALW, AKW=BU-AKW, and LIVE=BU-AHJ.
+3. When the objective is booking, new_doctor must match the extracted/verified
+   doctor and new_reservationdate must match the appointment date. The supplied
+   Booking intent boolean is a broad routing hint that may include appointment
+   inquiries/reschedules; classify the actual objective from the transcript and
+   do not apply these two checks unless a booking was created.
+4. description must be a short note that accurately describes the chat objective.
+   Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
+   wording differences are acceptable; contradictory or unrelated descriptions are not.
+5. new_lastcallresult must match the final outcome actually reached in the chat
+   (for example booked, rescheduled, inquiry answered, callback/pending, patient
+   declined, or disconnected). Do not confuse the requested objective with outcome.
+6. A CRM field required for an applicable check but null/blank is a mismatch.
+7. Return one field_check per field. Every mismatch must produce a C2B/moderate
+   flag. Use a concise transcript excerpt supporting the expected value, or "N/A"
+   when the expectation comes only from authoritative metadata/database evidence.
+8. Return no positive flags. Limit crm_leads_flags to the first 4 mismatches.
+
+AUTHORITATIVE CHAT FACTS
+Call ID: {call.call_id}
+Agent: {call.agent_name}
+Business unit: {call.business_unit or "unknown"}
+Report date: {call.call_date}
+Booking intent: {is_booking_intent}
+Extracted appointment details: {json.dumps(details, ensure_ascii=False, default=str)}
+Appointment database verification: {json.dumps(verification, ensure_ascii=False, default=str)}
+
+FETCHED CRM LEAD
+{json.dumps(crm_record, ensure_ascii=False, default=str)}
+
+TRANSCRIPT
+{call.transcript}
+
+Return ONLY valid JSON with this shape:
+{{
+  "crm_lead_status": "match | violation",
+  "objective": "reschedule | booking | inquiry",
+  "final_outcome": "<short normalized outcome>",
+  "summary": "<concise validation summary>",
+  "field_checks": [
+    {{
+      "field": "<CRM field name>",
+      "matches": true,
+      "expected": "<chat/database value>",
+      "actual": "<CRM value>",
+      "reason": "<concise evidence-based reason>"
+    }}
+  ],
+  "crm_leads_flags": [
+    {{
+      "type": "C2B",
+      "severity": "moderate",
+      "description": "CRM lead mismatch: <field and concise reason>",
+      "transcript_excerpt": "<verbatim excerpt or N/A>"
+    }}
+  ]
+}}
+"""
+

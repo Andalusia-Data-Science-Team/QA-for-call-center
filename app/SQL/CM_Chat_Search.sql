@@ -3,26 +3,9 @@ DECLARE @AgentFullName  NVARCHAR(200) = :AgentFullName;
 DECLARE @AgentEmail     NVARCHAR(200) = :AgentEmail;
 DECLARE @FilterDate     DATE = :FilterDate;
 
--- Performance note: the ConversationId/AgentFullName/AgentEmail/FilterDate
--- filters and the TOP (10) are applied HERE, in this first CTE, BEFORE the
--- per-conversation OUTER APPLY lookups against [Messages] run (see
--- ConvSummary below) — not after, as this query previously did. All four
--- source tables live on the ROBINDWH linked server, and the old ordering
--- computed FirstResponse/ForwardedTime for every row the base join
--- produced across the ENTIRE remote [Conversations]/[People]/[Accounts]
--- history before ever applying the date/agent filter, since a linked-
--- server query with non-sargable LIKE predicates gives the optimizer no
--- reliable way to push the WHERE clause down to the remote side. That
--- turned a "last 10 matching conversations" lookup into a correlated
--- subquery over the remote [Messages] table for every conversation ever
--- synced — the likely cause of the reported
--- "TCP Provider: The wait operation timed out" failures. Filtering (and
--- capping to TOP 10) BEFORE the OUTER APPLYs run means those correlated
--- lookups execute at most 10 times instead of once per historical row,
--- with identical final results (FirstResponse/ForwardedTime are computed
--- per-conversation and don't depend on when they're computed).
-;WITH FilteredConversations AS
+;WITH ConvSummary AS
 (
+    -- Your existing CTE exactly as it is
     SELECT
         c.UniqueId,
         a.EmailAddress,
@@ -32,6 +15,9 @@ DECLARE @FilterDate     DATE = :FilterDate;
         DATEADD(HOUR, 3, c.AnswerDateTime)      AS Answer_DateTime,
         DATEADD(HOUR, 3, c.LastUpdatedDateTime) AS LastUpdatedDateTime,
         DATEADD(HOUR, 3, c.ArchiveDateTime)     AS Archive_DateTime,
+        fr.FirstResponse,
+        fw.ForwardedTime,
+        DATEDIFF(MINUTE, DATEADD(HOUR, 3, c.StartDateTime), fr.FirstResponse) AS First_Response_Minutes,
         c.InboxExternalIdentifier AS PatientPhoneNumber,
         c.AnswerState,
         c.State,
@@ -46,40 +32,12 @@ DECLARE @FilterDate     DATE = :FilterDate;
         ON c.ArchivePersonUniqueId = p.UniqueID
     LEFT JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[Accounts] a
         ON p.Account_UniqueID = a.UniqueID
-    WHERE
-        (@ConversationId IS NULL OR c.UniqueId = @ConversationId)
-        AND (@AgentFullName IS NULL OR (p.FirstName + ' ' + p.LastName) LIKE '%' + @AgentFullName + '%')
-        AND (@AgentEmail IS NULL OR p.UserEmailAddress LIKE '%' + @AgentEmail + '%')
-        AND (
-            @FilterDate IS NULL
-            OR (
-                c.StartDateTime >= DATEADD(HOUR, -3, CAST(@FilterDate AS DATETIME))
-                AND c.StartDateTime < DATEADD(HOUR, -3, DATEADD(DAY, 1, CAST(@FilterDate AS DATETIME)))
-            )
-        )
-),
-TopConversations AS
-(
-    SELECT TOP (10) *
-    FROM FilteredConversations
-    ORDER BY Start_DateTime DESC
-),
-ConvSummary AS
-(
-    -- The expensive per-row lookups now run only against the (already
-    -- filtered, already capped at 10) TopConversations set above.
-    SELECT
-        tc.*,
-        fr.FirstResponse,
-        fw.ForwardedTime,
-        DATEDIFF(MINUTE, tc.Start_DateTime, fr.FirstResponse) AS First_Response_Minutes
-    FROM TopConversations tc
     OUTER APPLY
     (
         SELECT TOP (1)
             DATEADD(HOUR, 3, m2.CreationDateTime) AS FirstResponse
         FROM [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[Messages] m2
-        WHERE m2.Conversation_UniqueId = tc.UniqueId
+        WHERE m2.Conversation_UniqueId = c.UniqueId
           AND m2.CollaborationMode = 'Internal'
         ORDER BY m2.CreationDateTime
     ) fr
@@ -88,7 +46,7 @@ ConvSummary AS
         SELECT TOP (1)
             DATEADD(HOUR, 3, m3.CreationDateTime) AS ForwardedTime
         FROM [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[Messages] m3
-        WHERE m3.Conversation_UniqueId = tc.UniqueId
+        WHERE m3.Conversation_UniqueId = c.UniqueId
           AND m3.Discriminator = 'ConversationForwardedSystemMessage'
         ORDER BY m3.CreationDateTime
     ) fw
@@ -138,12 +96,10 @@ SELECT
     --m.[Subject],
     m.[ArchiveDateTime],
     m.[WebStoreName]
-FROM ConvSummary tc
+FROM TopConversations tc
 INNER JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[MessagesTotal] m
     ON m.ConversationId = tc.UniqueId
-
---where m.ConversationId = UPPER('FA679C1A-1689-F111-B337-000D3AA9D4A7')
-
+--where m.ConversationId = UPPER('32497DAA-9299-F111-9B33-000D3AA9D409')
 ORDER BY
     tc.Start_DateTime DESC,
     tc.UniqueId,
