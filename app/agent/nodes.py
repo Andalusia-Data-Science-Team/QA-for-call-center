@@ -833,6 +833,86 @@ def _normalize_flag_type(flag: dict) -> dict:
     return flag
 
 
+def _build_doctor_compliance_flags(doctor: dict[str, Any]) -> tuple[list[dict], list[dict]]:
+    """Build detailed C2B compliance flags AND a separate, non-punitive
+    warning-card list from ONE doctor_validation result dict (either
+    result_shape — single_doctor or multi_doctor, see validate_doctor_
+    information's docstring; both shapes expose failure_details/
+    warning_details per doctor, see _result() in doctor_validation.py).
+
+    Genuine field-level violations (failure_details — degree/specialty/
+    fee/etc. mismatches) become detailed C2B "moderate" flags, one per
+    failed field, quoting exactly what the Agent said vs the authoritative
+    CRM value and the local transcript evidence — replacing the old,
+    single generic "N of M recommended doctor(s) failed validation: names."
+    sentence as the reader's only explanation (that sentence remains
+    available via doctor.get("reason") for API consumers, just no longer
+    the only signal in compliance_flags).
+
+    Non-punitive quality notices (warning_details — e.g. name_
+    completeness) are NEVER turned into a C2B flag, a compliance
+    violation, or an escalation trigger: they are returned separately
+    (second element) for a dedicated, informational UI surface (see
+    QAAnalysisResult.doctor_warnings) — this is the one and only place
+    that distinction is enforced for the whole doctor-validation ->
+    UI/persistence pipeline.
+
+    Falls back to the pre-existing generic reason sentence as a single
+    C2B flag ONLY when a genuine violation exists (doctor.get(
+    "is_violation")) with no structured failure_details anywhere to
+    describe it (e.g. AMBIGUOUS_DOCTOR, or a doctor resolved but outside
+    authoritative scope) — so a real violation is never silently
+    dropped just because it predates structured field-level evidence."""
+    if not doctor:
+        return [], []
+    entries = doctor.get("doctors")
+    if not isinstance(entries, list) or not entries:
+        entries = [doctor]  # single-doctor result shape carries its own fields directly
+
+    c2b_flags: list[dict] = []
+    warning_cards: list[dict] = []
+    for entry in entries:
+        doctor_label = (
+            entry.get("doctor_name_ar") or entry.get("doctor_name_en")
+            or entry.get("input_name") or "the recommended doctor"
+        )
+        for fd in entry.get("failure_details") or []:
+            description = (
+                f"{fd.get('label')} — {doctor_label} / "
+                f"Agent stated: {fd.get('chat_value')} / "
+                f"CRM value: {fd.get('crm_value')} / "
+                f"Reason: {fd.get('reason')}"
+            )
+            excerpt = fd.get("transcript_excerpt")
+            if excerpt:
+                description += f" / Evidence: {excerpt}"
+            c2b_flags.append({
+                "type": "C2B", "severity": "moderate",
+                "description": description,
+                "transcript_excerpt": excerpt or "Doctor information supplied by agent.",
+            })
+        for wd in entry.get("warning_details") or []:
+            description = (
+                f"{wd.get('label')} — {doctor_label} / "
+                f"Agent stated: {wd.get('chat_value')} / "
+                f"CRM doctor: {wd.get('crm_value')} / "
+                f"Recommendation: {wd.get('reason')}"
+            )
+            warning_cards.append({
+                "type": "quality_notice", "severity": "info",
+                "description": description,
+                "transcript_excerpt": wd.get("transcript_excerpt") or "Doctor information supplied by agent.",
+            })
+
+    if doctor.get("is_violation") and not c2b_flags:
+        c2b_flags.append({
+            "type": "C2B", "severity": "moderate",
+            "description": doctor.get("reason", "Doctor information validation failed."),
+            "transcript_excerpt": "Doctor information supplied by agent.",
+        })
+    return c2b_flags, warning_cards
+
+
 async def aggregate_results(state: AgentState) -> dict:
     """
     Merge sub-evaluation results into a single QAAnalysisResult-compatible dict.
@@ -888,14 +968,12 @@ async def aggregate_results(state: AgentState) -> dict:
         })
     # Doctor is two independent checks (deterministic + semantic) — each
     # gets its own flag when it independently flags a violation, same
-    # pattern as bank/location.
-    doctor_flags = []
-    if doctor.get("is_violation"):
-        doctor_flags.append({
-            "type": "C2B", "severity": "moderate",
-            "description": doctor.get("reason", "Doctor information validation failed."),
-            "transcript_excerpt": "Doctor information supplied by agent.",
-        })
+    # pattern as bank/location. The deterministic check's flags/warnings
+    # are built from its own structured failure_details/warning_details
+    # (see _build_doctor_compliance_flags) rather than one generic
+    # sentence — doctor_warnings is a SEPARATE, non-punitive surface,
+    # never merged into doctor_flags/compliance_flags.
+    doctor_flags, doctor_warnings = _build_doctor_compliance_flags(doctor)
     if doctor_scope.get("is_violation"):
         doctor_flags.append({
             "type": "C2B", "severity": "moderate",
@@ -957,6 +1035,7 @@ async def aggregate_results(state: AgentState) -> dict:
         "overall_assessment":   scoring.get("overall_assessment", "needs_review"),
         "assessment_reasoning": scoring.get("assessment_reasoning", ""),
         "compliance_flags":     deduped_flags,
+        "doctor_warnings":      doctor_warnings,
         "agent_performance": {
             # professionalism_score — prefer behavioral node, fall back to scoring
             "professionalism_score": _norm_score(
@@ -1934,6 +2013,22 @@ async def validate_doctor_node(state: AgentState, llm_client: LLMClient) -> dict
         "doctor validation | call_id=%s outcome=%s doctor_key=%s",
         call.call_id, result["outcome"], result.get("doctor_key"),
     )
+    # A genuine multi-doctor recommendation set — see validate_doctor_
+    # information's own docstring — is detected via the authoritative
+    # per-doctor "doctors" list, never by guessing from the top-level
+    # scalar fields (those intentionally mirror only ONE entry, or None,
+    # for backward compatibility — see that function's "result_shape"/
+    # "doctors" fields). A 0- or 1-doctor result prints EXACTLY as before
+    # (unchanged); 2+ doctors get their own dedicated summary below, since
+    # printing the legacy singular fields for a real multi-doctor result
+    # is exactly what previously produced an internally contradictory log
+    # (requested_name from the semantic layer paired with resolved_name/
+    # doctor_key mirrored from a DIFFERENT per-doctor entry).
+    _doctors_list = result.get("doctors") or []
+    if len(_doctors_list) > 1:
+        _print_multi_doctor_validation_summary(result, _doctors_list, semantic_specialty, intent_ctx, call_bu, canonical_bu)
+        return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
     _resolved_name = result.get("doctor_name_ar") or result.get("doctor_name_en")
     _requested_name = semantic_name or result.get("input_name")
     _source = result.get("resolution_source") or ""
@@ -1942,11 +2037,7 @@ async def validate_doctor_node(state: AgentState, llm_client: LLMClient) -> dict
     # when resolution never got that far at all (e.g. INSUFFICIENT_
     # REFERENCE_DATA before any CRM pool existed).
     _bu_scoped = ("bu_scoped" in _source) if _source else None
-    _match_method = (
-        None if not result.get("doctor_resolved")
-        else "partial" if (_requested_name and _resolved_name and normalize_arabic_text(_requested_name) != normalize_arabic_text(_resolved_name))
-        else "exact"
-    )
+    _match_method = _derive_doctor_match_method(_requested_name, _resolved_name, bool(result.get("doctor_resolved")), _source)
     # Field-level breakdown for WHY a PASS/FAIL outcome was reached — the
     # doctor was already correctly resolved by this point (see the
     # resolution block above); PASS/FAIL is a SEPARATE, later check of
@@ -1982,6 +2073,108 @@ async def validate_doctor_node(state: AgentState, llm_client: LLMClient) -> dict
         flush=True,
     )
     return {"doctor_validation": result, "node_trace": _trace(state, "validate_doctor")}
+
+
+def _derive_doctor_match_method(
+    requested_name: str | None, resolved_name: str | None,
+    doctor_resolved: bool, resolution_source: str | None,
+) -> str | None:
+    """Observability-only classification of HOW a name resolved — shared
+    by both the single-doctor and per-doctor multi-doctor log summaries in
+    validate_doctor_node so the two never drift into subtly different
+    terminology for the same underlying resolution_source. Never
+    consulted by any resolution/validation decision itself (this is a
+    pure presentation concern; the actual resolution already happened
+    inside app.service_hub.doctor_validation before this ever runs).
+
+    "contextual_single_name" is reported verbatim whenever that is the
+    actual resolution_source (see doctor_validation._resolve_single_
+    token_candidate_with_context) — its own distinct match method, never
+    collapsed into "partial"/"exact". Otherwise falls back to the SAME
+    requested-vs-resolved-name string comparison this node has always
+    used: "exact" when the two are the same person-name string after
+    normalize_arabic_text (ه/ة and every alef/yeh variant already
+    equivalent there), "partial" when they differ (a genuine partial/
+    fuzzy CRM match). None when the doctor never resolved at all."""
+    if not doctor_resolved:
+        return None
+    if resolution_source and "contextual_single_name" in resolution_source:
+        return "contextual_single_name"
+    if requested_name and resolved_name and normalize_arabic_text(requested_name) != normalize_arabic_text(resolved_name):
+        return "partial"
+    return "exact"
+
+
+def _print_multi_doctor_validation_summary(
+    result: dict, doctors_list: list[dict], semantic_specialty: str | None,
+    intent_ctx: dict, call_bu, canonical_bu,
+) -> None:
+    """The dedicated multi-doctor log summary validate_doctor_node prints
+    for a genuine 2+-doctor recommendation set (see that node's own
+    docstring for the contradictory-log regression this replaces). EVERY
+    requested name, resolved identity, key, BU, match method, outcome, and
+    validated-fields breakdown below is read from the SAME per-doctor
+    dict in *doctors_list* — never assembled by pairing one doctor's
+    requested name against a DIFFERENT doctor's resolved identity, which
+    is exactly what the old singular print (semantic_name + top-level
+    result.get(...) mirror) could silently do. *doctors_list* is
+    app.service_hub.doctor_validation.validate_doctor_information's own
+    authoritative "doctors" list — the sole source of truth here; nothing
+    in this function re-derives or second-guesses a resolution decision,
+    it only formats what already happened."""
+    resolved_count = sum(1 for d in doctors_list if d.get("doctor_resolved"))
+    # Failed/warning doctor counts — derived from each per-doctor entry's
+    # OWN failure_details/warning_details (never re-derived from the
+    # aggregate outcome/reason string), kept strictly separate: a doctor
+    # counted in warning_count NEVER also counts toward failed_count
+    # purely because it has warnings, and vice versa (see _result() in
+    # doctor_validation.py — failure_details and warning_details are
+    # independent lists on every per-doctor entry).
+    failed_count = sum(1 for d in doctors_list if d.get("failure_details"))
+    warning_count = sum(1 for d in doctors_list if d.get("warning_details"))
+    lines = [
+        "[doctor] extraction:",
+        f"[doctor]     doctors={[d.get('input_name') for d in doctors_list]}",
+        f"[doctor]     specialty_context={semantic_specialty or result.get('doctor_context_specialty')!r}",
+        "[doctor] routing:",
+        f"[doctor]     business_unit={call_bu}",
+    ]
+    if canonical_bu != call_bu:
+        lines.append(f"[doctor]     canonical_business_unit={canonical_bu}")
+    lines += [
+        f"[doctor]     doctor_role={intent_ctx.get('doctor_role')}",
+        "[doctor]     doctor_validation_needed=True",
+        "[doctor] multi-doctor resolution:",
+        f"[doctor]     requested_count={len(doctors_list)}",
+        f"[doctor]     resolved_count={resolved_count}",
+        f"[doctor]     failed_count={failed_count}",
+        f"[doctor]     warning_count={warning_count}",
+    ]
+    for i, d in enumerate(doctors_list, start=1):
+        _requested_name = d.get("input_name")
+        _resolved_name = d.get("doctor_name_ar") or d.get("doctor_name_en")
+        _resolved = bool(d.get("doctor_resolved"))
+        _failures = [fd.get("field") for fd in (d.get("failure_details") or [])]
+        _warnings = [wd.get("field") for wd in (d.get("warning_details") or [])]
+        lines += [
+            f"[doctor] doctor[{i}]:",
+            f"[doctor]     requested_name={_requested_name!r}",
+            f"[doctor]     resolved={_resolved}",
+            f"[doctor]     resolved_name={_resolved_name!r}",
+            f"[doctor]     doctor_key={d.get('doctor_key')}",
+            f"[doctor]     resolved_business_unit={d.get('business_unit')!r}",
+            f"[doctor]     resolution_source={d.get('resolution_source')}",
+            f"[doctor]     validation_outcome={d.get('outcome')}",
+            f"[doctor]     failures={_failures}",
+            f"[doctor]     warnings={_warnings}",
+        ]
+    lines += [
+        "[doctor] aggregate outcome:",
+        f"[doctor]     outcome={result.get('outcome')}",
+    ]
+    if result.get("reason"):
+        lines.append(f"[doctor]     reason={result.get('reason')}")
+    print("\n".join(lines), flush=True)
 
 
 # ---------------------------------------------------------------------------

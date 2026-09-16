@@ -508,24 +508,99 @@ _NON_NAME_ADMIN_WORDS = {
 }
 
 # Degree/generic-role title words — distinct from _GENERIC_SPECIALTY_WORDS
-# (medical fields/procedures) and from دكتور/طبيب themselves (already
-# consumed by _DOCTOR_TITLE_RE before a candidate is ever built): these are
-# OTHER credential/role words that legitimately anchor a name search of
-# their own ("الاستشاري اسامة عبد السلام" — see _DOCTOR_TITLE_RE below) but
-# must never themselves be mistaken for (the start of) a person's name when
-# they show up as the FIRST word of a candidate instead — real regression:
-# "طبيب مختص؟" ("a specialist doctor?" — a generic, unnamed role reference)
-# extracted "مختص" as if it were a doctor's name, and "دكتور استشاري محمد"
-# (title immediately followed by a second credential word before the real
-# name) would otherwise fold "استشاري" into the captured name. Deliberately
-# a small, closed, non-exhaustive class — same philosophy as every other
+# (medical fields/procedures): these are credential/role words that
+# legitimately anchor a name search of their own ("الاستشاري اسامة عبد
+# السلام" — see _DOCTOR_TITLE_RE below) but must never themselves be
+# mistaken for (the start of) a person's name when they show up as the
+# FIRST word of a candidate instead — real regression: "طبيب مختص؟" ("a
+# specialist doctor?" — a generic, unnamed role reference) extracted
+# "مختص" as if it were a doctor's name, and "دكتور استشاري محمد" (title
+# immediately followed by a second credential word before the real name)
+# would otherwise fold "استشاري" into the captured name. Deliberately a
+# small, closed, non-exhaustive class — same philosophy as every other
 # blocklist here — not an attempt to enumerate every clinical credential.
+#
+# دكتور/دكتوره/دكتورة/طبيب/طبيبه/طبيبة (the primary title words
+# _DOCTOR_TITLE_RE itself anchors on) are included here too — NOT
+# redundant with _DOCTOR_TITLE_RE despite both recognising the same words:
+# _DOCTOR_TITLE_RE only ever consumes the title as the ANCHOR each
+# candidate search starts AFTER, so it safely removes a title at the very
+# START of a message/occurrence, but does nothing to stop an ALREADY-
+# STARTED candidate's tail from swallowing a SECOND title word that shows
+# up later, mid-sentence, before the next doctor's actual name — real
+# regression: "الدكتورة بدريه والطبيبه اميره بركات" (two doctors offered
+# in one turn) extracted "بدريه والطبيبه اميره بركات" as ONE candidate for
+# the FIRST doctor, because "والطبيبه" ("و" + "الطبيبة", fused with no
+# space — ordinary Arabic conjunction attachment) was never recognised as
+# a continuation-stopping word: _doctor_name_candidates_in_text's own
+# multi-occurrence scan DOES find "طبيبه" inside "والطبيبه" as a fresh
+# title anchor for a SECOND candidate, but that never trims the FIRST
+# candidate's already-in-progress tail, which needs this blocklist (via
+# _is_non_name_word's prefix-stripping — see _strip_leading_wa/_strip_
+# contracted_prefix) to stop at "والطبيبه" instead of running through it.
 _DEGREE_TITLE_WORDS = {
     "استشاري", "استشاريه", "استشارية",
     "اخصائي", "أخصائي", "اخصائيه", "أخصائية",
     "مختص", "مختصه", "مختصة",
-    "consultant", "specialist",
+    "دكتور", "دكتوره", "دكتورة", "طبيب", "طبيبه", "طبيبة",
+    "consultant", "specialist", "doctor", "dr",
 }
+
+# Doctor UNAVAILABILITY/departure/non-existence vocabulary — real
+# regression: "الطبيب حاتم غادر اندلسيه" ("Dr Hatem has LEFT Andalusia")
+# extracted "حاتم غادر اندلسيه" as if the whole phrase were a name, and
+# "الدكتور غير متاح"/"الطبيب لم يعد يعمل معنا"/"لا يوجد دكتور بهذا الاسم"
+# (no real name in any of them at all) extracted "غير"/"لم يعد يعمل"/
+# "بهذا الاسم" as if THOSE were names. Split into two tiers:
+#   _DOCTOR_DEPARTURE_ACTION_WORDS — strong action verbs describing a
+#     SPECIFIC named doctor's own status (غادر/استقال/انتقل/توقف/رفض, all
+#     conjugations used here) — when one of these immediately follows an
+#     otherwise-plausible name, _name_candidate_from_title_match doesn't
+#     just STOP there (like any other continuation-stop word); it
+#     suppresses the WHOLE candidate, because the mention describes a
+#     doctor who is no longer an active recommendation at all, never a
+#     genuine candidate with a merely-truncated name (see that function's
+#     own use of this set below).
+#   The remaining negation/non-existence words (غير/لم/يعد/يعمل/معنا/يوجد/
+#     بهذا/هذا/اسم/مفيش) cover the "no real name was ever given" phrasings
+#     — ordinary first-word/continuation blocking (via _NON_NAME_WORDS,
+#     same as every other entry there) already yields no candidate at all
+#     for those, since the negation word is the very first thing after the
+#     title with nothing name-shaped before it.
+_DOCTOR_DEPARTURE_ACTION_WORDS = {
+    "غادر", "غادرت", "غادروا",
+    "استقال", "استقالت", "استقالوا",
+    "انتقل", "انتقلت", "انتقلوا",
+    "توقف", "توقفت",
+    "رفض", "رفضت",
+}
+# Deliberately NOT a bare "غير" (unlike, say, "لم"/"يعد" below): "غير" alone
+# is an ordinary Arabic word ("other/non-") that can legitimately appear as
+# part of a real (or test-fixture) name/surname — blocking it unconditionally
+# would reject a genuine candidate. Only the specific 2-word phrase "غير
+# متاح[ة/ه]" ("not available") is a reliable unavailability signal — see
+# _unavailable_phrase_len below, which checks this multi-word pattern
+# directly rather than adding "غير" to the single-word blocklist.
+_DOCTOR_UNAVAILABLE_PHRASE_STARTS: dict[str, set[str]] = {
+    "غير": {"متاح", "متاحه", "متاحة"},
+}
+_DOCTOR_UNAVAILABLE_WORDS = _DOCTOR_DEPARTURE_ACTION_WORDS | {
+    "لم", "يعد", "يعمل", "معنا", "يوجد", "بهذا", "هذا", "اسم", "مفيش",
+}
+
+
+def _unavailable_phrase_len(words: list[str], i: int) -> int:
+    """Length (in words), or 0, of a doctor-unavailability PHRASE (see
+    _DOCTOR_UNAVAILABLE_PHRASE_STARTS) starting at words[i] — unlike the
+    single-word _DOCTOR_UNAVAILABLE_WORDS/_DOCTOR_DEPARTURE_ACTION_WORDS
+    sets, this only ever matches the exact multi-word sequence, so a word
+    like "غير" that is ambiguous on its own (could start "غير متاح" OR be
+    an ordinary word/name-fragment elsewhere) is never treated as a
+    rejection signal in isolation."""
+    continuations = _DOCTOR_UNAVAILABLE_PHRASE_STARTS.get(words[i])
+    if continuations and i + 1 < len(words) and words[i + 1] in continuations:
+        return 2
+    return 0
 
 # Combined "this token can never be (part of) a doctor's proper name"
 # blocklist, and the single check function used for BOTH the first-word
@@ -534,6 +609,7 @@ _DEGREE_TITLE_WORDS = {
 _NON_NAME_WORDS = (
     _GENERIC_SPECIALTY_WORDS | _NON_NAME_FIRST_WORDS | _NON_NAME_ADMIN_WORDS
     | _NON_NAME_MISC_WORDS | _DEGREE_TITLE_WORDS | _SUBORDINATING_CONJUNCTIONS
+    | _DOCTOR_UNAVAILABLE_WORDS
 )
 
 
@@ -692,6 +768,25 @@ _DOCTOR_TITLE_RE = re.compile(
     r"dr\.?|doctor|consultant|specialist|(?<![\w])د(?:[./\\-])?)(?![\w])\s*[\(\[]?\s*", re.I,
 )
 
+# PRIMARY doctor-referring titles only (دكتور/طبيب/Dr/د) — deliberately
+# EXCLUDES the credential/degree words استشاري/اخصائي/consultant/specialist
+# that _DOCTOR_TITLE_RE also anchors on. Used ONLY for "is this turn
+# actually REFERRING TO a doctor (possibly without naming them, e.g. a
+# negated/unavailable mention)" boundary checks — see _turn_is_doctor_
+# context_boundary/_agent_turns_text_for_doctor — never for name
+# extraction itself (_doctor_name_candidate and friends keep using the
+# full _DOCTOR_TITLE_RE, unchanged). Real regression: a BARE degree claim
+# like "اخصائيه" (stated on its own line, answering "استشاري؟") itself
+# matches _DOCTOR_TITLE_RE (via its own "اخصائي[ةه]?" alternative) with an
+# empty tail — using the full title regex for the boundary check wrongly
+# treated that legitimate bare follow-up claim as if it were a doctor
+# reference with no name, resetting the active doctor and losing the
+# claim entirely, exactly backwards from what "a bare follow-up claim
+# stays attached to the active doctor" is supposed to do.
+_PRIMARY_DOCTOR_TITLE_RE = re.compile(
+    r"(?:دكتور[ةه]?|طبيب[ةه]?|dr\.?|doctor|(?<![\w])د(?:[./\\-])?)(?![\w])\s*[\(\[]?\s*", re.I,
+)
+
 # Extraction boundary: stop at punctuation/parentheses, or at a preposition/
 # structural marker that signals the sentence has moved on from a name to
 # branch/appointment/context detail (mirrors location_validation.py's
@@ -777,7 +872,27 @@ def _name_candidate_from_title_match(text: str, m: re.Match) -> str | None:
     words = rest.split()[:_NAME_MAX_TOKENS]
     if not words or _is_non_name_word(words[0]) or _contains_digit(words[0]):
         return None
+    if _unavailable_phrase_len(words, 0):
+        # "الدكتور غير متاح" ("the doctor is not available") — no name is
+        # given at all here (the phrase starts immediately after the
+        # title), so this must yield no candidate, exactly like the
+        # single-word rejections just above — see _unavailable_phrase_len.
+        return None
     for i, word in enumerate(words[1:], start=1):
+        if word in _DOCTOR_DEPARTURE_ACTION_WORDS or _unavailable_phrase_len(words, i):
+            # Not an ordinary continuation-stop: "حاتم غادر اندلسيه" ("Dr
+            # Hatem LEFT Andalusia") must never be reported as a plausible
+            # candidate named "حاتم" either — a name immediately followed
+            # by a departure/resignation/rejection verb describes a doctor
+            # who is no longer an active recommendation at all, so the
+            # WHOLE mention is suppressed here rather than merely trimmed
+            # (contrast with an ordinary stop word, e.g. "دكتور محمد
+            # للتقييم", which correctly keeps "محمد"). Callers needing this
+            # excluded-but-real name for diagnostics/history still get it
+            # via the existing "ignored non-name doctor phrase" logging
+            # path (see _rejected_candidate_reason), which already fires
+            # whenever a title match yields no candidate.
+            return None
         if _is_non_name_word(word) or word in _NAME_CONTINUATION_EXTRA_STOP_WORDS or _contains_digit(word):
             words = words[:i]
             break
@@ -945,6 +1060,26 @@ def _rejected_candidate_reason(raw_tail: str) -> str:
     words = normalize_arabic_text(raw_tail).split()
     if not words:
         return "empty_after_title"
+    # Checked FIRST, across every word (not just the first) and BEFORE the
+    # degree-role/specialty checks below — deliberately: "للغدد بهذا
+    # الاسم" ("for the glands, by this name") starts with a specialty
+    # word ("غدد"/"للغدد"), but the phrase as a WHOLE is fundamentally an
+    # UNAVAILABILITY statement (the "بهذا الاسم" tail is what actually
+    # carries the meaning here), not a legitimate specialty-context
+    # signal — a genuine name can also legitimately precede the
+    # departure/unavailability marker instead ("حاتم غادر اندلسيه"). Real
+    # regression: classifying this "specialty_not_person_name" FIRST (the
+    # original order) let _first_specialty_phrase_in_text treat the whole
+    # negated mention as trustworthy specialty context and attribute it to
+    # an unrelated, later-named doctor (see _turn_is_doctor_context_
+    # boundary, which also relies on this specific ordering) — purely so
+    # the mention stays identifiable as diagnostic/historical evidence in
+    # the logs either way, never lumped into the generic "not_a_plausible_
+    # person_name" bucket.
+    if any(w in _DOCTOR_UNAVAILABLE_WORDS for w in words):
+        return "doctor_departed_or_unavailable"
+    if any(_unavailable_phrase_len(words, i) for i in range(len(words))):
+        return "doctor_departed_or_unavailable"
     first = words[0]
     variants = {first, _strip_leading_al(first), _strip_leading_wa(first), _strip_contracted_prefix(first)}
     if variants & _DEGREE_TITLE_WORDS:
@@ -969,7 +1104,20 @@ def _trim_to_specialty_phrase(raw_tail: str) -> str:
     words = normalize_arabic_text(raw_tail).split()
     kept: list[str] = []
     for word in words:
-        variants = {word, _strip_leading_al(word), _strip_leading_wa(word), _strip_leading_al(_strip_leading_wa(word))}
+        # Same variant set _rejected_candidate_reason itself checks (see
+        # its own {first, _strip_leading_al(first), _strip_leading_wa(
+        # first), _strip_contracted_prefix(first)}) — previously missing
+        # _strip_contracted_prefix here specifically, so a "لل"-prefixed
+        # specialty word ("للغدد" = لل + غدد) was correctly recognised as
+        # a specialty word BY _rejected_candidate_reason (which is what
+        # let this whole tail qualify as "specialty_not_person_name" in
+        # the first place) but then NOT recognised here, leaving `kept`
+        # empty and falling back to returning the WHOLE raw tail
+        # unchanged — e.g. "للغدد بهذا الاسم" instead of just "للغدد".
+        variants = {
+            word, _strip_leading_al(word), _strip_leading_wa(word),
+            _strip_leading_al(_strip_leading_wa(word)), _strip_contracted_prefix(word),
+        }
         if variants & _GENERIC_SPECIALTY_WORDS:
             kept.append(word)
             continue
@@ -1166,6 +1314,55 @@ def _first_specialty_phrase_in_text(text: str) -> str | None:
             return _trim_to_specialty_phrase(raw)
 
 
+def _turn_is_doctor_context_boundary(text: str, resolved_tokens: list[str]) -> bool:
+    """True when *text* is a boundary that per-doctor claim scoping (see
+    extract_doctor_context_specialty/_specialty_context_for_resolved_name/
+    _agent_turns_text_for_doctor, the three callers of this shared check)
+    must never cross or attribute to *resolved_tokens*'s doctor — either
+    of two cases:
+      1. A DIFFERENT, incompatible doctor is actually named in this turn
+         (a real title+name candidate that does not match resolved_tokens
+         via _is_plausible_same_person_name).
+      2. A دكتور/طبيب title is present, NO name candidate survived, AND
+         the tail was rejected SPECIFICALLY as a negated/unavailable/
+         departed/rejected doctor reference (_rejected_candidate_reason ==
+         "doctor_departed_or_unavailable" — see _DOCTOR_UNAVAILABLE_WORDS/
+         _unavailable_phrase_len/_DOCTOR_DEPARTURE_ACTION_WORDS). Real
+         regression: "غير متاح طبيب للغدد بهذا الاسم" (about the earlier,
+         REJECTED "حاتم" request) was being walked straight through and
+         its specialty-shaped tail ("للغدد...") attributed to Amira, the
+         doctor named in a LATER turn, purely because the backward walk
+         had no notion of "this earlier turn is about someone/something
+         else entirely".
+
+    Deliberately does NOT treat as a boundary: an ordinary title-LESS turn
+    (price/offer/closing/scheduling chatter, or a genuine bare follow-up
+    claim like "اخصائيه" — see _PRIMARY_DOCTOR_TITLE_RE's own docstring
+    for why a bare credential word never counts as a title reference
+    here), OR a title-bearing tail rejected for any OTHER reason —
+    crucially, a bare SPECIALTY/service request with no name at all
+    ("نحتاج طبيب مخ واعصاب") is *_rejected_candidate_reason ==
+    "specialty_not_person_name"*, never "doctor_departed_or_unavailable",
+    and is exactly the legitimate context extract_doctor_context_specialty
+    is searching the backward walk FOR — it must never be treated as a
+    boundary, or every "specialty mention, then a later recommendation"
+    call this module already correctly supports would silently break."""
+    turn_candidates = _doctor_name_candidates_in_text(text)
+    if turn_candidates:
+        return not any(
+            _name_tokens(candidate)
+            and _is_plausible_same_person_name(resolved_tokens, _name_tokens(candidate))
+            for candidate in turn_candidates
+        )
+    m = _PRIMARY_DOCTOR_TITLE_RE.search(text)
+    if not m:
+        return False
+    tail = text[m.end():]
+    stop = _NAME_STOP_RE.search(tail)
+    raw = (tail[:stop.start()] if stop else tail).strip()
+    return _rejected_candidate_reason(raw) == "doctor_departed_or_unavailable"
+
+
 def extract_doctor_context_specialty(call: CallTranscript, named_doctor: str | None = None) -> str | None:
     """Best-effort SUPPORTING evidence only: the clinical specialty/field
     phrase a title's tail was rejected as (see _rejected_candidate_reason's
@@ -1204,8 +1401,18 @@ def extract_doctor_context_specialty(call: CallTranscript, named_doctor: str | N
             if named_doctor in _doctor_name_candidates_in_text(text):
                 target_idx = i  # last occurrence wins — closest to the actual recommendation
         if target_idx is not None:
+            resolved_tokens = _name_tokens(named_doctor)
             for i in range(target_idx, -1, -1):
-                found = _first_specialty_phrase_in_text(turns[i][1])
+                text_i = turns[i][1]
+                if i < target_idx and _turn_is_doctor_context_boundary(text_i, resolved_tokens):
+                    # An earlier turn names a DIFFERENT doctor, or is
+                    # itself a negated/unavailable doctor reference — the
+                    # backward walk must never cross it (see
+                    # _turn_is_doctor_context_boundary's own regression
+                    # note): whatever specialty-shaped text lies beyond it
+                    # belongs to that OTHER context, never named_doctor.
+                    break
+                found = _first_specialty_phrase_in_text(text_i)
                 if found:
                     return found
             return None
@@ -1245,7 +1452,10 @@ def _specialty_context_for_resolved_name(call: CallTranscript, resolved_name: st
     if target_idx is None:
         return None
     for i in range(target_idx, -1, -1):
-        found = _first_specialty_phrase_in_text(turns[i][1])
+        text_i = turns[i][1]
+        if i < target_idx and _turn_is_doctor_context_boundary(text_i, resolved_tokens):
+            break  # see _turn_is_doctor_context_boundary's regression note
+        found = _first_specialty_phrase_in_text(text_i)
         if found:
             return found
     return None
@@ -1256,30 +1466,133 @@ def _agent_turns_text_for_doctor(call: CallTranscript, resolved_name: str) -> st
     *resolved_name* (same safe same-person name match as
     _specialty_context_for_resolved_name — _is_plausible_same_person_name
     against that turn's own regex-extracted doctor-name candidates), used
-    to scope RANK/DEGREE-claim extraction to the doctor actually being
-    validated. Never the whole call's agent_text: in a multi-doctor
-    conversation an explicit degree claim about a DIFFERENT recommended
-    doctor ("...ومتواجد دكتور احمد استشاري عظام") must never be attributed
-    to this one. Self-introduction turns are excluded, same as the
-    specialty-scoping sibling above. Returns "" (never None) when no turn
-    matches, since _extract_degree_claim already treats an empty string
-    as "no claim" — this is an additive helper, only used for degree-
-    claim scoping; it does not change extract_doctor_context_specialty or
-    _specialty_context_for_resolved_name."""
+    to scope RANK/DEGREE-claim (and every other optional-field) extraction
+    to the doctor actually being validated. Never the whole call's
+    agent_text: in a multi-doctor conversation an explicit degree claim
+    about a DIFFERENT recommended doctor ("...ومتواجد دكتور احمد استشاري
+    عظام") must never be attributed to this one. Self-introduction turns
+    are excluded, same as the specialty-scoping sibling above.
+
+    ALSO includes a BARE (name-less) Agent turn — one with no دكتور/طبيب-
+    anchored candidate of its own at all, e.g. "اخصائيه" stated on its own
+    line right after naming the doctor — as long as the MOST RECENT prior
+    Agent turn that DID name a doctor was this same *resolved_name* (real
+    regression: "متاح الطبيبه اميره بركات" / "اخصائيه" on the very next
+    Agent turn, replying to the Patient's own follow-up question, with
+    Amira's name never repeated in that second turn — her degree claim
+    must still be scoped to her). This tracks the single MOST RECENTLY
+    named doctor only: it resets the moment a LATER Agent turn names a
+    DIFFERENT doctor (or the same doctor again, which simply keeps
+    matching), so a bare follow-up claim is never misattributed once the
+    conversation has moved on to someone else. Patient turns never affect
+    this tracking either way — only an Agent turn that itself names (or
+    fails to name) a doctor changes which doctor is "active".
+
+    A title-bearing turn that yields NO valid name candidate at all — most
+    commonly a negated/unavailable/departed/rejected doctor reference (see
+    _turn_is_doctor_context_boundary) — is a BOUNDARY, not a bare
+    continuation: it resets "active" to False rather than extending the
+    previous doctor's scope. Real regression: "غير متاح طبيب للغدد بهذا
+    الاسم" (about an earlier, rejected doctor request) was being treated
+    exactly like a genuine bare follow-up ("اخصائيه") purely because
+    _doctor_name_candidates_in_text also returns [] for it, letting its
+    specialty/fee-shaped text keep flowing to whichever doctor happened to
+    be active — see _turn_is_doctor_context_boundary's own regression note.
+
+    Returns "" (never None) when no turn matches, since _extract_degree_
+    claim already treats an empty string as "no claim" — this remains an
+    additive helper, only used for optional-field scoping; it does not
+    change extract_doctor_context_specialty or _specialty_context_for_
+    resolved_name."""
+    return " ".join(text for _, text, _ in _agent_turn_matches_for_doctor(call, resolved_name))
+
+
+def _agent_turn_matches_for_doctor(
+    call: CallTranscript, resolved_name: str,
+) -> list[tuple[int, str, bool]]:
+    """Turn-level companion to _agent_turns_text_for_doctor (same exact
+    "most recently named doctor" tracking — see that function's docstring
+    for the full regression history), returning (turn_index, text,
+    names_doctor) for every Agent turn scoped to *resolved_name* instead
+    of just the joined string. turn_index indexes into the SAME
+    split_transcript_turns(call.transcript) list a caller can recompute
+    deterministically (e.g. to look up the immediately preceding turn for
+    a local transcript excerpt — see _field_transcript_excerpt). names_
+    doctor is True only for a turn whose OWN extracted candidate(s)
+    actually matched *resolved_name* (i.e. a turn that itself STATES the
+    doctor's name, as opposed to a bare follow-up folded in via the
+    active-doctor tracking) — used by the name_completeness WARNING check
+    to find the turn where an incomplete name was actually stated."""
     resolved_tokens = _name_tokens(resolved_name)
     if not resolved_tokens:
-        return ""
+        return []
     turns = split_transcript_turns(call.transcript)
-    matched_texts: list[str] = []
-    for speaker, text in turns:
+    matched: list[tuple[int, str, bool]] = []
+    _this_doctor_is_active = False
+    for idx, (speaker, text) in enumerate(turns):
         if speaker != "agent" or is_agent_self_introduction(text):
             continue
-        for candidate in _doctor_name_candidates_in_text(text):
-            candidate_tokens = _name_tokens(candidate)
-            if candidate_tokens and _is_plausible_same_person_name(resolved_tokens, candidate_tokens):
-                matched_texts.append(text)
+        turn_candidates = _doctor_name_candidates_in_text(text)
+        if turn_candidates:
+            _this_doctor_is_active = any(
+                _name_tokens(candidate)
+                and _is_plausible_same_person_name(resolved_tokens, _name_tokens(candidate))
+                for candidate in turn_candidates
+            )
+            if _this_doctor_is_active:
+                matched.append((idx, text, True))
+        elif _turn_is_doctor_context_boundary(text, resolved_tokens):
+            # A negated/unavailable/departed doctor reference (never a
+            # bare credential word or a bare specialty request — see
+            # _turn_is_doctor_context_boundary's own docstring) — boundary.
+            _this_doctor_is_active = False
+        elif _this_doctor_is_active:
+            matched.append((idx, text, False))
+    return matched
+
+
+def _field_transcript_excerpt(
+    call: CallTranscript | None, resolved_name: str | None, field_predicate: Any,
+) -> str | None:
+    """Best-effort LOCAL transcript excerpt for one FAILED field on ONE
+    resolved doctor (see the "failure_details" schema in validate_doctor_
+    information's docstring: "transcript_excerpt" must be local to the
+    relevant doctor/field, never cross-attributed). Picks the specific
+    Agent turn — from THIS doctor's own scoped turns only, see
+    _agent_turn_matches_for_doctor, never the whole call's agent_text —
+    whose OWN text, checked in isolation, independently satisfies
+    *field_predicate* (a text->bool check using the SAME extractor the
+    field's own validation block already used), paired with the
+    immediately preceding turn when it is a Patient turn so the excerpt
+    reads exactly as the exchange actually happened (e.g. "Patient:
+    استشاري؟\\nAgent: اخصائيه"). Falls back to this doctor's LAST scoped
+    turn when no single turn's own text satisfies the predicate (a claim
+    can legitimately be assembled across more than one turn) — this is
+    still always a turn belonging to THIS doctor, never a blind scan."""
+    if not call or not resolved_name:
+        return None
+    matches = _agent_turn_matches_for_doctor(call, resolved_name)
+    if not matches:
+        return None
+    chosen: tuple[int, str] | None = None
+    for idx, text, _ in matches:
+        try:
+            if field_predicate(text):
+                chosen = (idx, text)
                 break
-    return " ".join(matched_texts)
+        except Exception:
+            continue
+    if chosen is None:
+        last_idx, last_text, _ = matches[-1]
+        chosen = (last_idx, last_text)
+    idx, agent_turn_text = chosen
+    lines = [f"Agent: {agent_turn_text}"]
+    if idx > 0:
+        turns = split_transcript_turns(call.transcript)
+        prev_speaker, prev_text = turns[idx - 1]
+        if prev_speaker == "patient":
+            lines.insert(0, f"Patient: {prev_text}")
+    return "\n".join(lines)
 
 
 def raw_doctor_title_tails(call: CallTranscript) -> tuple[list[str], list[str]]:
@@ -1366,6 +1679,70 @@ def _name_tokens(name: str) -> list[str]:
     return [t for t in normalize_arabic_text(name or "").split() if len(t) > 1]
 
 
+def _meaningful_name_token_count(candidate: str | None) -> int:
+    """Count of GENUINE person-name tokens in an already-extracted doctor-
+    name candidate — used only by the name_completeness WARNING check
+    (see _name_completeness_warning), never by identity resolution itself
+    (which already has its own established prefix/given-family matching).
+    Reuses the SAME closed blocklist every other part of this module
+    already trusts to tell a real name token apart from a title
+    (دكتور/دكتورة/طبيب/طبيبة/Dr/Doctor), a degree/rank word (استشاري/
+    اخصائي), an attached conjunction (و/والدكتورة), or a specialty/
+    schedule/branch/administrative word (_is_non_name_word) — so "دكتورة
+    بدرية" correctly counts as ONE meaningful token (the title isn't a
+    second name) while "Dr. Ahmed Ali" correctly counts as TWO."""
+    return len([t for t in _name_tokens(candidate) if not _is_non_name_word(t)])
+
+
+def _name_completeness_warning(
+    input_name: str | None, doctor: dict[str, Any],
+    call: CallTranscript | None = None, resolved_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Non-punitive WARNING (never a validation failure — see this
+    module's docstring on the name_completeness quality notice) raised
+    when the Agent only ever stated the resolved doctor's bare first
+    name, never at least a first+second name, anywhere in the call.
+
+    *input_name* is the caller's already-enriched _input_name (see
+    _resolve_and_validate_one_doctor and _enrich_candidates_with_fuller_
+    agent_names) — the MOST COMPLETE name the Agent themselves stated for
+    this doctor anywhere in the transcript, since enrichment already
+    widens a bare early mention (e.g. "اميره") to a fuller one found in a
+    LATER Agent turn (e.g. "اميره بركات") before resolution ever runs.
+    That is exactly why a later Agent-stated full name already clears
+    this warning here for free, while a Patient-only full name never
+    does: enrichment only ever draws from Agent-turn candidates (see
+    _enrichment_sources in validate_doctor_information), never Patient
+    turns.
+
+    Returns None once *input_name* already carries >=2 meaningful
+    person-name tokens (title/degree/conjunction/specialty/admin words
+    never count — see _meaningful_name_token_count), or when there is no
+    input_name at all (nothing to warn about)."""
+    if not input_name or _meaningful_name_token_count(input_name) >= 2:
+        return None
+    crm_value = doctor.get("cr301_doctornamear") or doctor.get("servhub_doctornameen") or "Not on file"
+    excerpt = None
+    if call is not None and resolved_name:
+        matches = _agent_turn_matches_for_doctor(call, resolved_name)
+        naming_turn = next((t for t in matches if t[2]), None)
+        if naming_turn is not None:
+            excerpt = naming_turn[1]
+    return {
+        "field": "name_completeness",
+        "label": "Doctor name incomplete",
+        "outcome": "WARNING",
+        "is_violation": False,
+        "chat_value": input_name,
+        "crm_value": crm_value,
+        "reason": (
+            "The agent stated only the doctor's first name. The preferred "
+            "practice is to provide at least the first and second name."
+        ),
+        "transcript_excerpt": excerpt,
+    }
+
+
 # First names alone are too common to trust — "محمد"/"أحمد"/"سارة" must not
 # resolve a doctor on their own (Part on doctor identity resolution).
 _SINGLE_TOKEN_MATCH_MIN_LEN = 2  # a query must supply >=2 real name tokens
@@ -1426,6 +1803,101 @@ def _is_plausible_same_person_name(query_tokens: list[str], name_tokens: list[st
     agreeing ("محمد احمد" vs "محمد علي" again — the family-name endpoints
     differ too)."""
     return _ordered_prefix_match(query_tokens, name_tokens) or _given_and_family_name_match(query_tokens, name_tokens)
+
+
+# ── Cross-turn recommendation-set identity enrichment ───────────────────────
+# Real regression: an Agent turn offers "بدريه والطبيبه اميره" (a genuine
+# 2-candidate recommendation set), then a LATER turn — replying to the
+# Patient's own follow-up question about availability — states the fuller
+# "اميره بركات". The Patient never repeats the name themselves, but the
+# Agent's own later turn is exactly the kind of transcript evidence CRM
+# resolution needs: a bare first-name-only candidate should be superseded by
+# a more complete, name-COMPATIBLE mention found anywhere else the Agent
+# spoke, in either direction of the conversation (never guessed — only ever
+# a strictly more informative, compatible name already present in the
+# transcript). See validate_doctor_information's use of this below.
+
+def _enrich_candidates_with_fuller_agent_names(
+    candidates: list[str], fuller_name_sources: list[str],
+) -> list[str]:
+    """For each name in *candidates* (a recommendation-set's own entries,
+    possibly bare first-name-only), look for a LONGER, name-compatible
+    candidate among *fuller_name_sources* (every OTHER name-shaped string
+    available as evidence — typically every Agent-turn candidate across
+    the whole call, see extract_doctor_turn_candidates, optionally with a
+    grounded semantic name appended — see _semantic_name_is_grounded) and,
+    when found, REPLACE the shorter entry with the fuller one.
+
+    Compatibility is the SAME strict rule CRM resolution itself already
+    uses end-to-end (_is_plausible_same_person_name: an ordered prefix, OR
+    agreement at both the given-name and family-name endpoints) — the
+    shared normaliser it builds on (_name_tokens -> normalize_arabic_text)
+    already treats ه/ة and every alef/yeh variant as equivalent, so a bare
+    "اميره" is recognised as compatible with a fuller "أميرة بركات" just as
+    readily as with "اميره بركات". A candidate that DISCRIMINATINGLY
+    conflicts with a longer name (e.g. a genuinely different surname) is
+    never touched by it — this only ever WIDENS an already-compatible
+    name, never guesses a replacement.
+
+    Never invents a new candidate and never changes how many candidates
+    exist: only replaces an EXISTING entry, only with a compatible name
+    that adds EXACTLY ONE token (a plausible single missing name
+    component — a surname added to a bare first name, e.g. "اميره" ->
+    "اميره بركات" — never an open-ended amount of extra text), and only
+    when exactly ONE existing candidate qualifies for a given fuller name.
+    The exact "+1 token" bound is deliberate, not merely a simplification:
+    extraction is not perfect elsewhere in this module — a name candidate
+    can end up with a claim glued onto it with no punctuation boundary
+    ("Dr Ahmed Ali بورد سعودي" extracted as one 4-token string when the
+    Agent stated a qualification right after re-naming an already-known
+    doctor) — and that IS still an ordered-prefix-compatible "longer"
+    string, but it must never be mistaken for a genuinely fuller NAME and
+    overwrite a clean, correct 2-token candidate ("ahmed ali") with claim
+    text. A real missing name component is always exactly one token; a
+    claim/specialty/degree phrase accidentally glued onto a name never is
+    (see the regression this specific bound closes).
+
+    A fuller name that is compatible with more than one existing
+    candidate at once is ambiguous and is left alone, since guessing
+    which one it enriches would be exactly the kind of unsafe widening
+    this module avoids everywhere else (e.g. the same-first-name-alone
+    safety net)."""
+    if not candidates or not fuller_name_sources:
+        return candidates
+    enriched = list(candidates)
+    for fuller in fuller_name_sources:
+        fuller_tokens = _name_tokens(fuller)
+        if len(fuller_tokens) < 2:
+            continue  # only a genuinely MORE COMPLETE name can enrich anything
+        compatible_indices = [
+            i for i, existing in enumerate(enriched)
+            if len(_name_tokens(existing)) == len(fuller_tokens) - 1
+            and _is_plausible_same_person_name(_name_tokens(existing), fuller_tokens)
+        ]
+        if len(compatible_indices) == 1:
+            enriched[compatible_indices[0]] = fuller
+    return enriched
+
+
+def _semantic_name_is_grounded(semantic_name: str | None, agent_candidates: list[str]) -> bool:
+    """True when *semantic_name* (an LLM-produced doctor name) is actually
+    compatible with SOME name an Agent turn's own deterministic extraction
+    independently found (see extract_doctor_turn_candidates) — the safety
+    net a multi-doctor recommendation set needs before trusting an LLM
+    name at all: an LLM name with no correspondence to anything the Agent
+    was ever transcript-recorded as saying must never be allowed to
+    enrich, replace, or otherwise stand in for real deterministic
+    evidence (see _enrich_candidates_with_fuller_agent_names, the only
+    caller of this check)."""
+    if not semantic_name:
+        return False
+    semantic_tokens = _name_tokens(semantic_name)
+    if not semantic_tokens:
+        return False
+    return any(
+        _is_plausible_same_person_name(semantic_tokens, _name_tokens(a))
+        for a in agent_candidates
+    )
 
 
 # Degree/title words that sometimes end up glued onto an already-extracted
@@ -1574,6 +2046,153 @@ def resolve_doctor_candidates(
             seen_keys.add(k)
             unique_winners.append(rec)
     return unique_winners if len(unique_winners) == 1 else unique_winners
+
+
+# ── Safe CONTEXTUAL single-name resolution (multi-doctor recommendation
+# sets ONLY) ──────────────────────────────────────────────────────────────
+# Real regression: an Agent turn offers two doctors bare-first-name-only
+# ("متاح الطبيبه بدريه والطبيبه اميره") — "اميره" later gets enriched to a
+# full name from a subsequent Agent turn (see _enrich_candidates_with_
+# fuller_agent_names), but "بدريه" never does; she has no surname anywhere
+# in the call. resolve_doctor_candidates' own allow_single_token flag
+# deliberately never trusts a bare first name via ordinary partial/fuzzy
+# matching (a common given name is far too likely to collide) — and this
+# module must NOT start doing so globally just to resolve one doctor in one
+# call (see resolve_doctor_candidates' own docstring, unchanged).
+#
+# Instead: a bare first name may resolve ONLY when AUTHORITATIVE, NON-FUZZY
+# CONTEXT — the doctor being Active + in a supported BU, the call's own BU
+# when known, and the specialty/service the Patient actually asked for
+# (e.g. "بدي دكتور الغدد" -> Endocrinology) — narrows the CRM pool down to
+# EXACTLY one doctor. Zero matches stays DOCTOR_UNRESOLVED; two or more
+# stays AMBIGUOUS_DOCTOR — this NEVER picks a "best" fuzzy-scored guess
+# among several plausible doctors (see _resolve_single_token_candidate_
+# with_context's own "never fuzzy" contract). Used ONLY as a fallback tier
+# inside _resolve_and_validate_one_doctor, and ONLY when the caller
+# (validate_doctor_information's multi-doctor branch) explicitly opts in
+# via allow_contextual_single_name=True — the ordinary single-doctor path
+# never sets this, so a bare first name mentioned outside a genuine
+# multi-doctor recommendation set is completely unaffected by this.
+
+
+def _recommendation_set_specialty_context(call: CallTranscript) -> str | None:
+    """The specialty/service category (see _resolve_specialty_category —
+    already maps "الغدد"/"الغدد الصماء"/"امراض السكر والغدد الصماء" to
+    "Endocrinology", among every other specialty this module already
+    recognises) the WHOLE multi-doctor recommendation set is framed
+    around — the Patient's own original request, checked across every
+    Patient turn FIRST (in order), falling back to Agent turns only when
+    no Patient turn resolves anything. Used ONLY to narrow a single-token
+    candidate's safe contextual resolution (see _resolve_single_token_
+    candidate_with_context) — never to override or replace extract_
+    doctor_context_specialty's own per-doctor-anchored scoping used
+    elsewhere for specialty CLAIM validation.
+
+    Deliberately scans the WHOLE call rather than being anchored to (and
+    boundary-limited by — see _turn_is_doctor_context_boundary) any one
+    named doctor's own turn: a recommendation set's shared context
+    legitimately comes from the Patient's original, standalone service
+    request, which can sit BEFORE an intervening rejected/unavailable-
+    doctor mention ("بدي دكتور الغدد" ... "غير متاح طبيب بهذا الاسم" ...
+    "متاح الطبيبه بدريه والطبيبه اميره" — all in the SAME call). This
+    never widens NAME matching by itself — it is only ever one of several
+    filters _resolve_single_token_candidate_with_context requires ALL of
+    to agree on before a bare first name is allowed to resolve at all."""
+    turns = split_transcript_turns(call.transcript)
+    for speaker, text in turns:
+        if speaker == "patient":
+            category = _resolve_specialty_category(text)
+            if category:
+                return category
+    for speaker, text in turns:
+        if speaker == "agent" and not is_agent_self_introduction(text):
+            category = _resolve_specialty_category(text)
+            if category:
+                return category
+    return None
+
+
+def _resolve_single_token_candidate_with_context(
+    name: str,
+    authoritative_pool: list[dict[str, Any]],
+    call_bu: str | None,
+    specialty_context: str | None,
+) -> list[dict[str, Any]]:
+    """Safe, CONTEXTUAL resolution for a single-token doctor-name
+    candidate — see this section's own module-level comment for the full
+    business rationale and safety contract. Filters applied, in order:
+      1. name compatibility — the CRM doctor's own given name (first
+         token, either cr301_doctornamear or servhub_doctornameen) equals
+         *name*, using the SAME ه/ة, alef, and yeh-normalising comparison
+         every other name match in this module already uses (_name_
+         tokens -> normalize_arabic_text) — never fuzzy/partial.
+      2. *authoritative_pool* only — Active + supported-BU (see
+         authoritative_doctor_pool); a doctor outside that scope is never
+         reachable through this path at all.
+      3. the call's own business unit, when known (*call_bu*, already
+         canonicalised) — via _match_doctor_business_unit (either of the
+         doctor's two CRM BU fields).
+      4. *specialty_context* (already resolved via _resolve_specialty_
+         category) — matches EITHER the doctor's specialty OR
+         subspecialty field (cr301_specialtyname/cr18c_manualspecialtyname
+         /cr301_subspecialtyname/cr18c_manualsubspecialtyname), reusing
+         _specialty_claim_result — the SAME comparison this module
+         already uses for specialty CLAIM validation elsewhere — never a
+         bare substring/fuzzy text match of its own.
+    Each of steps 3/4 is applied ONLY when its own input (*call_bu*/
+    *specialty_context*) is actually available — never silently skipped
+    the other way around (an unavailable filter is never treated as
+    "matches everything"; it simply isn't one of the filters this
+    particular call applies).
+
+    Returns the filtered list AS-IS — 0 (no context-compatible doctor at
+    all), exactly 1 (safely resolved), or 2+ (still genuinely ambiguous
+    even after every filter). NEVER picks a "best" candidate by fuzzy
+    score among 2+ results — the caller (_resolve_and_validate_one_doctor)
+    interprets this exactly like any other resolve_doctor_candidates
+    result: 0 -> DOCTOR_UNRESOLVED, 1 -> resolved, 2+ -> AMBIGUOUS_DOCTOR
+    (after its own existing same-profile/BU-tiebreak checks, unchanged)."""
+    name_tokens = _name_tokens(name)
+    if len(name_tokens) != 1:
+        return []
+    if not call_bu and not specialty_context:
+        # No authoritative context available AT ALL — a bare first name
+        # must never resolve on name-uniqueness-within-the-pool alone
+        # (that would silently degrade into exactly the unrestricted
+        # first-name matching this mechanism is explicitly required NOT
+        # to enable globally, the moment a call happens to have only one
+        # same-named doctor in its pool). At least one real contextual
+        # signal (call BU or resolved specialty) must be available before
+        # this function does any narrowing at all.
+        return []
+    given = name_tokens[0]
+
+    candidates = [
+        rec for rec in authoritative_pool
+        if any(
+            _name_tokens(str(rec.get(field) or ""))[:1] == [given]
+            for field in ("cr301_doctornamear", "servhub_doctornameen")
+        )
+    ]
+    if not candidates:
+        return []
+
+    if call_bu:
+        candidates = [rec for rec in candidates if _match_doctor_business_unit(call_bu, rec) is not None]
+        if not candidates:
+            return []
+
+    if specialty_context:
+        candidates = [
+            rec for rec in candidates
+            if _specialty_claim_result(
+                specialty_context, specialty_context,
+                rec.get("cr301_specialtyname"), rec.get("cr18c_manualspecialtyname"),
+                rec.get("cr301_subspecialtyname"), rec.get("cr18c_manualsubspecialtyname"),
+            ) is True
+        ]
+
+    return candidates
 
 
 # ── Resolution diagnostics (ambiguous / outside-authoritative-scope) ────────
@@ -2437,10 +3056,71 @@ _FEE_CLAIM_RE = re.compile(
 )
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
+# Discount/percentage context — a number found near ANY of these must
+# NEVER be treated as the doctor's own standard walk-in fee:
+#   - a discount RATE ("خصم 50%"/"50 في الميه") is not a monetary amount
+#     at all, it's a percentage;
+#   - a discounted PAYABLE amount ("بعد الخصم 113 ريال"/"في حدود 113 ريال")
+#     is the price AFTER an offer/promotion is applied, never the doctor's
+#     own standard CRM fee (cr301_walkinconsultationfees) — comparing the
+#     two directly is meaningless without the authoritative discount
+#     percentage/rule itself, which belongs to the offer/discount
+#     evaluator (real CRM promotion data), never this deterministic
+#     field-by-field doctor-information check.
+# Real regression: "خصم 50% على الكشفية" was captured as claimed
+# walkin_fee=50 and FAILed against the CRM fee (300) — "%" is stripped by
+# normalize_arabic_text's own punctuation removal before _FEE_CLAIM_RE
+# ever runs, so a percentage number is otherwise indistinguishable from a
+# genuine fee amount purely from the normalized text.
+_FEE_DISCOUNT_CONTEXT_RE = re.compile(
+    r"%|percent|في\s*ال?ميه|في\s*ال?مائه|في\s*ال?مائة|بال?ميه|بال?مية"
+    r"|خصم|discount|في\s*حدود|تقريبا|تقريباً|حوالي",
+    re.I,
+)
+
+
+def _discount_tainted_fee_numbers(raw_text: str) -> set[str]:
+    """Every digit-string in *raw_text* that appears near an explicit
+    percentage/discount indicator (see _FEE_DISCOUNT_CONTEXT_RE) — checked
+    on a DIGIT-ONLY-normalised view of the ORIGINAL text (Arabic-Indic
+    digits converted to Western form; % and every Arabic percentage/
+    discount WORD deliberately left untouched, unlike normalize_arabic_
+    text's own aggressive punctuation stripping, which erases % — the
+    exact signal this needs — before _FEE_CLAIM_RE ever sees the text).
+    Matched by VALUE, not by character position, against the (separately,
+    fully) normalized text _extract_fee_claim/_fee_claim_raw_match
+    actually search — the two normalisations diverge in string length
+    (diacritic/whitespace collapsing), so position alignment between them
+    is unreliable; a digit-string is specific enough on its own within one
+    doctor's scoped claim text that a value-based match is both simpler
+    and safe here."""
+    if not raw_text:
+        return set()
+    local = raw_text.translate(_ARABIC_DIGITS)
+    tainted: set[str] = set()
+    for m in _FEE_DISCOUNT_CONTEXT_RE.finditer(local):
+        window = local[max(0, m.start() - 20):m.end() + 20]
+        tainted.update(re.findall(r"[0-9]{1,5}", window))
+    return tainted
+
+
+def _first_untainted_fee_match(norm_text: str, tainted_numbers: set[str]) -> re.Match | None:
+    """The first _FEE_CLAIM_RE match in *norm_text* whose number is NOT in
+    *tainted_numbers* — never merely the first match overall, so a
+    discount rate/discounted amount mentioned before (or after) a genuine
+    fee statement in the same scoped text never suppresses the real one,
+    and a text with ONLY a discount-tainted number never falls back to
+    reporting it as a fee claim."""
+    for m in _FEE_CLAIM_RE.finditer(norm_text):
+        raw = (m.group(1) or m.group(2)).translate(_ARABIC_DIGITS)
+        if raw not in tainted_numbers:
+            return m
+    return None
+
 
 def _extract_fee_claim(text: str) -> float | None:
     norm = normalize_arabic_text(text)
-    m = _FEE_CLAIM_RE.search(norm)
+    m = _first_untainted_fee_match(norm, _discount_tainted_fee_numbers(text or ""))
     if not m:
         return None
     raw = (m.group(1) or m.group(2)).translate(_ARABIC_DIGITS)
@@ -2454,7 +3134,7 @@ def _fee_claim_raw_match(text: str) -> str | None:
     """The raw matched substring behind _extract_fee_claim's parsed float —
     diagnostic-only, mirrors _degree_claim_raw_match."""
     norm = normalize_arabic_text(text)
-    m = _FEE_CLAIM_RE.search(norm)
+    m = _first_untainted_fee_match(norm, _discount_tainted_fee_numbers(text or ""))
     return m.group() if m else None
 
 
@@ -2578,6 +3258,115 @@ def _log_field_validation(
 _OPTIONAL_CLAIM_FIELDS = ("degree", "doctor_notes", "qualifications", "examination_age", "walkin_fee")
 
 
+# ── Structured failure_details (Part: doctor-validation results/logging/
+# persistence/UI presentation) ───────────────────────────────────────────
+# Human-readable label/reason text for every field that can produce a
+# validated_fields[...]["outcome"] == "FAIL" entry — used only to build
+# the UI/persistence-facing failure_details list below, never consulted
+# by the PASS/FAIL decision itself (that decision is already final by the
+# time _build_field_failure_detail runs).
+_FIELD_FAILURE_LABELS: dict[str, str] = {
+    "degree": "Degree/title mismatch",
+    "specialty": "Specialty mismatch",
+    "subspecialty": "Subspecialty mismatch",
+    "business_unit": "Business unit/branch mismatch",
+    "doctor_notes": "Doctor notes mismatch",
+    "qualifications": "Qualifications mismatch",
+    "examination_age": "Examination age mismatch",
+    "walkin_fee": "Consultation fee mismatch",
+    "scope_of_service": "Scope of service mismatch",
+}
+_FIELD_FAILURE_REASONS: dict[str, str] = {
+    "degree": "The professional degree stated by the agent does not match the authoritative CRM record.",
+    "specialty": "The specialty stated by the agent does not match the authoritative CRM record.",
+    "subspecialty": "The subspecialty stated by the agent does not match the authoritative CRM record.",
+    "business_unit": "The business unit/branch stated by the agent does not match the authoritative CRM record.",
+    "doctor_notes": "The doctor notes stated by the agent do not match the authoritative CRM record.",
+    "qualifications": "The qualifications stated by the agent do not match the authoritative CRM record.",
+    "examination_age": "The examination age stated by the agent does not match the authoritative CRM record.",
+    "walkin_fee": "The consultation fee stated by the agent does not match the authoritative CRM record.",
+    "scope_of_service": "The scope of service stated by the agent does not match the authoritative CRM record.",
+}
+
+
+def _field_failure_predicate(field: str) -> Any:
+    """A text->bool check, reusing the SAME extractor/trigger each field's
+    own validation block above already used, applied to ONE turn's text
+    in isolation — used only to locate a local transcript_excerpt for a
+    FAILED field (see _field_transcript_excerpt), never to re-decide the
+    field's own PASS/FAIL outcome (already decided, against this doctor's
+    full scoped text, by the time this runs)."""
+    if field == "degree":
+        return lambda t: _extract_degree_claim(t) is not None
+    if field == "examination_age":
+        return lambda t: _extract_examination_age_claim(t) is not None
+    if field == "walkin_fee":
+        return lambda t: _extract_fee_claim(t) is not None
+    if field == "business_unit":
+        return lambda t: resolve_business_unit(t) is not None
+    if field in ("specialty", "subspecialty"):
+        return lambda t: _resolve_specialty_category(t) is not None
+    if field == "doctor_notes":
+        return lambda t: bool(_NOTES_CLAIM_TRIGGER_RE.search(normalize_arabic_text(t)))
+    if field == "scope_of_service":
+        return lambda t: (
+            bool(_SCOPE_CLAIM_TRIGGER_RE.search(normalize_arabic_text(t)))
+            or _resolve_specialty_category(t) is not None
+        )
+    if field == "qualifications":
+        return lambda t: bool(_QUALIFICATION_CLAIM_TRIGGER_RE.search(normalize_arabic_text(t)))
+    return lambda t: False
+
+
+def _raw_claim_for_field(field: str, entry: dict[str, Any], doctor_scope_text: str) -> Any:
+    """Best-effort ORIGINAL agent wording for one validated_fields entry —
+    see failure_details' schema: "chat_value" must preserve the original
+    agent wording, never a canonicalised bucket (e.g. degree's "claimed"
+    is the bucket "specialist", not the Agent's actual "اخصائيه"). Prefers
+    a "raw_claim" evidence key when the field's own validation block
+    already computed one (degree/examination_age/walkin_fee — see their
+    _xxx_claim_raw_match siblings); every other field falls back to this
+    doctor's own scoped agent text (the real original wording near the
+    claim — never a resolved category/BU-code/canonical value), and only
+    as a last resort to entry["claimed"] itself."""
+    raw = entry.get("raw_claim")
+    if raw not in (None, ""):
+        return raw
+    if doctor_scope_text:
+        return doctor_scope_text
+    return entry.get("claimed")
+
+
+def _build_field_failure_detail(
+    field: str, entry: dict[str, Any], *,
+    call: CallTranscript | None, resolved_name: str | None,
+    doctor_scope_text: str,
+) -> dict[str, Any]:
+    """Build one structured failure_details entry (Part: doctor-validation
+    results/logging/persistence/UI presentation schema) for a field whose
+    validated_fields[field]["outcome"] == "FAIL". chat_value preserves the
+    Agent's ORIGINAL wording; crm_value is always a genuine CRM display
+    value the field was actually checked against, never a bare None;
+    transcript_excerpt is local to THIS doctor and THIS field only (see
+    _field_transcript_excerpt) — never a different recommended doctor's
+    evidence in a multi-doctor recommendation set."""
+    crm_value = entry.get("reference")
+    if crm_value in (None, ""):
+        crm_value = "Not on file"
+    return {
+        "field": field,
+        "label": _FIELD_FAILURE_LABELS.get(field, field.replace("_", " ").title() + " mismatch"),
+        "chat_value": _raw_claim_for_field(field, entry, doctor_scope_text),
+        "crm_value": crm_value,
+        "chat_canonical": entry.get("claimed"),
+        "crm_canonical": crm_value.lower() if isinstance(crm_value, str) else crm_value,
+        "reason": _FIELD_FAILURE_REASONS.get(
+            field, "The agent-stated value for this field does not match the authoritative CRM record.",
+        ),
+        "transcript_excerpt": _field_transcript_excerpt(call, resolved_name, _field_failure_predicate(field)),
+    }
+
+
 def _log_skipped_optional_fields(validated: dict[str, Any]) -> None:
     """Concise diagnostic listing which optional (claim-driven) fields were
     never mentioned at all for this doctor — printed alongside, never
@@ -2595,6 +3384,8 @@ def _result(
     candidate_count: int = 0, call: CallTranscript | None = None,
     context_specialty: str | None = None,
     input_name: str | None = None, resolution_source: str | None = None,
+    failure_details: list[dict[str, Any]] | None = None,
+    warning_details: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "applicable": applicable,
@@ -2638,6 +3429,18 @@ def _result(
         ),
         "is_violation": outcome in DOCTOR_FAILURES,
         "reason": reason,
+        # Structured, UI/persistence-facing detail lists (Part: doctor-
+        # validation results/logging/persistence/UI presentation) — kept
+        # STRICTLY separate: failure_details are genuine violations
+        # (already reflected in outcome/is_violation above);
+        # warning_details are non-punitive quality notices (e.g.
+        # name_completeness) that NEVER affect outcome/is_violation,
+        # scoring, needs_review, or escalation — see _name_completeness_
+        # warning's docstring. Always present (empty list, never omitted)
+        # so a consumer never has to guess whether an absent key means "no
+        # failures" or "not computed".
+        "failure_details": failure_details or [],
+        "warning_details": warning_details or [],
     }
 
 
@@ -2656,6 +3459,7 @@ def _resolve_and_validate_one_doctor(
     patient_candidates: list[str],
     agent_candidates: list[str],
     allow_single_token: bool = False,
+    allow_contextual_single_name: bool = False,
 ) -> dict[str, Any]:
     """Resolve ONE doctor from *query_candidates* (tried in order, first
     match wins — see resolve_doctor_candidates) against the ALREADY-BUILT
@@ -2679,6 +3483,18 @@ def _resolve_and_validate_one_doctor(
     once the same-BU attempt found nothing, (4) safe partial across the
     full authoritative pool likewise — never picking a same-name doctor
     from a DIFFERENT business unit while a same-BU candidate pool exists.
+
+    *allow_contextual_single_name* (default False) is ONLY ever set True
+    by validate_doctor_information's MULTI-doctor recommendation-set
+    branch — never the single-doctor path — and only adds ONE further
+    fallback tier, tried after the ordinary authoritative-pool tier above
+    and before the outside-authoritative-scope fallback below: a bare,
+    single-token query may still resolve via _resolve_single_token_
+    candidate_with_context's safe, non-fuzzy CONTEXTUAL narrowing (Active +
+    supported BU + call BU + specialty context) when every earlier tier
+    found nothing. See that function's own docstring for the full
+    business rationale; this flag never changes behaviour for a
+    multi-token query or for the single-doctor path.
     """
     candidates: list[dict[str, Any]] = []
     resolution_source = "none"
@@ -2696,6 +3512,21 @@ def _resolve_and_validate_one_doctor(
             if found:
                 candidates, resolution_source, resolved_query = found, "authoritative_pool", query
                 break
+
+    if not candidates and allow_contextual_single_name:
+        _specialty_context = _recommendation_set_specialty_context(call) if call is not None else None
+        for query in query_candidates:
+            found = _resolve_single_token_candidate_with_context(
+                query, authoritative_pool, call_bu, _specialty_context,
+            )
+            if found:
+                candidates, resolution_source, resolved_query = found, "contextual_single_name", query
+                break
+        if candidates:
+            _doc_print_section(
+                "contextual single-name resolution", query=resolved_query,
+                specialty_context=_specialty_context, candidate_count=len(candidates),
+            )
 
     if not candidates:
         # Defensive fallback: does this doctor exist at all, just outside
@@ -2790,6 +3621,22 @@ def _resolve_and_validate_one_doctor(
             candidates = candidates[:1]  # same doctor key, duplicate rows already merged upstream
 
     doctor = candidates[0]
+
+    # Non-punitive name_completeness WARNING (Part: doctor-validation
+    # results/logging/persistence/UI presentation) — computed as soon as
+    # identity is resolved, reused by every return path below that has a
+    # resolved doctor. NEVER a failure: see _name_completeness_warning's
+    # docstring for why it never affects outcome/is_violation.
+    _name_warning = _name_completeness_warning(
+        _input_name, doctor, call, resolved_query or _input_name,
+    )
+    _warning_details = [_name_warning] if _name_warning else []
+    if _name_warning:
+        _doc_print_section(
+            "name completeness", outcome="WARNING",
+            chat_value=_name_warning["chat_value"], crm_value=_name_warning["crm_value"],
+        )
+
     logger.info(
         "doctor resolution | call_id=%s source=%s doctor_key=%s doctor_name_ar=%r business_unit=%s "
         "opd_flag=%s candidate_count=%d",
@@ -2863,6 +3710,7 @@ def _resolve_and_validate_one_doctor(
             applicable=True, doctor=doctor, candidate_count=1, call=call,
             context_specialty=intent_ctx.get("doctor_context_specialty"),
             input_name=_input_name, resolution_source=resolution_source,
+            warning_details=_warning_details,
         )
 
     # ── Field-by-field validation of ONLY the Agent's actual claims ────────
@@ -2890,7 +3738,10 @@ def _resolve_and_validate_one_doctor(
         crm_degree = _canon_degree_value(doctor.get("cr301_degreename"))
         ok = bool(crm_degree) and degree_claim == crm_degree
         degree_outcome = "PASS" if ok else "FAIL"
-        validated["degree"] = _field(degree_claim, degree_outcome, doctor.get("cr301_degreename"))
+        validated["degree"] = _field(
+            degree_claim, degree_outcome, doctor.get("cr301_degreename"),
+            raw_claim=_degree_claim_raw_match(_doctor_scope_text),
+        )
         _log_field_validation(
             "degree",
             raw_claim=_degree_claim_raw_match(_doctor_scope_text),
@@ -3164,7 +4015,10 @@ def _resolve_and_validate_one_doctor(
                 # must never silently PASS.
                 ok = None
             age_outcome = "NEEDS_REVIEW" if ok is None else ("PASS" if ok else "FAIL")
-        validated["examination_age"] = _field(age_claim, age_outcome, doctor.get("servhub_examinationage"))
+        validated["examination_age"] = _field(
+            age_claim, age_outcome, doctor.get("servhub_examinationage"),
+            raw_claim=_examination_age_claim_raw_match(_doctor_scope_text),
+        )
         _log_field_validation(
             "examination_age",
             raw_claim=_examination_age_claim_raw_match(_doctor_scope_text),
@@ -3281,7 +4135,10 @@ def _resolve_and_validate_one_doctor(
             except (TypeError, ValueError):
                 ok = False
             fee_outcome = "PASS" if ok else "FAIL"
-        validated["walkin_fee"] = _field(fee_claim, fee_outcome, crm_fee)
+        validated["walkin_fee"] = _field(
+            fee_claim, fee_outcome, crm_fee,
+            raw_claim=_fee_claim_raw_match(_doctor_scope_text),
+        )
         _log_field_validation(
             "walkin_fee",
             raw_claim=_fee_claim_raw_match(_doctor_scope_text), canonical_claim=fee_claim,
@@ -3299,6 +4156,20 @@ def _resolve_and_validate_one_doctor(
     else:
         outcome, reason = "PASS", "All Agent-stated doctor details that could be checked match the authoritative CRM record."
 
+    # Structured, per-field failure evidence (Part: doctor-validation
+    # results/logging/persistence/UI presentation) — built ONLY from
+    # fields that actually FAILed above, local to THIS resolved doctor's
+    # own scoped text (_doctor_scope_text) only — never another
+    # recommended doctor's evidence in a multi-doctor set.
+    _resolved_name_for_excerpts = resolved_query or _input_name
+    failure_details = [
+        _build_field_failure_detail(
+            field, entry, call=call, resolved_name=_resolved_name_for_excerpts,
+            doctor_scope_text=_doctor_scope_text,
+        )
+        for field, entry in validated.items() if entry["outcome"] == "FAIL"
+    ]
+
     logger.info(
         "doctor validation | call_id=%s outcome=%s doctor_key=%s fields_checked=%d",
         call_id, outcome, doctor.get("cr301_doctorkey"), len(validated),
@@ -3310,6 +4181,7 @@ def _resolve_and_validate_one_doctor(
         outcome, reason, applicable=True, doctor=doctor, validated_fields=validated,
         candidate_count=1, call=call, context_specialty=intent_ctx.get("doctor_context_specialty"),
         input_name=_input_name, resolution_source=resolution_source,
+        failure_details=failure_details, warning_details=_warning_details,
     )
 
 
@@ -3355,6 +4227,56 @@ def _aggregate_doctor_recommendation_outcomes(per_doctor: list[dict[str, Any]]) 
         f"All {len(per_doctor)} recommended doctors resolved and passed validation.",
         False,
     )
+
+
+def _active_doctor_in_recommendation_set(
+    call: CallTranscript, per_doctor: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Which per-doctor entry (see validate_doctor_information's multi-
+    doctor "doctors" list) the conversation most recently, UNAMBIGUOUSLY
+    narrowed the discussion to — purely OBSERVATIONAL, used only to
+    populate the active_doctor_input_name/active_doctor_key metadata
+    fields (see validate_doctor_information's own docstring on them);
+    never consulted by resolution/validation itself, and never a second,
+    competing name-matching mechanism (it only ever compares an already-
+    extracted turn candidate against the ALREADY-COMPUTED per_doctor
+    entries' own input_name, via the SAME _is_plausible_same_person_name
+    check every other same-person comparison in this module already
+    uses).
+
+    Scans every AGENT turn in transcript order (never reversed — the
+    LAST such turn wins, since that is the most recent, most relevant
+    narrowing); a turn is only ever informative when its own name
+    candidate(s) are compatible with EXACTLY ONE per_doctor entry — a
+    turn that names two doctors from the set at once (an "either of
+    them" offer, not a narrowing) never changes which one is "active".
+    Returns None when no Agent turn ever narrows unambiguously to a
+    single entry at all."""
+    if not per_doctor:
+        return None
+    active: dict[str, Any] | None = None
+    for speaker, text in split_transcript_turns(call.transcript):
+        if speaker != "agent" or is_agent_self_introduction(text):
+            continue
+        # Every DISTINCT per_doctor entry any candidate in THIS turn
+        # matches — deliberately de-duplicated by identity (id()) before
+        # counting, so the SAME doctor named twice in one turn (e.g. via
+        # both a bare first name and a fuller name candidate) still counts
+        # as ONE match, while genuinely offering "بدريه والطبيبه اميره"
+        # together (two DIFFERENT doctors in the same turn) correctly
+        # counts as two and is therefore NOT a narrowing at all.
+        turn_matches: dict[int, dict[str, Any]] = {}
+        for candidate in _doctor_name_candidates_in_text(text):
+            candidate_tokens = _name_tokens(candidate)
+            if not candidate_tokens:
+                continue
+            for d in per_doctor:
+                input_tokens = _name_tokens(str(d.get("input_name") or ""))
+                if input_tokens and _is_plausible_same_person_name(candidate_tokens, input_tokens):
+                    turn_matches[id(d)] = d
+        if len(turn_matches) == 1:
+            active = next(iter(turn_matches.values()))
+    return active
 
 
 def validate_doctor_information(
@@ -3539,6 +4461,31 @@ def validate_doctor_information(
 
     named_doctor_candidates = _intent_ctx.get("named_doctor_candidates") or []
 
+    # Cross-turn identity enrichment (see _enrich_candidates_with_fuller_
+    # agent_names' own module-level regression note): a candidate the
+    # classifier resolved from an EARLIER turn (e.g. bare "اميره") is
+    # superseded by a more complete, name-compatible mention found
+    # anywhere else the Agent spoke in this same call (e.g. a LATER
+    # "اميره بركات", given in reply to the Patient's own follow-up
+    # question) — the Patient need never repeat the name themselves.
+    # Sources: every Agent-turn candidate across the whole call
+    # (deterministic, always available), PLUS the semantic LLM name ONLY
+    # when it is independently GROUNDED in one of those same Agent
+    # candidates (_semantic_name_is_grounded) — an ungrounded LLM name is
+    # never added as an enrichment source at all, so it can never replace
+    # real transcript evidence. This only ever replaces an EXISTING
+    # candidate's string with a strictly fuller, compatible one; it never
+    # changes how many candidates there are, so it is always safe to run
+    # regardless of whether the single- or multi-doctor path is taken
+    # below.
+    _enrichment_sources = list(agent_candidates)
+    _semantic_name_stripped = (semantic_doctor_name or "").strip()
+    if _semantic_name_stripped and _semantic_name_is_grounded(_semantic_name_stripped, agent_candidates):
+        _enrichment_sources.append(_semantic_name_stripped)
+    named_doctor_candidates = _enrich_candidates_with_fuller_agent_names(
+        named_doctor_candidates, _enrichment_sources,
+    )
+
     if len(named_doctor_candidates) <= 1:
         # Single-doctor path — resolves against the FULL flat candidate
         # list exactly as before (never just the classifier's one scalar),
@@ -3562,9 +4509,19 @@ def validate_doctor_information(
                     semantic_specialty_context or _intent_ctx.get("doctor_context_specialty")
                 ),
             }
-        return _resolve_and_validate_one_doctor(
+        _single_result = _resolve_and_validate_one_doctor(
             query_candidates, allow_single_token=allow_single_token, **_resolve_kwargs
         )
+        # Observability-only shape markers (see the multi-doctor branch's
+        # identical fields below for the full rationale) — never consulted
+        # by resolution/validation itself, purely additive so a caller can
+        # tell "this result already IS one doctor" apart from "this is the
+        # top-level mirror of a multi-doctor set" without inspecting
+        # "doctors" first.
+        _single_result["result_shape"] = "single_doctor"
+        _single_result["doctor_count"] = 1 if _single_result.get("doctor_resolved") else 0
+        _single_result["resolved_doctor_count"] = _single_result["doctor_count"]
+        return _single_result
 
     # ── Multi-doctor recommendation set: resolve/validate EVERY recommended
     # name independently against the SAME pools built above — never stop
@@ -3578,7 +4535,14 @@ def validate_doctor_information(
     _doc_print(f"  requested={len(named_doctor_candidates)}")
     per_doctor: list[dict[str, Any]] = []
     for name in named_doctor_candidates:
-        per_doctor.append(_resolve_and_validate_one_doctor([name], **_resolve_kwargs))
+        # allow_contextual_single_name=True ONLY here (the genuine multi-
+        # doctor recommendation-SET path) — never for the single-doctor
+        # path above, so a bare first name mentioned outside a real
+        # recommendation set is completely unaffected (see _resolve_
+        # single_token_candidate_with_context's own module-level comment).
+        per_doctor.append(
+            _resolve_and_validate_one_doctor([name], allow_contextual_single_name=True, **_resolve_kwargs),
+        )
 
     resolved_count = sum(1 for d in per_doctor if d["doctor_resolved"])
     _doc_print(f"  resolved={resolved_count}")
@@ -3602,15 +4566,76 @@ def validate_doctor_information(
 
     # Top-level scalar fields mirror the FIRST doctor for backward
     # compatibility (single-doctor consumers reading doctor_key/
-    # scope_reference/etc. directly still get a sensible value); "doctors"
-    # is the authoritative multi-doctor evidence.
-    base: dict[str, Any] = dict(per_doctor[0]) if per_doctor else {}
+    # scope_reference/etc. directly still get a sensible value) — EXCEPT
+    # when the first candidate is unresolved while exactly ONE other
+    # candidate in the set DID resolve: mirroring an unresolved "None"
+    # doctor_key/business_unit/resolved_name at the top level while a
+    # real, resolved doctor sits later in "doctors" is exactly the
+    # misleading summary this generalises away (real regression: Amira
+    # resolved cleanly, but every top-level log/routing signal still read
+    # doctor_key=None/resolved_name=None because Badria — unresolved —
+    # was per_doctor[0]). Falls back to per_doctor[0] whenever which
+    # doctor is "the" active one is genuinely ambiguous (zero or 2+
+    # resolved) — this never GUESSES; "doctors" remains the untouched,
+    # authoritative, full per-candidate evidence either way (every
+    # candidate, resolved or not, always stays in it — this only changes
+    # which ONE entry's fields are additionally mirrored at the top level,
+    # and is purely additive/observational, never a second resolution
+    # decision).
+    _resolved_in_set = [d for d in per_doctor if d.get("doctor_resolved")]
+    if len(_resolved_in_set) == 1:
+        _mirrored_doctor = _resolved_in_set[0]
+        _doc_print(
+            f"top-level summary mirrors the SOLE resolved doctor "
+            f"({_mirrored_doctor.get('doctor_name_ar') or _mirrored_doctor.get('doctor_name_en')!r}), "
+            f"not necessarily per_doctor[0] — see 'doctors' for the full, untouched per-candidate set.",
+        )
+    elif per_doctor:
+        _mirrored_doctor = per_doctor[0]
+        if len(_resolved_in_set) != 1:
+            _doc_print(
+                f"top-level summary mirrors per_doctor[0] ({len(_resolved_in_set)} of "
+                f"{len(per_doctor)} resolved) — read 'doctors' for the authoritative per-candidate breakdown.",
+            )
+    else:
+        _mirrored_doctor = {}
+    base: dict[str, Any] = dict(_mirrored_doctor)
     base["outcome"] = outcome
     base["reason"] = reason
     base["is_violation"] = is_violation
     base["candidate_count"] = len(named_doctor_candidates)
     base["recommended_doctor_count"] = len(named_doctor_candidates)
     base["doctors"] = per_doctor
+    # Observability-only shape markers — NEVER authoritative on their own;
+    # "doctors" above remains the one authoritative per-candidate result
+    # for logging/scope-routing/aggregation/persistence/serialization (see
+    # this function's own docstring). These purely let a caller confirm
+    # "this IS a genuine multi-doctor set" and get an accurate resolved
+    # count without re-deriving it from "doctors" itself every time.
+    base["result_shape"] = "multi_doctor"
+    base["doctor_count"] = len(per_doctor)
+    base["resolved_doctor_count"] = resolved_count
+    # Failed/warning doctor counts (Part: doctor-validation results/
+    # logging/persistence/UI presentation) — derived directly from each
+    # per-doctor entry's own failure_details/warning_details, kept
+    # strictly separate: warning_count NEVER contributes to failed_count
+    # or to outcome/is_violation above (a doctor can be counted here in
+    # warning_count while its own validation_outcome stays PASS).
+    base["failed_count"] = sum(1 for d in per_doctor if d.get("failure_details"))
+    base["warning_count"] = sum(1 for d in per_doctor if d.get("warning_details"))
+    # Explicit ACTIVE-doctor identity (see _active_doctor_in_recommendation_
+    # set's own docstring) — set ONLY when the conversation itself
+    # unambiguously narrowed to one doctor AND that doctor actually
+    # resolved; left unset (base.get(...) is None) otherwise, so a
+    # consumer never has to guess whether an unset value means "no active
+    # doctor" or "the active doctor's key happens to be None". Deliberately
+    # separate fields from the generic top-level doctor_key/resolved_name
+    # mirror above — those intentionally stay ambiguous/best-effort for
+    # backward compatibility; these two are the unambiguous signal.
+    _active_doctor = _active_doctor_in_recommendation_set(call, per_doctor)
+    if _active_doctor and _active_doctor.get("doctor_resolved"):
+        base["active_doctor_input_name"] = _active_doctor.get("input_name")
+        base["active_doctor_key"] = _active_doctor.get("doctor_key")
     return base
 
 
@@ -3631,9 +4656,32 @@ def validate_doctor_information(
 # only ever a legitimate signal when it co-occurs with one of the actual
 # symptom/disease/procedure-with-pathology words below (e.g. "عندي وجع"
 # still matches, via وجع — not via عندي).
+#
+# IMPORTANT (second): bare "مريض" ("patient"/"sick person") is NOT itself
+# unconditional evidence — same regression class as "عندي" above, but
+# handled differently: "مريض"/"المريض" is routinely used as a plain ROLE
+# LABEL identifying WHO is being discussed, with no medical content of its
+# own at all ("المريض كاش" = "the patient [will pay] cash", "المريض
+# تأمين" = "...has insurance", "المريض جديد" = "...is a new patient",
+# "المريض عنده ملف" = "...has a file with us") — a patient role label is
+# not a diagnosis. Real diseases/conditions named right after "مريض" are
+# open-ended and impossible to enumerate exhaustively (e.g. "مريض فشل
+# كلوي" — kidney failure — a genuine, pre-existing regression this must
+# keep recognising), so rather than requiring an explicit disease word
+# after it (which would silently miss any condition not already listed
+# below), only the SPECIFIC administrative/payment continuations reported
+# as false positives are excluded via a negative lookahead immediately
+# after "مريض" — every other continuation (a real disease name, or
+# anything else) still counts, exactly as before. سكر/ربو are additionally
+# listed below as their own standalone disease words (redundant with, but
+# independent of, the "مريض" trigger) so "المريض عنده سكر"/"مريض ربو"
+# keep matching even via a DIFFERENT sentence structure than "مريض
+# <disease>" directly. Plain "مرض" ("disease/illness" as a bare noun, e.g.
+# "عندي مرض") is UNCHANGED — that word names an illness on its own,
+# unlike the "مريض" role/identity word.
 _MEDICAL_COMPLAINT_RE = re.compile(
     r"(?<![\w])وجع(?![\w])|(?<![\w])الم(?![\w])|اصابه|إصابة|قطع\s*في|تمزق|كسر|حصو[ةه]|سرطان|"
-    r"مريض|(?<![\w])مرض(?![\w])|حساسيه|حساسية|التهاب|صداع|دوخه|دوخة|"
+    r"مريض(?!\s*(?:كاش|تأمين|تامين|جديد|عنده\s*ملف))|(?<![\w])مرض(?![\w])|حساسيه|حساسية|التهاب|صداع|دوخه|دوخة|سكري|سكر|ربو|"
     r"تأخر\s*(?:في\s*)?(?:ال)?نمو|تاخر\s*(?:في\s*)?(?:ال)?نمو|"
     r"تأخر\s*(?:في\s*)?(?:ال)?حمل|تاخر\s*(?:في\s*)?(?:ال)?حمل|"
     r"صرع|تشنج|"
@@ -4210,6 +5258,38 @@ def _classify_specific_doctor_intent_impl(call: CallTranscript) -> dict[str, Any
                     last_established_target = "doctor"
                 elif is_ordering:
                     saw_ordering_marker = True
+                elif (
+                    not has_active_verb and not has_service_noun
+                    and len(_doctor_name_candidates_in_text(clause)) >= 2
+                ):
+                    # TWO OR MORE doctors named via their own fused
+                    # "<title> <name>" pair WITHIN THIS ONE CLAUSE — e.g.
+                    # "الدكتورة بدريه والطبيبه اميره بركات" with no comma
+                    # or other punctuation between the two names at all (an
+                    # ordinary Arabic conjunction "و" fused directly onto
+                    # the second title, "والطبيبه" — see _is_non_name_word/
+                    # _DEGREE_TITLE_WORDS' own regression note on why that
+                    # fused title must independently stop the FIRST name's
+                    # extraction from running into the second). This is the
+                    # SAME recommendation-SET structural signature as the
+                    # multi-CLAUSE branch just below — a clause that
+                    # independently names 2+ people via title-anchored
+                    # candidates, with no active-verb/service content of
+                    # its own, needs no further "nothing else register"
+                    # check: naming multiple people this way IS the
+                    # register. _doctor_name_candidates_in_text (not the
+                    # single-result `cand`) is what finds every one of
+                    # them independently — real regression: previously only
+                    # `cand` (the FIRST occurrence) was ever captured here,
+                    # and this whole branch never even ran at all for a
+                    # single, comma-less clause (len(clauses) > 1 required
+                    # below), so the SECOND doctor was silently dropped
+                    # from named_doctor_candidates entirely rather than
+                    # merely mis-extracted.
+                    saw_isolated_addressee = True
+                    for _clause_cand in _doctor_name_candidates_in_text(clause):
+                        if _clause_cand not in turn_bare_name_candidates:
+                            turn_bare_name_candidates.append(_clause_cand)
                 elif (
                     cand is not None and len(clauses) > 1
                     and not has_active_verb and not has_service_noun

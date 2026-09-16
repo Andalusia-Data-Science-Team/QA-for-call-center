@@ -4,8 +4,19 @@ import pytest
 
 from app.models.input import CallTranscript
 from app.service_hub.doctor_validation import (
+    _doctor_name_candidate,
+    _doctor_name_candidates_in_text,
+    _enrich_candidates_with_fuller_agent_names,
+    _extract_fee_claim,
     _match_doctor_business_unit,
+    _meaningful_name_token_count,
+    _name_completeness_warning,
+    _recommendation_set_specialty_context,
+    _rejected_candidate_reason,
+    _resolve_single_token_candidate_with_context,
     _resolve_specialty_category,
+    _semantic_name_is_grounded,
+    _specialty_context_for_resolved_name,
     _specialty_core,
     authoritative_doctor_pool,
     classify_specific_doctor_intent,
@@ -14,10 +25,12 @@ from app.service_hub.doctor_validation import (
     describe_excluded_doctor_candidates,
     detect_doctor_mention,
     detect_doctor_signals,
+    doctor_scope_skip_reason,
     doctor_scope_validation_needed,
     doctor_validation_needed,
     extract_doctor_context_specialty,
     extract_doctor_turn_candidates,
+    extract_patient_clinical_need,
     has_detailed_scope_evidence,
     is_agent_self_introduction,
     is_plausible_person_name,
@@ -260,10 +273,10 @@ def call(transcript: str) -> CallTranscript:
     )
 
 
-def validate(transcript: str, doctors=ALL_DOCTORS):
+def validate(transcript: str, doctors=ALL_DOCTORS, **kwargs):
     c = call(transcript)
     signals = detect_doctor_signals(c)
-    return validate_doctor_information(c, doctors, signals)
+    return validate_doctor_information(c, doctors, signals, **kwargs)
 
 
 # ── Applicability ────────────────────────────────────────────────────────────
@@ -344,6 +357,1051 @@ def test_duplicate_crm_rows_same_key_are_deduplicated():
     assert len(deduped) == 1
     # Non-null value from the second row fills the gap in the first.
     assert deduped[0]["cr301_specialtyname"] == "General Surgery"
+
+
+# ── Arabic ه/ة equivalence + multi-doctor candidate-boundary regression ────
+# Real regression:
+#   requested_name=بدريه والطبيبه اميره
+#   candidate_name='بدرية البيروتي '
+#   reason=discriminating_name_token_conflict
+#   doctor recommendation set: requested=2 resolved=0 outcome=DOCTOR_UNRESOLVED
+#   extracted doctor: اميره بركات
+#
+# Root cause was NOT missing ه/ة equivalence in name COMPARISON — normalize_
+# arabic_text (shared by every matching tier here) already collapses ة->ه
+# and every alef variant (أ إ آ ٱ)->ا, so "اميره"/"أميرة" and "بدريه"/
+# "بدرية" already compared equal wherever that normaliser is used. The
+# actual bug was CANDIDATE EXTRACTION: "طبيب[ةه]?"/"دكتور[ةه]?" were only
+# ever recognised as an ANCHOR _DOCTOR_TITLE_RE searches FOR (correct for
+# the FIRST title in a message), never as a CONTINUATION-STOP inside an
+# already-started candidate — so a second doctor's title, fused with no
+# space onto the Arabic conjunction "و" ("والطبيبه" = "و" + "الطبيبة"),
+# was invisible to the extraction boundary and the first doctor's name
+# candidate ran straight through it into the second doctor's own name.
+# A second, connected gap silently DROPPED the second doctor entirely
+# whenever both names shared one clause with no comma between them (the
+# recommendation-set classifier only ever extracted the FIRST title match
+# per clause). See _DEGREE_TITLE_WORDS' and the classify_specific_doctor_
+# intent clause-scanning loop's own regression comments for the fixes.
+
+DOC_BADRIA = {
+    "cr301_doctorkey": "900900201", "servhub_doctornameen": "Badria Bairuti",
+    "cr301_doctornamear": "بدرية البيروتي", "cr301_degreename": "Consultant",
+    "cr301_specialtyname": "Endocrinology", "cr301_subspecialtyname": None,
+    "cr18c_manualspecialtyname": None, "cr18c_manualsubspecialtyname": None,
+    "cr18c_buname": "AHJ", "cr301_businessunitname": "AHJ",
+    "statuscodename": "Active", "cr301_opdflag": "OPD",
+    "cr301_drnotes": None, "cr301_scopeofservice": None, "cr301_scopeofservicear": None,
+    "cr301_qualificationsandexperience": None, "cr301_qualificationsandexperiencear": None,
+    "servhub_examinationage": None, "cr301_walkinconsultationfees": None,
+}
+DOC_AMIRA = {
+    **DOC_BADRIA, "cr301_doctorkey": "900900202",
+    "servhub_doctornameen": "Amira Barakat", "cr301_doctornamear": "أميرة بركات",
+}
+
+
+@pytest.mark.parametrize("query,crm_name", [
+    ("اميره بركات", "أميرة بركات"),   # ه (query) -> ة (CRM)
+    ("أميرة بركات", "اميره بركات"),   # ة (query) -> ه (CRM)
+])
+def test_teh_marbuta_and_heh_are_treated_as_equivalent_for_amira(query, crm_name):
+    doc = {**DOC_AMIRA, "cr301_doctornamear": crm_name}
+    candidates = resolve_doctor_candidates(query, [doc])
+    assert len(candidates) == 1
+    assert candidates[0]["cr301_doctorkey"] == doc["cr301_doctorkey"]
+
+
+@pytest.mark.parametrize("query,crm_name", [
+    ("بدريه البيروتي", "بدرية البيروتي"),
+    ("بدرية البيروتي", "بدريه البيروتي"),
+])
+def test_teh_marbuta_and_heh_are_treated_as_equivalent_for_badria(query, crm_name):
+    doc = {**DOC_BADRIA, "cr301_doctornamear": crm_name}
+    candidates = resolve_doctor_candidates(query, [doc])
+    assert len(candidates) == 1
+    assert candidates[0]["cr301_doctorkey"] == doc["cr301_doctorkey"]
+
+
+@pytest.mark.parametrize("alef_variant", ["اميرة", "أميرة", "إميرة", "آميرة"])
+def test_alef_variants_in_amira_are_equivalent(alef_variant):
+    """Every alef form (ا أ إ آ) at the start of 'أميرة' must resolve the
+    same doctor — mirrors the regex example [اأإآٱ]م[يىئ]ر[هة] given for
+    this exact name."""
+    candidates = resolve_doctor_candidates(f"{alef_variant} بركات", [DOC_AMIRA])
+    assert len(candidates) == 1
+    assert candidates[0]["cr301_doctorkey"] == DOC_AMIRA["cr301_doctorkey"]
+
+
+def test_combined_candidate_splits_into_two_independent_names():
+    """The exact reported malformed extraction: a single Agent turn naming
+    two doctors with no punctuation between them ('...بدريه والطبيبه اميره
+    بركات...') must split into two independent name candidates, never one
+    combined string — 'والطبيبه' (the fused conjunction + feminine title)
+    must act as a boundary, not get folded into the first doctor's name."""
+    text = "متوفر معانا الدكتورة بدريه والطبيبه اميره بركات بكرة"
+    candidates = _doctor_name_candidates_in_text(text)
+    assert candidates == ["بدريه", "اميره بركات"]
+
+
+@pytest.mark.parametrize("title_phrase", [
+    "متوفر معانا الدكتورة بدريه والطبيبه اميره بركات بكرة",
+    "متوفرة معانا دكتورة بدريه والطبيبه اميره بركات بكرة",
+    "متوفر معانا الدكتورة بدريه ودكتورة اميره بركات بكرة",
+    "متوفر معانا الطبيبة بدريه والدكتورة اميره بركات بكرة",
+])
+def test_titles_and_attached_conjunction_are_removed_not_captured(title_phrase):
+    """و/والطبيبه/الطبيبة/الدكتورة/دكتورة/دكتور must never themselves
+    become part of an extracted candidate, or a discriminating token that
+    blocks a genuine match — every variant here must still split cleanly
+    into the same two names."""
+    candidates = _doctor_name_candidates_in_text(title_phrase)
+    assert candidates == ["بدريه", "اميره بركات"]
+    for cand in candidates:
+        assert "طبيب" not in cand and "دكتور" not in cand and cand.split()[0] != "و"
+
+
+def test_combined_candidate_extraction_does_not_hardcode_these_names():
+    """The same fused-title boundary bug, generalised to a COMPLETELY
+    different pair of names — proves the fix is a general Arabic-name rule
+    (title/conjunction blocklist + boundary detection), never a special
+    case for 'بدرية'/'أميرة' specifically."""
+    text = "متوفر معانا الدكتور سامي والطبيب خالد يوسف بكرة"
+    candidates = _doctor_name_candidates_in_text(text)
+    assert candidates == ["سامي", "خالد يوسف"]
+
+
+def test_two_recommended_doctors_resolved_independently_no_contamination():
+    """End-to-end: the malformed-combined-candidate bug previously
+    produced requested=2/resolved=0 for the WHOLE set. With the boundary
+    fixed, each doctor must resolve/fail independently. بدريه (bare first
+    name only in this turn) now safely resolves too, via the CONTEXTUAL
+    single-name mechanism — the Patient explicitly asked for "الغدد
+    الصماء" (Endocrinology) and DOC_BADRIA's own CRM specialty is
+    Endocrinology, so authoritative, non-fuzzy context narrows her down to
+    exactly one CRM doctor (see _resolve_single_token_candidate_with_
+    context). Either way, each doctor's OWN evidence must never leak into
+    the other's."""
+    transcript = (
+        "Patient: عايز اعرف مين الدكاترة المتاحين بكرة في الغدد الصماء\n"
+        "Agent: متوفر معانا الدكتورة بدريه والطبيبه اميره بركات بكرة\n"
+    )
+    result = validate(transcript, doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert len(result["doctors"]) == 2
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    badria_entry = by_name["بدريه"]
+    assert badria_entry["doctor_resolved"] is True
+    assert badria_entry["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+    assert badria_entry["resolution_source"] == "contextual_single_name"
+    amira_entry = by_name["اميره بركات"]
+    assert amira_entry["doctor_resolved"] is True
+    assert amira_entry["doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+    assert amira_entry["doctor_name_ar"] == "أميرة بركات"
+    assert amira_entry["outcome"] == "PASS"
+    # No contamination: each entry's own CRM key/name stays distinct.
+    assert badria_entry["doctor_key"] != amira_entry["doctor_key"]
+    assert badria_entry["doctor_name_ar"] != amira_entry["doctor_name_ar"]
+
+
+def test_two_fully_named_recommended_doctors_both_resolve():
+    """When BOTH doctors' full names are actually stated (no punctuation
+    between them), both must resolve to their correct, distinct CRM
+    records — no cross-contamination between the two independent
+    resolutions."""
+    transcript = (
+        "Patient: عايز اعرف مين الدكاترة المتاحين بكرة\n"
+        "Agent: متوفر معانا الدكتورة بدرية البيروتي والدكتورة اميره بركات بكرة\n"
+    )
+    result = validate(transcript, doctors=[DOC_BADRIA, DOC_AMIRA])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["بدريه البيروتي"]["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+    assert by_name["اميره بركات"]["doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+    assert result["outcome"] == "PASS"
+    assert result["doctor_resolved"] is True
+
+
+def test_genuine_discriminating_surname_conflict_still_rejected():
+    """The ه/ة equivalence fix must never weaken the discriminating-token
+    safety check — a genuinely DIFFERENT surname must still correctly
+    reject the match, ه/ة normalisation notwithstanding."""
+    doc = {**DOC_BADRIA, "cr301_doctornamear": "بدرية النجار"}
+    candidates = resolve_doctor_candidates("بدريه البيروتي", [doc])
+    assert candidates == []
+
+
+def test_no_partial_resolution_when_two_crm_doctors_share_first_name():
+    """A bare shared first name (no surname at all) must never resolve to
+    ONE of two same-named CRM doctors by accident — either no match, or
+    both returned as a tie for the caller to treat as ambiguous, but never
+    a single incorrect pick."""
+    doc_a = {**DOC_BADRIA, "cr301_doctorkey": "b1", "cr301_doctornamear": "بدرية البيروتي"}
+    doc_b = {**DOC_BADRIA, "cr301_doctorkey": "b2", "cr301_doctornamear": "بدرية النجار"}
+    candidates = resolve_doctor_candidates("بدريه", [doc_a, doc_b], allow_single_token=True)
+    assert len(candidates) != 1
+
+
+# ── Negative/unavailable doctor mentions + cross-turn identity tracking ────
+# Real regression:
+#   Agent: الطبيب حاتم غادر اندلسيه          ("Dr Hatem has LEFT Andalusia")
+#   Agent: متاح الطبيبه بدريه والطبيبه اميره  (offers two doctors, one clause)
+#   Patient: مين متاح الليلة من 9 لحد 12       (asks who is free tonight)
+#   Agent: متاح الطبيبه اميره بركات           (answers with Amira's full name)
+#   Agent: اخصائيه                            (states Amira's degree)
+# Previously: "حاتم غادر اندلسيه" was extracted as an active recommendation
+# candidate (the departure verb was never a stop word), producing a bogus
+# 3-candidate set; the later full "اميره بركات" was never used to enrich
+# the earlier bare "اميره"; and the semantic extractor's own "اميره بركات"
+# was discarded outright because the deterministic classifier already found
+# multiple candidates. Net result: requested=3 resolved=0,
+# outcome=DOCTOR_UNRESOLVED, even though Amira was clearly resolvable.
+
+_HATEM_AMIRA_BADRIA_TRANSCRIPT = (
+    "Patient: محتاج احجز موعد غدد صماء\n"
+    "Agent: الطبيب حاتم غادر اندلسيه\n"
+    "Agent: متاح الطبيبه بدريه والطبيبه اميره\n"
+    "Patient: مين متاح الليلة من 9 لحد 12\n"
+    "Agent: متاح الطبيبه اميره بركات\n"
+    "Agent: اخصائيه\n"
+)
+
+
+def test_complete_reported_conversation_resolves_amira_excludes_hatem():
+    """The full, exact reported conversation: Hatem excluded, Amira
+    enriched+resolved+her degree validated, and — per the later business
+    requirement (safe contextual single-name resolution) — Badria ALSO
+    resolves: the Patient's own request ("محتاج احجز موعد غدد صماء") gives
+    Endocrinology as the recommendation set's shared specialty context,
+    which matches DOC_BADRIA's own CRM specialty and narrows her bare
+    first name down to exactly one CRM doctor."""
+    # DOC_AMIRA's CRM degree is overridden to "Specialist" here specifically
+    # so the reported "اخصائيه" ("specialist") claim genuinely PASSes
+    # against it — the shared DOC_AMIRA fixture otherwise inherits
+    # DOC_BADRIA's "Consultant" for its OTHER (non-degree-focused) uses.
+    doc_amira_specialist = {**DOC_AMIRA, "cr301_degreename": "Specialist"}
+    result = validate(_HATEM_AMIRA_BADRIA_TRANSCRIPT, doctors=[DOC_BADRIA, doc_amira_specialist])
+    input_names = [d["input_name"] for d in result["doctors"]]
+    assert "حاتم" not in input_names
+    assert len(result["doctors"]) == 2
+
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    amira = by_name["اميره بركات"]
+    assert amira["doctor_resolved"] is True
+    assert amira["doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+    assert amira["doctor_name_ar"] == "أميرة بركات"
+    assert amira["outcome"] == "PASS"
+    assert amira["validated_fields"]["degree"]["outcome"] == "PASS"
+    assert amira["validated_fields"]["degree"]["reference"] == "Specialist"
+
+    badria = by_name["بدريه"]
+    assert badria["doctor_resolved"] is True
+    assert badria["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+    assert badria["resolution_source"] == "contextual_single_name"
+
+    # Never claims that NONE of the recommended doctors resolved -- both did.
+    assert "none" not in result["reason"].lower()
+    assert result["reason"] == "All 2 recommended doctors resolved and passed validation."
+
+
+@pytest.mark.parametrize("negative_phrase", [
+    "الطبيب حاتم غادر اندلسيه",
+    "الدكتور غير متاح",
+    "الطبيب لم يعد يعمل معنا",
+    "لا يوجد دكتور بهذا الاسم",
+])
+def test_negative_or_unavailable_doctor_mentions_yield_no_candidate(negative_phrase):
+    assert _doctor_name_candidate(negative_phrase) is None
+    assert _doctor_name_candidates_in_text(negative_phrase) == []
+
+
+def test_hatem_departure_mention_logged_as_diagnostic_evidence_not_silently_dropped():
+    """'Preserve as history/diagnostic evidence' — the rejection must be
+    identifiable as a departed/unavailable-doctor mention, not an
+    undifferentiated generic rejection, so the mention is still visible
+    in the logs even though it never becomes an active candidate."""
+    assert _rejected_candidate_reason("حاتم غادر اندلسيه") == "doctor_departed_or_unavailable"
+    assert _rejected_candidate_reason("غير متاح") == "doctor_departed_or_unavailable"
+    assert _rejected_candidate_reason("لم يعد يعمل معنا") == "doctor_departed_or_unavailable"
+    assert _rejected_candidate_reason("بهذا الاسم") == "doctor_departed_or_unavailable"
+
+
+def test_ordinary_name_containing_ghair_word_is_not_falsely_rejected():
+    """Regression guard: 'غير' is an ordinary Arabic word that can
+    legitimately be part of a real name/surname — only the specific
+    phrase 'غير متاح[ة/ه]' is a rejection signal, never bare 'غير' alone."""
+    assert _doctor_name_candidate("الاستشاري سلمى غير عيادات وهي ممتازة") == "سلمي غير عيادات"
+
+
+def test_splitting_badria_and_amira_bare_clause():
+    """'متاح الطبيبه بدريه والطبيبه اميره' must split into two independent
+    candidates, 'بدريه' and 'اميره' — the fused conjunction+title
+    'والطبيبه' must act as a boundary, never a name token."""
+    candidates = _doctor_name_candidates_in_text("متاح الطبيبه بدريه والطبيبه اميره")
+    assert candidates == ["بدريه", "اميره"]
+
+
+@pytest.mark.parametrize("existing,fuller,should_enrich", [
+    (["اميره"], ["اميره بركات"], True),
+    (["أميرة"], ["اميره بركات"], True),   # ة (existing) vs ه (fuller)
+    (["اميره"], ["أميرة بركات"], True),   # ه (existing) vs ة (fuller)
+    (["إميرة"], ["اميره بركات"], True),   # alef variant
+    (["آميره"], ["اميره بركات"], True),   # alef variant
+])
+def test_enrich_amira_across_alef_yeh_and_teh_marbuta_variants(existing, fuller, should_enrich):
+    result = _enrich_candidates_with_fuller_agent_names(existing, fuller)
+    if should_enrich:
+        assert result == fuller
+    else:
+        assert result == existing
+
+
+def test_enrich_badria_across_teh_marbuta_variant():
+    assert _enrich_candidates_with_fuller_agent_names(["بدريه"], ["بدرية البيروتي"]) == ["بدرية البيروتي"]
+
+
+def test_enrichment_refuses_when_surnames_conflict():
+    """A LATER, unrelated fuller name must never overwrite an existing
+    candidate it doesn't actually match — no discriminating-token
+    guessing."""
+    result = _enrich_candidates_with_fuller_agent_names(["اميره"], ["بدريه بركات"])
+    assert result == ["اميره"]
+
+
+def test_enrichment_does_not_hijack_a_name_with_an_attached_claim():
+    """Regression guard: extraction can glue a claim onto a name with no
+    punctuation boundary ('Dr Ahmed Ali بورد سعودي' extracted as one
+    4-token string) — this must never be treated as a genuinely fuller
+    NAME and overwrite a clean 2-token candidate. Only a fuller name that
+    adds EXACTLY one token (a plausible missing surname) may enrich."""
+    result = _enrich_candidates_with_fuller_agent_names(
+        ["ahmed ali"], ["ahmed ali بورد سعودي"],
+    )
+    assert result == ["ahmed ali"]
+
+
+def test_two_distinct_fully_named_recommendations_preserved():
+    candidates = ["بدرية البيروتي", "اميره بركات"]
+    result = _enrich_candidates_with_fuller_agent_names(
+        candidates, ["بدرية البيروتي", "اميره بركات", "بدريه"],
+    )
+    assert result == candidates
+
+
+def test_later_agent_turn_narrows_recommendation_set_and_validates_amira():
+    """A later Agent turn answering the Patient's follow-up question
+    ('اميره بركات', with no name repeated by the Patient at all) must
+    become the active doctor for the subsequent degree claim — this is
+    exactly the cross-turn enrichment mechanism, applied end to end."""
+    result = validate(_HATEM_AMIRA_BADRIA_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert "اميره بركات" in by_name
+    assert by_name["اميره بركات"]["doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+
+
+def test_semantic_name_grounded_in_agent_turn_is_accepted():
+    assert _semantic_name_is_grounded("اميره بركات", ["اميره", "بدريه"]) is True
+
+
+def test_semantic_name_not_grounded_in_any_agent_turn_is_rejected():
+    """An LLM-produced name with no correspondence to anything the Agent
+    actually said must never be trusted to enrich or replace real
+    transcript evidence."""
+    assert _semantic_name_is_grounded("محمد السيد", ["اميره", "بدريه"]) is False
+
+
+def test_ungrounded_semantic_name_does_not_replace_deterministic_candidates():
+    transcript = (
+        "Patient: محتاج احجز موعد غدد صماء\n"
+        "Agent: متاح الطبيبه بدريه والطبيبه اميره\n"
+    )
+    result = validate(
+        transcript, doctors=[DOC_BADRIA, DOC_AMIRA], semantic_doctor_name="محمد السيد",
+    )
+    input_names = {d["input_name"] for d in result["doctors"]}
+    assert input_names == {"بدريه", "اميره"}
+    assert "محمد السيد" not in input_names
+    # Neither candidate got the ungrounded name substituted in -- both
+    # still safely resolve on their own via the contextual single-name
+    # mechanism (shared Endocrinology context + each doctor's own CRM
+    # specialty), never via the rejected "محمد السيد".
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["بدريه"]["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+    assert by_name["اميره"]["doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+
+
+def test_grounded_semantic_name_enriches_a_multi_doctor_recommendation_set():
+    """The semantic extractor already returns 'اميره بركات' from an
+    earlier turn that only had 'اميره'; even though the deterministic
+    classifier found a genuine multi-doctor set, the grounded semantic
+    name must still enrich the compatible candidate rather than being
+    discarded outright. بدريه resolves independently too, via the
+    contextual single-name mechanism (shared Endocrinology context) --
+    neither resolution depends on or interferes with the other."""
+    transcript = (
+        "Patient: محتاج احجز موعد غدد صماء\n"
+        "Agent: متاح الطبيبه بدريه والطبيبه اميره\n"
+    )
+    result = validate(
+        transcript, doctors=[DOC_BADRIA, DOC_AMIRA], semantic_doctor_name="اميره بركات",
+    )
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["اميره بركات"]["doctor_resolved"] is True
+    assert by_name["اميره بركات"]["doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+    assert by_name["بدريه"]["doctor_resolved"] is True
+    assert by_name["بدريه"]["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+    assert by_name["بدريه"]["resolution_source"] == "contextual_single_name"
+
+
+# ── Fee/discount extraction, negation-boundary scoping, and clinical-need
+# false positives — a further regression on the same conversation ────────────
+# Current incorrect results this section fixes:
+#   1. "خصم 50% على الكشفية" was captured as claimed walkin_fee=50 and
+#      FAILed against the CRM fee (300) -- a discount RATE is not a fee.
+#   2. "غى حدود 113 ريال" (a discounted PAYABLE amount) must never be
+#      compared directly with the standard CRM walk-in fee.
+#   3. "غير متاح طبيب للغدد بهذا الاسم" (about the earlier, rejected
+#      request) supplied a bogus specialty claim ("للغدد بهذا الاسم") for
+#      Amira, the doctor actually named in a LATER turn.
+#   4. "المريض كاش ومهم يكون في خصم على الكشفيه" (a payment/discount
+#      request) was treated as a genuine clinical need, running doctor-
+#      scope validation on a non-clinical statement.
+#   5. Amira resolving successfully was hidden behind a misleading
+#      top-level doctor_key=None/resolved_name=None/business_unit=None,
+#      because those scalar fields mirrored Badria (unresolved,
+#      per_doctor[0]) instead of Amira (the sole resolved doctor).
+
+_FULL_HATEM_AMIRA_BADRIA_CONVERSATION = (
+    "Patient: محتاج احجز موعد غدد صماء\n"
+    "Agent: الطبيب حاتم غادر اندلسيه\n"
+    "Agent: غير متاح طبيب للغدد بهذا الاسم\n"
+    "Agent: متاح الطبيبه بدريه والطبيبه اميره\n"
+    "Patient: مين متاح الليلة من 9 لحد 12\n"
+    "Agent: متاح الطبيبه اميره بركات\n"
+    "Patient: استشاري؟\n"
+    "Agent: اخصائيه\n"
+    "Agent: خصم 50% على الكشفية\n"
+    "Agent: في حدود 113 ريال\n"
+    "Patient: المريض كاش ومهم يكون في خصم على الكشفيه\n"
+)
+DOC_AMIRA_SENIOR_REGISTRAR = {
+    **DOC_AMIRA, "cr301_doctorkey": "11011216",
+    "cr301_degreename": "Senior Registrar", "cr301_walkinconsultationfees": 300,
+}
+
+
+# -- A. Monetary claim extraction -------------------------------------------
+
+def test_discount_percentage_does_not_create_a_fee_claim():
+    assert _extract_fee_claim("خصم 50% على الكشفية") is None
+
+
+@pytest.mark.parametrize("phrase", [
+    "الكشفية خصم 50 في الميه",
+    "خصم 50 في المائة على الكشفية",
+    "خصم 50 بالمية على الكشفية",
+    "discount 50 percent on consultation fee",
+])
+def test_arabic_and_english_percentage_forms_rejected_as_fees(phrase):
+    assert _extract_fee_claim(phrase) is None
+
+
+def test_explicit_fee_statement_still_recognized():
+    assert _extract_fee_claim("سعر الكشف 300 ريال") == 300.0
+    assert _extract_fee_claim("الكشفية 250") == 250.0
+
+
+def test_discounted_payable_amount_not_extracted_as_standard_fee():
+    """'بعد الخصم 113 ريال' (or 'في حدود 113 ريال') is the price AFTER a
+    discount is applied -- it must never be captured as (and therefore
+    never compared against) the doctor's own standard CRM walk-in fee."""
+    assert _extract_fee_claim("بعد الخصم الكشفية في حدود 113 ريال") is None
+    assert _extract_fee_claim("الكشفية في حدود 113 ريال بعد الخصم") is None
+
+
+def test_conversation_produces_no_walkin_fee_claim_at_all():
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert "walkin_fee" not in by_name["اميره بركات"]["validated_fields"]
+
+
+# -- B. Scoping claims to the correct doctor/context -------------------------
+
+def test_negative_doctor_statement_supplies_no_specialty_for_later_doctor():
+    transcript = (
+        "Agent: الطبيب حاتم غادر اندلسيه\n"
+        "Agent: غير متاح طبيب للغدد بهذا الاسم\n"
+        "Agent: متاح الطبيبه اميره بركات\n"
+    )
+    c = call(transcript)
+    assert _specialty_context_for_resolved_name(c, "اميره بركات") is None
+
+
+def test_ghair_bihatha_alism_not_attributed_to_amira():
+    c = call(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION)
+    context = _specialty_context_for_resolved_name(c, "اميره بركات")
+    assert context != "للغدد بهذا الاسم"
+    assert context is None or "بهذا" not in context
+
+
+def test_degree_answer_remains_attached_to_amira_through_local_exchange():
+    """The Patient asks 'استشاري؟' and the Agent answers 'اخصائيه' -- this
+    bare follow-up claim must stay associated with Amira (the doctor named
+    immediately before it), and compare against her ACTUAL CRM degree
+    (Senior Registrar) without being weakened into a false PASS."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    degree = by_name["اميره بركات"]["validated_fields"]["degree"]
+    assert degree["claimed"] == "specialist"
+    assert degree["reference"] == "Senior Registrar"
+    # Business rule preserved, not automatically weakened: no existing
+    # equivalence maps "Senior Registrar" to "Specialist" in this module.
+    assert degree["outcome"] == "FAIL"
+
+
+# -- C. Clinical-need detection ----------------------------------------------
+
+@pytest.mark.parametrize("phrase", [
+    "المريض كاش",
+    "المريض تأمين",
+    "المريض جديد",
+    "المريض عنده ملف",
+    "المريض كاش ومهم يكون في خصم على الكشفيه",
+])
+def test_administrative_patient_phrases_do_not_trigger_clinical_need(phrase):
+    assert patient_describes_medical_complaint(phrase) is False
+
+
+@pytest.mark.parametrize("phrase", [
+    "مريض سكر", "المريض عنده سكر", "المريض يعاني من صداع", "مريض ربو", "مريض سرطان",
+])
+def test_genuine_clinical_patient_phrases_still_trigger(phrase):
+    assert patient_describes_medical_complaint(phrase) is True
+
+
+def test_conversation_skips_doctor_scope_validation_no_clinical_need():
+    c = call(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION)
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    need = extract_patient_clinical_need(c)
+    assert need == ""
+    assert doctor_scope_skip_reason(result, need, c) == "no_patient_clinical_need"
+
+
+# -- D. Multi-doctor result consumption --------------------------------------
+
+def test_complete_conversation_resolves_amira_and_top_level_summary_is_not_misleading():
+    """Per the later business requirement (safe contextual single-name
+    resolution), Badria ALSO resolves in this conversation now -- the
+    Patient's own "محتاج احجز موعد غدد صماء" request gives Endocrinology
+    as the shared specialty context, matching DOC_BADRIA's own CRM
+    specialty. The per-doctor list stays the complete, authoritative
+    evidence for BOTH; the aggregate outcome still correctly surfaces
+    Amira's genuine degree mismatch rather than masking it."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["بدريه"]["doctor_resolved"] is True
+    assert by_name["بدريه"]["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+    assert by_name["اميره بركات"]["doctor_resolved"] is True
+    assert by_name["اميره بركات"]["doctor_key"] == "11011216"
+    # The aggregate outcome correctly reflects Amira's genuine degree
+    # mismatch (FAIL outranks DOCTOR_UNRESOLVED/PASS in the aggregation
+    # priority) -- never silently claims every doctor resolved and passed.
+    assert result["outcome"] == "FAIL"
+    assert "اميره بركات" in result["reason"]
+
+
+def test_top_level_summary_mirrors_sole_resolved_doctor_when_other_genuinely_unresolvable():
+    """The "sole resolved doctor" top-level mirroring still matters when a
+    recommended doctor genuinely CANNOT be resolved even with contextual
+    narrowing (e.g. no CRM doctor at all shares her first name) -- the
+    top-level scalar fields must still expose Amira, never a misleading
+    None mirrored from Badria's unresolved entry."""
+    result = validate(
+        _FULL_HATEM_AMIRA_BADRIA_CONVERSATION,
+        doctors=[DOC_AMIRA_SENIOR_REGISTRAR],  # Badria's own record isn't in the CRM pool at all
+    )
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["بدريه"]["doctor_resolved"] is False
+    assert by_name["اميره بركات"]["doctor_resolved"] is True
+    assert result["doctor_key"] == "11011216"
+    assert result["doctor_resolved"] is True
+    assert result["business_unit"] == "AHJ"
+
+
+# ── Non-punitive name_completeness WARNING + structured failure_details
+# (Part: doctor-validation results/logging/persistence/UI presentation) ──
+# Driven by the SAME real reported call (6AAD9CDB-2D96-F111-9B33-
+# 000D3AA9D409 / _FULL_HATEM_AMIRA_BADRIA_CONVERSATION) already used above:
+# the Agent only ever states Badria's bare first name ("بدريه") while
+# Amira is later given a full name ("اميره بركات") — Badria must get a
+# non-punitive WARNING (never a failure), Amira must get a genuine degree
+# FAILURE with structured evidence, and neither may ever affect the other.
+
+def test_badria_receives_name_completeness_warning():
+    """Item 6."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    warnings = by_name["بدريه"]["warning_details"]
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["field"] == "name_completeness"
+    assert w["outcome"] == "WARNING"
+    assert w["is_violation"] is False
+    assert w["chat_value"] == "بدريه"
+    assert w["crm_value"] == "بدرية البيروتي"
+
+
+def test_badria_remains_pass_and_not_a_violation_despite_warning():
+    """Item 7 — a non-punitive WARNING never turns a per-doctor PASS into
+    a FAIL and never sets is_violation."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    badria = by_name["بدريه"]
+    assert badria["outcome"] == "PASS"
+    assert badria["is_violation"] is False
+    assert badria["failure_details"] == []
+
+
+def test_amira_receives_no_name_warning_after_later_full_name():
+    """Item 8 — the Agent later states "اميره بركات" (two meaningful
+    tokens), so Amira must never receive a name_completeness warning even
+    though she was first introduced by a bare first name."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["اميره بركات"]["warning_details"] == []
+
+
+def test_amiras_degree_failure_contains_raw_chat_value_and_crm_value():
+    """Item 9 — chat_value preserves the Agent's ORIGINAL wording
+    ("اخصائيه"), never the canonicalised bucket ("specialist");
+    crm_value is the genuine CRM display value ("Senior Registrar")."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    failures = by_name["اميره بركات"]["failure_details"]
+    assert len(failures) == 1
+    fd = failures[0]
+    assert fd["field"] == "degree"
+    # normalize_arabic_text (already applied module-wide to every raw-match
+    # helper, e.g. _degree_claim_raw_match) folds ئ/ي the same way it folds
+    # every other hamza/yeh variant, so the preserved wording is "اخصاييه",
+    # not the transcript's exact byte-for-byte "اخصائيه" -- still the
+    # Agent's own original wording, never the canonicalised bucket
+    # ("specialist") validated_fields itself stores for comparison.
+    assert "اخصاييه" in fd["chat_value"]
+    assert fd["crm_value"] == "Senior Registrar"
+
+
+def test_degree_failure_includes_correct_local_transcript_excerpt():
+    """Item 10 — the excerpt must be the actual local Patient/Agent
+    exchange the claim came from, never a different doctor's turn."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    excerpt = by_name["اميره بركات"]["failure_details"][0]["transcript_excerpt"]
+    assert excerpt is not None
+    assert "استشاري؟" in excerpt
+    assert "اخصائيه" in excerpt
+
+
+def test_badria_does_not_inherit_amiras_degree_failure():
+    """Item 11 — evidence must be local to the relevant doctor/field,
+    never cross-attributed in a multi-doctor recommendation set."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["بدريه"]["failure_details"] == []
+    assert "degree" not in by_name["بدريه"]["validated_fields"]
+
+
+def test_warnings_excluded_from_failed_count_but_counted_separately():
+    """Item 12 — warning_count and failed_count are independent; Badria's
+    warning must never inflate failed_count, and Amira's real failure
+    must never be hidden from it."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    assert result["failed_count"] == 1
+    assert result["warning_count"] == 1
+    assert result["resolved_doctor_count"] == 2
+
+
+# ── name_completeness token-counting rules (unit-level) ─────────────────────
+
+def test_title_plus_one_name_counts_as_incomplete():
+    """Item 16."""
+    assert _meaningful_name_token_count("دكتورة بدرية") == 1
+
+
+def test_title_plus_two_names_counts_as_complete():
+    """Item 17."""
+    assert _meaningful_name_token_count("Dr. Ahmed Ali") == 2
+    assert _meaningful_name_token_count("بدرية البيروتي") == 2
+
+
+def test_name_completeness_warning_none_once_two_tokens_present():
+    doctor = {"cr301_doctornamear": "بدرية البيروتي", "servhub_doctornameen": "Badria Bairuti"}
+    assert _name_completeness_warning("اميره بركات", doctor) is None
+
+
+def test_name_completeness_warning_present_for_bare_first_name():
+    doctor = {"cr301_doctornamear": "بدرية البيروتي", "servhub_doctornameen": "Badria Bairuti"}
+    w = _name_completeness_warning("بدريه", doctor)
+    assert w is not None
+    assert w["chat_value"] == "بدريه"
+    assert w["crm_value"] == "بدرية البيروتي"
+
+
+def test_later_agent_stated_full_name_clears_earlier_warning():
+    """Item 18 — enrichment already widens a bare early Agent mention to a
+    later, fuller Agent-stated name (see _enrich_candidates_with_fuller_
+    agent_names); by the time name-completeness is evaluated, the
+    doctor's own input_name already reflects the fullest name the Agent
+    ever stated, so a later full name clears the warning."""
+    transcript = (
+        "Agent: متاح الطبيبه اميره والطبيبه بدريه\n"
+        "Patient: مين متاح؟\n"
+        "Agent: متاح الطبيبه اميره بركات\n"
+    )
+    result = validate(transcript, doctors=[DOC_BADRIA, DOC_AMIRA])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["اميره بركات"]["warning_details"] == []
+
+
+def test_patient_only_full_name_does_not_clear_agent_name_warning():
+    """Item 19 — enrichment only ever draws from AGENT-turn candidates
+    (see _enrich_candidates_with_fuller_agent_names' own call site in
+    validate_doctor_information); a Patient-only full name must never
+    clear a warning the Agent's own incomplete mention earned."""
+    transcript = (
+        "Patient: محتاج احجز موعد غدد صماء\n"
+        "Agent: متاح الطبيبه بدريه والطبيبه اميره بركات\n"
+        "Patient: تقصدي بدرية البيروتي؟\n"
+        "Agent: تمام\n"
+    )
+    result = validate(transcript, doctors=[DOC_BADRIA, DOC_AMIRA])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert len(by_name["بدريه"]["warning_details"]) == 1
+    assert by_name["بدريه"]["warning_details"][0]["chat_value"] == "بدريه"
+
+
+def test_ambiguous_doctor_receives_no_fabricated_crm_comparison():
+    """Item 21 — an AMBIGUOUS_DOCTOR result must never carry fabricated
+    failure_details/warning_details (there is no single resolved CRM
+    record to compare against)."""
+    doc_badria_twin = {**DOC_BADRIA, "cr301_doctorkey": "999999999", "cr301_specialtyname": "Cardiology"}
+    transcript = "Agent: متاح الطبيبه بدريه\n"
+    result = validate(transcript, doctors=[DOC_BADRIA, doc_badria_twin, DOC_AMIRA])
+    assert result["outcome"] != "PASS"
+    assert result.get("failure_details", []) == []
+
+
+# ── Safe CONTEXTUAL single-name resolution (call 6AAD9CDB-2D96-F111-9B33-
+# 000D3AA9D409) ──────────────────────────────────────────────────────────
+# Current (fixed) result: requested=2 resolved=2 -- بدريه resolves via
+# authoritative, non-fuzzy context (Active + supported BU + call BU when
+# known + the shared Endocrinology context the Patient's own request
+# established), never via unrestricted first-name/fuzzy matching (see
+# _resolve_single_token_candidate_with_context's own module-level comment
+# for the full business rationale and safety contract).
+
+_ENDOCRINE_RECOMMENDATION_TRANSCRIPT = (
+    "Patient: بدي دكتور الغدد أعتقد اسمه حامد\n"
+    "Agent: غير متاح طبيب للغدد بهذا الاسم\n"
+    "Patient: اسمه حاتم وهل يوجد خصم على الكشفية\n"
+    "Agent: الطبيب حاتم غادر اندلسيه\n"
+    "       متاح الطبيبه بدريه والطبيبه اميره\n"
+    "Agent: حابب نحجز مع احد منهم؟\n"
+    "Patient: من الدكتور بين 9 الى 12 الليل؟\n"
+    "Agent: متاح الطبيبه اميره بركات\n"
+    "Patient: استشاري؟\n"
+    "Agent: اخصائيه\n"
+)
+
+
+def test_full_endocrine_conversation_resolves_both_badria_and_amira():
+    """Item 1 — the complete supplied conversation resolves both offered
+    doctors: بدريه -> بدرية البيروتي (contextual single-name resolution)
+    and اميره -> أميرة بركات (cross-turn enrichment then exact match)."""
+    result = validate(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert len(result["doctors"]) == 2
+
+    badria = by_name["بدريه"]
+    assert badria["doctor_resolved"] is True
+    assert badria["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+    assert badria["doctor_name_ar"] == "بدرية البيروتي"
+
+    amira = by_name["اميره بركات"]
+    assert amira["doctor_resolved"] is True
+    assert amira["doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+    assert amira["doctor_name_ar"] == "أميرة بركات"
+
+
+def test_badria_resolves_uniquely_via_endocrinology_context():
+    """Item 2 — بدريه resolves uniquely using the Endocrinology context
+    established by the Patient's own request, via the dedicated
+    contextual-resolution helper directly."""
+    specialty_context = _recommendation_set_specialty_context(call(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT))
+    assert specialty_context == "Endocrinology"
+    found = _resolve_single_token_candidate_with_context(
+        "بدريه", [DOC_BADRIA, DOC_AMIRA], None, specialty_context,
+    )
+    assert len(found) == 1
+    assert found[0]["cr301_doctorkey"] == DOC_BADRIA["cr301_doctorkey"]
+
+
+def test_amira_still_enriched_to_full_name_in_this_conversation():
+    """Item 3 — اميره is still enriched to اميره بركات from the later,
+    fully-named Agent turn, exactly as before this change."""
+    result = validate(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    input_names = [d["input_name"] for d in result["doctors"]]
+    assert "اميره بركات" in input_names
+    assert "اميره" not in input_names
+
+
+@pytest.mark.parametrize("given_name_variant", ["بدريه", "بدرية"])
+def test_teh_marbuta_variant_forms_resolve_via_contextual_matching(given_name_variant):
+    """Item 4 — ه/ة variants in the QUERY name must still resolve the same
+    CRM doctor via the contextual mechanism (reuses the same normalize_
+    arabic_text-based comparison every other name match in this module
+    already relies on)."""
+    found = _resolve_single_token_candidate_with_context(
+        given_name_variant, [DOC_BADRIA, DOC_AMIRA], None, "Endocrinology",
+    )
+    assert len(found) == 1
+    assert found[0]["cr301_doctorkey"] == DOC_BADRIA["cr301_doctorkey"]
+
+
+@pytest.mark.parametrize("given_name_variant", ["اميره", "أميرة", "إميرة", "آميره"])
+def test_alef_and_teh_marbuta_variants_resolve_via_contextual_matching(given_name_variant):
+    """Item 4 (continued) — alef variants (ا/أ/إ/آ) in the QUERY name must
+    also resolve correctly via the contextual mechanism."""
+    found = _resolve_single_token_candidate_with_context(
+        given_name_variant, [DOC_BADRIA, DOC_AMIRA], None, "Endocrinology",
+    )
+    assert len(found) == 1
+    assert found[0]["cr301_doctorkey"] == DOC_AMIRA["cr301_doctorkey"]
+
+
+def test_bare_first_name_without_specialty_or_bu_context_stays_unresolved():
+    """Item 5 (replaces the old 'first-name-only Badria always stays
+    unresolved' assumption, per the new business requirement) — a bare
+    first name resolves ONLY when authoritative context narrows the pool
+    to exactly one doctor. With NO specialty context and NO call BU at
+    all, it must remain unresolved, never guessed via fuzzy/partial
+    matching."""
+    found = _resolve_single_token_candidate_with_context(
+        "بدريه", [DOC_BADRIA, DOC_AMIRA], None, None,
+    )
+    assert found == []
+
+
+def test_first_name_matching_multiple_endocrinology_doctors_stays_ambiguous():
+    """Item 6 — when the contextual filters still leave TWO OR MORE
+    candidates (e.g. two distinct CRM doctors who both happen to share the
+    queried first name AND both practice the resolved specialty), the
+    result must stay genuinely ambiguous — NEVER resolved by picking the
+    highest fuzzy score among them (item 7 of the business requirement)."""
+    doc_badria_2 = {
+        **DOC_BADRIA, "cr301_doctorkey": "900900299",
+        "servhub_doctornameen": "Badria Youssef", "cr301_doctornamear": "بدرية يوسف",
+    }
+    found = _resolve_single_token_candidate_with_context(
+        "بدريه", [DOC_BADRIA, doc_badria_2, DOC_AMIRA], None, "Endocrinology",
+    )
+    assert len(found) == 2
+    assert {r["cr301_doctorkey"] for r in found} == {DOC_BADRIA["cr301_doctorkey"], doc_badria_2["cr301_doctorkey"]}
+
+
+def test_ambiguous_first_name_produces_ambiguous_doctor_end_to_end():
+    doc_badria_2 = {
+        **DOC_BADRIA, "cr301_doctorkey": "900900299",
+        "servhub_doctornameen": "Badria Youssef", "cr301_doctornamear": "بدرية يوسف",
+    }
+    transcript = (
+        "Patient: بدي دكتور الغدد\n"
+        "Agent: متاح الطبيبه بدريه والطبيبه اميره بركات\n"
+    )
+    result = validate(transcript, doctors=[DOC_BADRIA, doc_badria_2, DOC_AMIRA])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["بدريه"]["outcome"] == "AMBIGUOUS_DOCTOR"
+    assert by_name["اميره بركات"]["outcome"] == "PASS"
+
+
+def test_unique_first_name_plus_specialty_resolves():
+    """Item 7 — a unique first name, once specialty context narrows the
+    pool to exactly one CRM doctor, safely resolves (end-to-end, mirrors
+    item 2 but through the full multi-doctor validation path)."""
+    transcript = (
+        "Patient: بدي دكتور الغدد\n"
+        "Agent: متاح الطبيبه بدريه والطبيبه اميره بركات\n"
+    )
+    result = validate(transcript, doctors=[DOC_BADRIA, DOC_AMIRA])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert by_name["بدريه"]["doctor_resolved"] is True
+    assert by_name["بدريه"]["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+
+
+def test_contextual_resolution_rejects_conflicting_surname():
+    """Item 8 — the contextual mechanism only ever matches on the GIVEN
+    name plus context; it must never be used to override a genuine
+    discriminating-surname conflict elsewhere. A query that already
+    carries a conflicting surname is handled by the ordinary exact/
+    partial-match tiers (unchanged) and must still fail, not fall through
+    to a contextual match on the given name alone."""
+    found = resolve_doctor_candidates("بدريه النجار", [{**DOC_BADRIA, "cr301_doctornamear": "بدرية البيروتي"}])
+    assert found == []
+
+
+def test_hatem_departure_statement_excluded_from_full_conversation():
+    """Item 9 — 'الطبيب حاتم غادر اندلسيه' never enters the recommendation
+    set, and Amira never inherits any of its text as her own evidence."""
+    result = validate(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    input_names = [d["input_name"] for d in result["doctors"]]
+    assert "حاتم" not in input_names
+    assert not any("حاتم" in name for name in input_names)
+
+
+def test_amiras_degree_claim_not_applied_to_badria():
+    """Item 10 — the later Patient/Agent exchange ('استشاري؟' / 'اخصائيه')
+    is local to Amira; Badria, who never repeats a degree claim of her
+    own, must show no degree claim in her own validated_fields at all."""
+    doc_amira_registrar = {**DOC_AMIRA, "cr301_degreename": "Senior Registrar"}
+    result = validate(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT, doctors=[DOC_BADRIA, doc_amira_registrar])
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert "degree" not in by_name["بدريه"]["validated_fields"]
+    assert by_name["اميره بركات"]["validated_fields"]["degree"]["outcome"] == "FAIL"
+
+
+def test_shared_endocrinology_context_available_for_both_doctors():
+    """Item 11 — both Badria and Amira are offered together for the same
+    endocrinology request, so the SAME resolved specialty context is what
+    narrows each of their independent contextual resolutions."""
+    context = _recommendation_set_specialty_context(call(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT))
+    assert context == "Endocrinology"
+    for name, doctor in ((("بدريه"), DOC_BADRIA), (("اميره"), DOC_AMIRA)):
+        found = _resolve_single_token_candidate_with_context(name, [DOC_BADRIA, DOC_AMIRA], None, context)
+        assert len(found) == 1
+        assert found[0]["cr301_doctorkey"] == doctor["cr301_doctorkey"]
+
+
+def test_aggregate_reports_requested_2_resolved_2():
+    """Item 12."""
+    result = validate(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert result["candidate_count"] == 2
+    assert result["recommended_doctor_count"] == 2
+    assert sum(1 for d in result["doctors"] if d["doctor_resolved"]) == 2
+
+
+# ── Multi-doctor observability metadata (result_shape/active_doctor_*) ─────
+# See app.agent.nodes.validate_doctor_node / test_doctor_validation_node.py
+# for the corresponding LOG-level fix. These dict-level fields are what the
+# node's print logic (and any other consumer) reads to tell a genuine
+# multi-doctor result apart from a single-doctor one without re-deriving it
+# from "doctors" every time, and to expose an unambiguous "active doctor"
+# identity separate from the legacy, best-effort top-level scalar mirror.
+
+def test_multi_doctor_result_shape_and_counts():
+    result = validate(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert result["result_shape"] == "multi_doctor"
+    assert result["doctor_count"] == 2
+    assert result["resolved_doctor_count"] == 2
+
+
+def test_single_doctor_result_shape():
+    result = validate("Agent: دكتورة بدرية البيروتي استشارية غدد صماء", doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert result["result_shape"] == "single_doctor"
+    assert result["doctor_count"] == 1
+    assert result["resolved_doctor_count"] == 1
+
+
+def test_active_doctor_exposed_separately_and_maps_to_correct_entry():
+    """Item 8 — the conversation narrows to Amira via the later 'من
+    الدكتور بين 9 الى 12 الليل؟' / 'متاح الطبيبه اميره بركات' exchange;
+    active_doctor_input_name/active_doctor_key must expose exactly her
+    per-doctor entry, never Badria's, and never the ambiguous top-level
+    doctor_key mirror (which, with both doctors resolved, falls back to
+    per_doctor[0]=Badria)."""
+    result = validate(_HATEM_AMIRA_BADRIA_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert result["active_doctor_input_name"] == "اميره بركات"
+    assert result["active_doctor_key"] == DOC_AMIRA["cr301_doctorkey"]
+    # The legacy top-level mirror is a SEPARATE, best-effort field and may
+    # legitimately differ -- active_doctor_key is the unambiguous one.
+    by_name = {d["input_name"]: d for d in result["doctors"]}
+    assert result["active_doctor_key"] == by_name["اميره بركات"]["doctor_key"]
+
+
+def test_active_doctor_unset_when_no_turn_unambiguously_narrows():
+    """active_doctor_* must stay unset (never guessed) when no single
+    Agent turn ever narrows the conversation to exactly one recommended
+    doctor by name."""
+    transcript = (
+        "Patient: بدي دكتور الغدد\n"
+        "Agent: متاح الطبيبه بدريه والطبيبه اميره بركات\n"
+    )
+    result = validate(transcript, doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert "active_doctor_input_name" not in result
+    assert "active_doctor_key" not in result
+
+
+def test_result_dict_with_new_metadata_keys_still_serializes():
+    """Item 11 — QAAnalysisResult.doctor_validation is a loose dict[str,
+    Any]; the new metadata keys must never break Pydantic validation/
+    serialization."""
+    from app.models.output import QAAnalysisResult
+
+    result = validate(_ENDOCRINE_RECOMMENDATION_TRANSCRIPT, doctors=[DOC_BADRIA, DOC_AMIRA])
+    parsed = QAAnalysisResult.model_validate({
+        "call_id": "x", "agent_name": "Agent", "overall_assessment": "pass",
+        "assessment_reasoning": "ok", "compliance_flags": [],
+        "agent_performance": {
+            "professionalism_score": 1.0, "Agent Classification": "A",
+        },
+        "escalation_required": False, "escalation_reason": None,
+        "conversation_link": None, "doctor_validation": result,
+    })
+    assert parsed.doctor_validation["result_shape"] == "multi_doctor"
+    assert parsed.doctor_validation["doctor_count"] == 2
+
+
+def test_full_name_and_single_doctor_resolution_remain_stable():
+    """Item 13 — the contextual single-name mechanism is scoped to the
+    multi-doctor recommendation-set path only; an ordinary single-doctor,
+    full-name resolution is completely unaffected."""
+    result = validate("Agent: دكتورة بدرية البيروتي استشارية غدد صماء", doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert result["doctor_resolved"] is True
+    assert result["doctor_key"] == DOC_BADRIA["cr301_doctorkey"]
+
+
+def test_bare_first_name_outside_recommendation_set_still_unresolved():
+    """Item 13 (continued) — 'Do not enable unrestricted first-name
+    matching globally': a bare first name in an ORDINARY single-doctor
+    mention (not a genuine 2+ recommendation set) must still never resolve
+    via fuzzy/partial matching, contextual mechanism or otherwise."""
+    result = validate("Patient: بدي دكتور الغدد\nAgent: دكتورة بدريه موجودة\n", doctors=[DOC_BADRIA, DOC_AMIRA])
+    assert result["doctor_resolved"] is False
+
+
+def test_hatem_still_excluded_and_only_two_candidates_in_full_conversation():
+    """Regression guard against this same fix set: the departed-doctor
+    exclusion from the previous session must still hold in the full
+    conversation."""
+    result = validate(_FULL_HATEM_AMIRA_BADRIA_CONVERSATION, doctors=[DOC_BADRIA, DOC_AMIRA_SENIOR_REGISTRAR])
+    input_names = [d["input_name"] for d in result["doctors"]]
+    assert "حاتم" not in input_names
+    assert len(result["doctors"]) == 2
+
+
+# -- E. Genuine claims elsewhere keep working (no over-correction) ----------
+
+def test_genuine_specialty_and_degree_claims_still_validate_normally():
+    doc = {
+        **DOC_AMIRA_SENIOR_REGISTRAR, "cr301_degreename": "Consultant",
+        "cr301_specialtyname": "Cardiology",
+    }
+    result = validate("Agent: دكتورة اميره بركات استشارية قلب", doctors=[doc])
+    assert result["validated_fields"]["degree"]["outcome"] == "PASS"
+    assert result["validated_fields"]["specialty"]["outcome"] == "PASS"
+
+
+def test_genuine_walkin_fee_claim_still_validates_normally():
+    doc = {**DOC_AMIRA_SENIOR_REGISTRAR, "cr301_walkinconsultationfees": 300}
+    result = validate("Agent: كشفية دكتورة اميره بركات 300 ريال", doctors=[doc])
+    assert result["validated_fields"]["walkin_fee"]["outcome"] == "PASS"
 
 
 # ── Record filtering ─────────────────────────────────────────────────────────

@@ -125,7 +125,7 @@ FROM ConvSummary tc
 INNER JOIN [ROBINDWH.ROBINHQ.COM].[RHQ_Andalusia_Group].[dbo].[MessagesTotal] m
     ON m.ConversationId = tc.UniqueId
 
---where m.ConversationId = UPPER('FA679C1A-1689-F111-B337-000D3AA9D4A7')
+--where m.ConversationId = UPPER('6AAD9CDB-2D96-F111-9B33-000D3AA9D40')
 
 ORDER BY
     tc.Start_DateTime DESC,

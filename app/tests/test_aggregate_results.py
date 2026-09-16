@@ -146,3 +146,140 @@ def test_valid_flag_types_are_unaffected_by_normalization():
     flags = result["parsed_data"]["compliance_flags"]
     assert flags[0]["type"] == "C2Com"
     assert flags[0]["severity"] == "critical"
+
+
+# ── Doctor-validation failure_details/warning_details -> compliance flags
+# (Part: doctor-validation results/logging/persistence/UI presentation) ──
+# warning_details (e.g. name_completeness) must NEVER become a C2B
+# compliance flag, never affect overall_assessment/escalation; genuine
+# failure_details must become a DETAILED C2B flag, not just the old
+# generic "N of M recommended doctor(s) failed validation: names."
+# sentence.
+
+def _warning_only_doctor_validation() -> dict:
+    return {
+        "outcome": "PASS", "reason": "All 1 recommended doctors resolved and passed validation.",
+        "is_violation": False, "result_shape": "multi_doctor",
+        "doctors": [{
+            "input_name": "بدريه", "doctor_resolved": True, "doctor_key": "110411",
+            "doctor_name_ar": "بدرية البيروتي", "doctor_name_en": "Badria Bairuti",
+            "outcome": "PASS", "is_violation": False,
+            "failure_details": [],
+            "warning_details": [{
+                "field": "name_completeness", "label": "Doctor name incomplete",
+                "outcome": "WARNING", "is_violation": False,
+                "chat_value": "بدريه", "crm_value": "بدرية البيروتي",
+                "reason": "The agent stated only the doctor's first name. The preferred practice is to provide at least the first and second name.",
+                "transcript_excerpt": "متاح الطبيبه بدريه",
+            }],
+        }],
+    }
+
+
+def test_warning_only_doctor_validation_retains_pass_assessment():
+    """Item 13."""
+    state = {
+        "call": call(),
+        "doctor_validation": _warning_only_doctor_validation(),
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    assert "error" not in result
+    assert result["parsed_data"]["overall_assessment"] == "pass"
+
+
+def test_warning_only_doctor_validation_creates_no_c2b_flag():
+    """Item 14 — the warning must appear on the separate doctor_warnings
+    surface, never in compliance_flags as a C2B (or any other) flag."""
+    state = {
+        "call": call(),
+        "doctor_validation": _warning_only_doctor_validation(),
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    flags = result["parsed_data"]["compliance_flags"]
+    assert not any(f["type"] == "C2B" for f in flags)
+    warnings = result["parsed_data"]["doctor_warnings"]
+    assert len(warnings) == 1
+    assert warnings[0]["type"] != "C2B"
+    assert "بدرية البيروتي" in warnings[0]["description"]
+
+
+def test_warning_card_contains_no_escalation_action():
+    """Item 15 — a non-punitive warning must never set escalation_
+    required/reason, and its own card carries no escalation action."""
+    state = {
+        "call": call(),
+        "doctor_validation": _warning_only_doctor_validation(),
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    assert result["parsed_data"]["escalation_required"] is False
+    warning = result["parsed_data"]["doctor_warnings"][0]
+    assert "action" not in warning
+    assert "escalate" not in warning.get("description", "").lower()
+
+
+def test_genuine_doctor_failure_produces_detailed_c2b_flag():
+    """A real field-level failure must produce a DETAILED C2B flag built
+    from failure_details (Agent-stated value, CRM value, reason, and
+    local transcript evidence) — not just the old generic sentence as the
+    only explanation."""
+    doctor_validation = {
+        "outcome": "FAIL", "reason": "1 of 1 recommended doctor(s) failed validation: اميره بركات.",
+        "is_violation": True, "result_shape": "multi_doctor",
+        "doctors": [{
+            "input_name": "اميره بركات", "doctor_resolved": True, "doctor_key": "11011216",
+            "doctor_name_ar": "أميرة بركات", "doctor_name_en": "Amira Barakat",
+            "outcome": "FAIL", "is_violation": True,
+            "failure_details": [{
+                "field": "degree", "label": "Degree/title mismatch",
+                "chat_value": "اخصاييه", "crm_value": "Senior Registrar",
+                "reason": "The professional degree stated by the agent does not match the authoritative CRM record.",
+                "transcript_excerpt": "Patient: استشاري؟\nAgent: اخصاييه",
+            }],
+            "warning_details": [],
+        }],
+    }
+    state = {
+        "call": call(),
+        "doctor_validation": doctor_validation,
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    flags = result["parsed_data"]["compliance_flags"]
+    c2b = [f for f in flags if f["type"] == "C2B"]
+    assert len(c2b) == 1
+    assert "أميرة بركات" in c2b[0]["description"]
+    assert "اخصاييه" in c2b[0]["description"]
+    assert "Senior Registrar" in c2b[0]["description"]
+    assert not result["parsed_data"]["doctor_warnings"]
+
+
+def test_doctor_validation_persists_failure_and_warning_details():
+    """Item 23 — the saved/serialized doctor_validation dict must retain
+    both failure_details and warning_details on every per-doctor entry
+    (loosely typed as Optional[dict[str, Any]] on QAAnalysisResult, so
+    any additive key is carried through unchanged)."""
+    doctor_validation = {
+        "outcome": "FAIL", "reason": "reason", "is_violation": True,
+        "doctors": [{
+            "input_name": "اميره بركات", "outcome": "FAIL",
+            "failure_details": [{"field": "degree"}],
+            "warning_details": [],
+        }],
+    }
+    state = {
+        "call": call(),
+        "doctor_validation": doctor_validation,
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    persisted = result["parsed_data"]["doctor_validation"]
+    assert persisted["doctors"][0]["failure_details"] == [{"field": "degree"}]
+    assert persisted["doctors"][0]["warning_details"] == []
