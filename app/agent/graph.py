@@ -8,86 +8,89 @@ Graph topology (happy path):
     ▼
   load_call ──(error)──────────────────────────────────────────────────────┐
     │                                                                       │
-    │  fan-out: 5 parallel criteria loaders                                 │
+    │  fan-out: 6 parallel criteria loaders                                 │
     ├──→ load_behavioral_criteria ──┐                                       │
     ├──→ load_compliance_pillars  ──┤                                       │
-    ├──→ load_script_templates    ──┤ fan-in                                │
+    ├──→ load_script_templates    ──┤ fan-in → criteria_ready               │
     ├──→ load_reservation_pillars ──┤                                       │
+    ├──→ load_offer_pillars       ──┤                                       │
     └──→ load_scoring_weights     ──┘                                       │
                                    │                                        │
-                            criteria_ready  (barrier / no-op)               │
+                            criteria_ready (barrier)                        │
                                    │                                        │
-    └──→ detect_intent                                                        │
-              │                                                               │
-              │  bank-intent router (conditional edge, reuses                │
-              │  bank_validation_needed — the SAME gate the node itself      │
-              │  uses, not a duplicate check):                               │
-              ├──(intent present)────→ validate_bank_information ──┐         │
-              ├──(no intent)──────────→ skip_bank_validation ───────┤        │
-              │                        (no CRM fetch, no BU          │       │
-              │                         resolution, no node_trace)   │       │
-              │                                                      │       │
-              │  location-intent router (independent conditional edge,       │
-              │  same pattern, reuses location_validation_needed):           │
-              ├──(intent present)────→ validate_location ────────────┤ fan-in│
-              └──(no intent)──────────→ skip_location_validation ────┤       │
-                                        (no CRM fetch, no             │       │
-                                         node_trace entry)            │       │
-                                                                       │       │
-                                                       loc_bank_ready (barrier)│
-                                               │                               │
-              ├──(booking)──→ extract_appointment_details                     │
-              │                        │                                      │
-              │               verify_appointment_in_db                       │
-              │                        │                                      │
-              │               infer_reservation_evaluation ──(error)─────────┤
-              │                        │                                      │
-              └──(skip_booking)────────┘                                      │
-                               │  (both paths converge here)                  │
-                               ▼                                              │
-                        inference_gate  (barrier — single fan-out point)      │
-                               │                                              │
-                     fetch_crm_offers_for_call                                │
-              (shared 1-hop pass-through — see below)                        │
-                               │                                              │
-    fan-out: 6 parallel branches, ALL exactly one hop past the fetch —        │
-    this equal hop-count is required so inference_ready's fan-in merges      │
-    all six arrivals into ONE superstep (see Step 3 comment in code: a       │
-    mismatched hop-count here previously fired inference_ready — and every-  │
-    thing downstream of it — TWICE per call). The doctor-scope and coe      │
-    branches are each conditional (_doctor_scope_intent_router /            │
-    _coe_intent_router): EITHER infer_doctor_scope_validation OR            │
-    skip_doctor_scope_validation runs (never both), and EITHER              │
-    infer_coe_validation OR skip_coe_validation runs (never both) — so      │
-    each pair still contributes exactly ONE of the six arrivals.            │
-    ├──→ infer_behavioral_evaluation ──(error)──────────────────────────┐    │
-    ├──→ infer_compliance_evaluation ──(error)──────────────────────────┤    │
-    ├──→ infer_script_matching       ──(error)──────────────────────────┤    │
-    ├──→ infer_offer_evaluation      ──(error)──────────────────────────┤    │
-    ├──(doctor resolved + clinical need)→ infer_doctor_scope_validation ┤    │
-    │  (else)──────────────────────────→ skip_doctor_scope_validation  ┤    │
-    └──(COE trigger detected)───────────→ infer_coe_validation         ┤    │
-       (else)──────────────────────────→ skip_coe_validation           ┤    │
-                                                    │ fan-in (6 edges)  │    │
-                                                    ▼                   │    │
-                                            inference_ready             │    │
-                                     (barrier — waits for exactly 6)    │    │
-                                                    │                   │    │
-                                                    ▼                   │    │
-                  infer_overall_scoring ──(error)───────────────────────┘    │
-                               │                                         │  │
-                               ▼                                         │  │
-                      aggregate_results ──(error)────────────────────────┤  │
-                               │                                         │  │
-                               ▼                                         │  │
-                      integrity_check                                    │  │
-                               │                                         │  │
-                               ▼                                         │  │
-                            finalize                          ┌───────────┘  │
-                               │                             │               │
-                              END ◄─── handle_error ◄────────┘               │
-                                            ▲                                │
-                                            └────────────────────────────────┘
+                             detect_intent                                   │
+                                   │                                        │
+    ┌──────────────────────────────┼──────────────────────────┐            │
+    │ (bank intent router)         │ (location intent router)  │            │
+    ▼                              │                           ▼            │
+validate_bank_information          │           validate_location            │
+  OR skip_bank_validation          │           OR skip_location_validation  │
+    │                              │                           │            │
+    └──────────────────────────────┼───────────────────────────┘            │
+                                   │  fan-in (exactly 2 arrivals)           │
+                             loc_bank_ready (barrier)                       │
+                                   │                                        │
+                      detect_insurance_intent                               │
+                                   │                                        │
+       ┌───────────────────────────┤                                        │
+       │(insurance)                │(continue)                              │
+       ▼                           ▼                                        │
+check_patient_eligibility  route_booking_intent                             │
+       │                           │                                        │
+       │ (eligible)                │ _doctor_intent_router                  │
+       └──────────────────────────►│                                        │
+                (not_eligible)     ├──(validate_doctor)──→ validate_doctor  │
+                     │             │  (skip_doctor)──────→ skip_doctor_val. │
+                     │             │              │                         │
+                     │             │        booking_ready (barrier,         │
+                     │             │        exactly 1 arrival)              │
+                     │             │              │                         │
+                     │             │  _booking_router                       │
+                     │             ├──(booking/offer_only)──────────────────┼──────────────────┐
+                     │             │  (skip_booking)────→ inference_gate    │                  │
+                     │             │                                        │                  ▼
+                     └────────────►│                              extract_appointment_details  │
+                    (ineligible)   │                                        │                  │
+                    also goes      │                              ┌─────────┴─────────┐        │
+                    here ──────────►                              │                   │        │
+                                                         (booking)│           (offer) │        │
+                                                                  ▼                   ▼        │
+                                                    verify_appointment_in_db  offer_done       │
+                                                                  │                   │        │
+                                                    infer_reservation_eval     inference_gate  │
+                                                                  │                            │
+                                                    enforce_ineligible_viol                    │
+                                                                  │                            │
+                                                            inference_gate ◄───────────────────┘
+                                                                  │
+                    ┌─────────────────────────────────────────────┼────────────────────────────────────┐
+                    │                    fetch_crm_offers_for_call │                                    │
+                    │                 ┌──────────┬────────────┬────┴────┬───────────┬────────────┐     │
+                    │                 │          │            │         │           │            │     │
+                    │           infer_beh  infer_comp  infer_script infer_offer doc_scope  infer_coe   │
+                    │                 │          │            │         │           │            │     │
+                    │           beh_done  comp_done   script_done off_done  doc_scope_done coe_done    │
+                    │                                                                                  │
+                    │   fetch_crm_services → infer_service → service_done                             │
+                    │   fetch_crm_packages → infer_package → package_done                             │
+                    │                                                                                  │
+                    └──────────────────────────────── inference_ready (barrier, 9 arrivals) ──────────┘
+                                                                  │
+                                                         validate_crm_lead
+                                                                  │
+                                                      detect_faq_escalation
+                                                                  │
+                                                       infer_overall_scoring
+                                                                  │
+                                                         aggregate_results
+                                                                  │
+                                                          integrity_check
+                                                                  │
+                                                          save_to_database
+                                                                  │
+                                                              finalize
+                                                                  │
+                     handle_error ◄──── (any error edge) ───     END
 ─────────────────────────────────────────────────────────────────────────────
 
 Topology details
@@ -133,12 +136,20 @@ Adding a new focused inference node:
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
-from typing import Literal
+from datetime import datetime, timezone
+from typing import Any, Callable, Literal
 
 from langgraph.graph import StateGraph, START, END
 
 from app.agent.state import AgentState
+from app.agent.telemetry import (
+    build_jsonl_logger,
+    record_node_execution,
+    write_jsonl,
+)
+from app.config import settings
 from app.agent.nodes import (
     load_call,
     load_behavioral_criteria,
@@ -200,6 +211,66 @@ from app.service_hub.coe_validation import classify_coe_trigger
 from app.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
+
+
+def _with_node_output_logging(
+    node_name: str,
+    action: Callable[[AgentState], Any],
+    output_logger: logging.Logger,
+) -> Callable[[AgentState], Any]:
+    """Wrap a graph node and record its returned state update or exception."""
+    async def logged_node(state: AgentState) -> Any:
+        record_node_execution(node_name)
+        call = state.get("call") if isinstance(state, dict) else None
+        call_id = getattr(call, "call_id", "UNKNOWN")
+        timestamp_utc = datetime.now(timezone.utc).isoformat()
+        try:
+            output = action(state)
+            if inspect.isawaitable(output):
+                output = await output
+        except Exception as exc:
+            write_jsonl(
+                output_logger,
+                {
+                    "timestamp_utc": timestamp_utc,
+                    "call_id": call_id,
+                    "node": node_name,
+                    "status": "error",
+                    "output": None,
+                    "error": str(exc),
+                },
+            )
+            raise
+
+        write_jsonl(
+            output_logger,
+            {
+                "timestamp_utc": timestamp_utc,
+                "call_id": call_id,
+                "node": node_name,
+                "status": "success",
+                "output": output,
+                "error": None,
+            },
+        )
+        return output
+
+    return logged_node
+
+
+class _NodeOutputLoggingGraph:
+    """StateGraph proxy that instruments every registered node."""
+
+    def __init__(self, graph: StateGraph, output_logger: logging.Logger) -> None:
+        self._graph = graph
+        self._output_logger = output_logger
+
+    def add_node(self, name: str, action: Callable, *args: Any, **kwargs: Any) -> Any:
+        wrapped = _with_node_output_logging(name, action, self._output_logger)
+        return self._graph.add_node(name, wrapped, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._graph, name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,23 +484,112 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
 
     LLMClient is injected via functools.partial so the graph is provider-agnostic
     and can be rebuilt with a different provider at any time.
+
+    Loop-free invariants enforced by this wiring
+    ─────────────────────────────────────────────
+    1. Every barrier node has a FIXED, KNOWN number of predecessors.
+       LangGraph fires a barrier exactly once — when ALL predecessors have
+       delivered exactly one arrival in the same superstep.
+
+    2. loc_bank_ready has exactly 2 predecessors:
+         bank branch  (validate_bank_information OR skip_bank_validation)
+         location branch (validate_location OR skip_location_validation)
+       Doctor validation runs AFTER loc_bank_ready in a dedicated
+       booking_ready barrier so it never inflates loc_bank_ready's count.
+
+    3. booking_ready has exactly 2 predecessors:
+         doctor branch (validate_doctor OR skip_doctor_validation)
+         eligibility/ineligible merge (route_booking_intent via booking_merge)
+       booking_ready is the SINGLE entry into the booking router.
+
+    4. inference_gate has exactly ONE predecessor per call path:
+         booking path:    enforce_ineligible_reservation_violation
+         offer-only path: offer_extraction_done
+         skip path:       booking_ready (skip_booking edge)
+       These are mutually exclusive per call — exactly one fires.
+
+    5. inference_ready has exactly 9 fixed predecessors — one *_done
+       barrier per parallel branch:
+         behavioral_done, compliance_done, script_done,
+         offer_done, service_done, package_done,
+         doctor_scope_done, coe_done, (none for services/packages — see below)
+       doctor_scope and coe each contribute exactly ONE arrival via their
+       own done-barrier (EITHER the infer_* path OR the skip_* path).
+
+    6. handle_ineligible_patient feeds into booking_merge (not directly
+       into extract_appointment_details), so it never bypasses booking_ready
+       and cannot create a second path into inference_gate.
     """
-    builder = StateGraph(AgentState)
+    output_logger, _output_log_path = build_jsonl_logger(
+        "node_output", settings.NODE_OUTPUT_LOG_PATH
+    )
+    builder = _NodeOutputLoggingGraph(
+        StateGraph(AgentState), output_logger
+    )
 
-    # ── Register nodes ────────────────────────────────────────────────────
-
-    # Stage 1: entry + validation
+    # ── Stage 1: entry ────────────────────────────────────────────────────
     builder.add_node("load_call", load_call)
 
-    # Stage 2: criteria loaders (run in parallel after load_call)
+    # ── Stage 2: criteria loaders (6 parallel) ───────────────────────────
     builder.add_node("load_behavioral_criteria", load_behavioral_criteria)
     builder.add_node("load_compliance_pillars",  load_compliance_pillars)
     builder.add_node("load_reservation_pillars", load_reservation_pillars)
     builder.add_node("load_offer_pillars",       load_offer_pillars)
     builder.add_node("load_script_templates",    load_script_templates)
     builder.add_node("load_scoring_weights",     load_scoring_weights)
+    # Barrier: fires once all 6 loaders complete (6 predecessors).
+    builder.add_node("criteria_ready", lambda state: {})
 
-    # Stage 3: focused LLM inference nodes (run in parallel after all loaders)
+    # ── Stage 3: intent detection + parallel bank/location validation ─────
+    builder.add_node("detect_intent", detect_intent)
+    builder.add_node("validate_bank_information", validate_bank_information_node)
+    builder.add_node("skip_bank_validation",      skip_bank_validation)
+    builder.add_node("validate_location",         validate_location_node)
+    builder.add_node("skip_location_validation",  skip_location_validation)
+    # Barrier: fires once bank branch AND location branch both complete (2 predecessors).
+    builder.add_node("loc_bank_ready", lambda state: {})
+
+    # ── Stage 4: insurance / eligibility → doctor validation ─────────────
+    builder.add_node("detect_insurance_intent", detect_insurance_intent)
+    builder.add_node("check_patient_eligibility", check_patient_eligibility)
+    builder.add_node("handle_ineligible_patient", handle_ineligible_patient)
+    # no-op barrier that merges the insurance→eligible path and the
+    # no-insurance path into a single token before doctor routing.
+    # Also receives handle_ineligible_patient so ineligible calls still
+    # reach doctor validation (to catch an improper reservation) without
+    # bypassing booking_ready.
+    builder.add_node("booking_merge", lambda state: {})
+    builder.add_node(
+        "validate_doctor",
+        functools.partial(validate_doctor_node, llm_client=llm_client),
+    )
+    builder.add_node("skip_doctor_validation", skip_doctor_validation)
+    # Barrier: fires once doctor branch completes (1 predecessor).
+    # Single entry point into the booking router — prevents any second
+    # path from re-triggering extract_appointment_details.
+    builder.add_node("booking_ready", lambda state: {})
+
+    # ── Stage 5: booking branch ───────────────────────────────────────────
+    builder.add_node(
+        "extract_appointment_details",
+        functools.partial(extract_appointment_details, llm_client=llm_client),
+    )
+    builder.add_node("verify_appointment_in_db",   verify_appointment_in_db)
+    builder.add_node(
+        "infer_reservation_evaluation",
+        functools.partial(infer_reservation_evaluation, llm_client=llm_client),
+    )
+    builder.add_node("enforce_ineligible_reservation_violation", enforce_ineligible_reservation_violation)
+    # no-op barrier: offer-only path joins here before inference_gate.
+    builder.add_node("offer_extraction_done", lambda state: {})
+    # Single fan-out point for all parallel inference branches.
+    builder.add_node("inference_gate", lambda state: {})
+
+    # ── Stage 6: CRM data fetches + parallel inference ────────────────────
+    builder.add_node("fetch_crm_offers_for_call",  fetch_crm_offers_for_call)
+    builder.add_node("fetch_crm_services_for_call", fetch_crm_services_for_call)
+    builder.add_node("fetch_crm_packages_for_call", fetch_crm_packages_for_call)
+
     builder.add_node(
         "infer_behavioral_evaluation",
         functools.partial(infer_behavioral_evaluation, llm_client=llm_client),
@@ -443,13 +603,6 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         functools.partial(infer_script_matching, llm_client=llm_client),
     )
     builder.add_node(
-        "infer_reservation_evaluation",
-        functools.partial(infer_reservation_evaluation, llm_client=llm_client),
-    )
-    builder.add_node("fetch_crm_offers_for_call",   fetch_crm_offers_for_call)
-    builder.add_node("fetch_crm_services_for_call",  fetch_crm_services_for_call)
-    builder.add_node("fetch_crm_packages_for_call",  fetch_crm_packages_for_call)
-    builder.add_node(
         "infer_offer_evaluation",
         functools.partial(infer_offer_evaluation, llm_client=llm_client),
     )
@@ -457,6 +610,39 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         "infer_service_evaluation",
         functools.partial(infer_service_evaluation, llm_client=llm_client),
     )
+    builder.add_node(
+        "infer_package_evaluation",
+        functools.partial(infer_package_evaluation, llm_client=llm_client),
+    )
+    builder.add_node(
+        "infer_doctor_scope_validation",
+        functools.partial(infer_doctor_scope_validation, llm_client=llm_client),
+    )
+    builder.add_node("skip_doctor_scope_validation", skip_doctor_scope_validation)
+    builder.add_node(
+        "infer_coe_validation",
+        functools.partial(infer_coe_validation, llm_client=llm_client),
+    )
+    builder.add_node("skip_coe_validation", skip_coe_validation)
+
+    # Per-branch done-barriers — each has exactly 1 predecessor so
+    # inference_ready always receives exactly 9 arrivals per call.
+    builder.add_node("behavioral_done",   lambda state: {})
+    builder.add_node("compliance_done",   lambda state: {})
+    builder.add_node("script_done",       lambda state: {})
+    builder.add_node("offer_done",        lambda state: {})
+    builder.add_node("service_done",      lambda state: {})
+    builder.add_node("package_done",      lambda state: {})
+    builder.add_node("doctor_scope_done", lambda state: {})
+    builder.add_node("coe_done",          lambda state: {})
+
+    # Barrier: fires once all 9 *_done nodes deliver (9 predecessors).
+    # Note: services and packages use their own fetch→infer→done chain
+    # rather than routing through fetch_crm_offers_for_call, so they
+    # are independent parallel branches at equal hop depth.
+    builder.add_node("inference_ready", lambda state: {})
+
+    # ── Stage 7: post-inference sequential chain ──────────────────────────
     builder.add_node(
         "validate_crm_lead",
         functools.partial(validate_crm_lead, llm_client=llm_client),
@@ -467,124 +653,24 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
         functools.partial(validate_faq_record, llm_client=llm_client),
     )
     builder.add_node(
-        "infer_package_evaluation",
-        functools.partial(infer_package_evaluation, llm_client=llm_client),
-    )
-    # Semantic doctor-recommendation-suitability check — separate from the
-    # deterministic validate_doctor node above (which already ran and wrote
-    # state["doctor_validation"] before the booking split). Applicability
-    # (doctor resolved + scope evidence + patient complaint) is decided at
-    # the GRAPH level by _doctor_scope_intent_router below — when it's not
-    # applicable, this node never executes at all (see
-    # skip_doctor_scope_validation). Its own internal gate remains as a
-    # defensive fallback only, mirroring validate_doctor_node.
-    builder.add_node(
-        "infer_doctor_scope_validation",
-        functools.partial(infer_doctor_scope_validation, llm_client=llm_client),
-    )
-    builder.add_node("skip_doctor_scope_validation", skip_doctor_scope_validation)
-
-    # COE (Center of Excellence) validation. Trigger detection is fully
-    # deterministic (app.service_hub.coe_validation.classify_coe_trigger)
-    # and decided at the GRAPH level by _coe_intent_router below — when no
-    # COE/specialized-center trigger exists, this node never executes at
-    # all (see skip_coe_validation). Its own internal gate remains as a
-    # defensive fallback only, mirroring validate_doctor_node /
-    # infer_doctor_scope_validation.
-    builder.add_node(
-        "infer_coe_validation",
-        functools.partial(infer_coe_validation, llm_client=llm_client),
-    )
-    builder.add_node("skip_coe_validation", skip_coe_validation)
-
-    # Stage 4: scoring synthesis (fan-in barrier — waits for all 3 focused nodes)
-    builder.add_node(
         "infer_overall_scoring",
         functools.partial(infer_overall_scoring, llm_client=llm_client),
     )
-
-    # Barrier node 1 — fan-in for all criteria loaders, fan-out to inference.
-    builder.add_node("criteria_ready", lambda state: {})
-
-    # Barrier node 1b — fan-in that waits for the booking/skip branch to
-    # fully complete before the three parallel LLM calls start.  This is the
-    # SINGLE entry point into behavioral + compliance + script_matching, preventing any second
-    # trigger from arriving via a different path.
-    builder.add_node("inference_gate", lambda state: {})
-
-    # Barrier node 2 — fan-in that waits for:
-    #   • infer_behavioral_evaluation     (direct from inference_gate)
-    #   • infer_compliance_evaluation     (direct from inference_gate)
-    #   • infer_offer_evaluation          (via fetch_crm_offers_for_call)
-    #   • infer_service_evaluation        (via fetch_crm_services_for_call)
-    #   • infer_package_evaluation        (via fetch_crm_packages_for_call)
-    #   • infer_script_matching           (direct from inference_gate)
-    # Exactly 6 unconditional predecessors.
-    builder.add_node("inference_ready", lambda state: {})
-    builder.add_node("behavioral_done", lambda state: {})
-    builder.add_node("compliance_done", lambda state: {})
-    builder.add_node("offer_done", lambda state: {})
-    builder.add_node("service_done", lambda state: {})
-    builder.add_node("package_done", lambda state: {})
-    builder.add_node("script_done", lambda state: {})
-
-
-    # Stage 5: aggregate + validate merged result
     builder.add_node("aggregate_results", aggregate_results)
+    builder.add_node("integrity_check",   integrity_check)
+    builder.add_node("save_to_database",  save_to_database)
+    builder.add_node("finalize",          finalize)
+    builder.add_node("handle_error",      handle_error)
 
-    # Stage 6: post-processing chain
-    builder.add_node("integrity_check", integrity_check)
-    builder.add_node("save_to_database", save_to_database)
-    builder.add_node("finalize", finalize)
+    # ════════════════════════════════════════════════════════════════════
+    # EDGES
+    # ════════════════════════════════════════════════════════════════════
 
-    # Error sink
-    builder.add_node("handle_error", handle_error)
-
-    # ── Booking intent sub-flow (inserted after infer_behavioral_evaluation) ──
-    builder.add_node("detect_intent", detect_intent)
-    builder.add_node("detect_insurance_intent", detect_insurance_intent)
-    builder.add_node("route_booking_intent", lambda state: {})
-    builder.add_node(
-        "extract_appointment_details",
-        functools.partial(extract_appointment_details, llm_client=llm_client),
-    )
-    builder.add_node("verify_appointment_in_db", verify_appointment_in_db)
-    builder.add_node("enforce_ineligible_reservation_violation", enforce_ineligible_reservation_violation)
-    builder.add_node("check_patient_eligibility", check_patient_eligibility)
-    builder.add_node("handle_ineligible_patient", handle_ineligible_patient)
-    # Two fully independent deterministic nodes — each cheaply gates on its
-    # own Arabic detection before reading CRM data, and each runs in
-    # parallel with the other (neither depends on the other's result).
-    builder.add_node("validate_bank_information", validate_bank_information_node)
-    builder.add_node("validate_location", validate_location_node)
-    builder.add_node(
-        "validate_doctor",
-        functools.partial(validate_doctor_node, llm_client=llm_client),
-    )
-    # Graph-level skip paths for validate_bank_information / validate_location
-    # / validate_doctor — see _bank_intent_router / _location_intent_router /
-    # _doctor_intent_router below. Deliberately do not add to node_trace:
-    # each is a routing decision, not a validation step.
-    builder.add_node("skip_bank_validation", skip_bank_validation)
-    builder.add_node("skip_location_validation", skip_location_validation)
-    builder.add_node("skip_doctor_validation", skip_doctor_validation)
-    # Barrier — fan-in for EITHER validate_bank_information or its skip path,
-    # EITHER validate_location or its skip path, AND EITHER validate_doctor
-    # or its skip path, fan-out to the booking router. None of the three is
-    # on the booking-detection critical path individually; the router just
-    # needs all three branches to have finished, independently of each
-    # other (any combination of the three must be supported).
-    builder.add_node("loc_bank_ready", lambda state: {})
-
-    # ── Edges ─────────────────────────────────────────────────────────────
-
-    # Entry
     builder.add_edge(START, "load_call")
 
-    # load_call → error check (conditional) then fan-out to all 6 criteria loaders.
+    # ── load_call → fan-out to 6 criteria loaders ─────────────────────────
     builder.add_conditional_edges(
-        "load_call",
-        _error_router,
+        "load_call", _error_router,
         {"continue": "load_behavioral_criteria", "handle_error": "handle_error"},
     )
     builder.add_edge("load_call", "load_compliance_pillars")
@@ -593,11 +679,7 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_edge("load_call", "load_offer_pillars")
     builder.add_edge("load_call", "load_scoring_weights")
 
-    # ── All 6 loaders fan-in to the barrier node ──────────────────────────
-    #
-    # criteria_ready is a no-op that LangGraph uses as a synchronisation
-    # point: it fires only after every loader has written its state key.
-    # From there we fan-out to the inference nodes + detect_intent.
+    # ── 6 loaders → criteria_ready (6 predecessors) ──────────────────────
     builder.add_edge("load_behavioral_criteria", "criteria_ready")
     builder.add_edge("load_compliance_pillars",  "criteria_ready")
     builder.add_edge("load_script_templates",    "criteria_ready")
@@ -605,244 +687,189 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_edge("load_offer_pillars",       "criteria_ready")
     builder.add_edge("load_scoring_weights",     "criteria_ready")
 
-    # ── Step 1: detect_intent runs first (sequential, after all loaders) ──
-    #
-    # detect_intent is the first thing that fires after criteria_ready.
-    # Its result (is_booking_intent) determines which branch runs next.
+    # ── criteria_ready → detect_intent → parallel bank + location ────────
     builder.add_edge("criteria_ready", "detect_intent")
 
-    # ── Step 2: independent insurance intent, then booking routing ────────
-    #
-    # Identity/IQAMA requests are insurance intent unless the patient explicitly
-    # selected cash or stated they are uninsured. The detector always runs; a
-    # successful check returns to the unchanged booking router.
-    builder.add_edge("detect_intent", "detect_insurance_intent")
     builder.add_conditional_edges(
-        "detect_insurance_intent",
-        _insurance_router,
-        {
-            "insurance": "check_patient_eligibility",
-            "continue":  "route_booking_intent",
-        },
+        "detect_intent", _bank_intent_router,
+        {"validate_bank_information": "validate_bank_information",
+         "skip_bank": "skip_bank_validation"},
     )
     builder.add_conditional_edges(
-        "check_patient_eligibility",
-        _eligibility_router,
-        {
-            "eligible":     "route_booking_intent",
-            "not_eligible": "handle_ineligible_patient",
-            "error":        "handle_error",
-        },
-    )
-    # Route through bank + location + doctor validation (parallel) before
-    # the booking split. All three states survive every branch combination
-    # and are included in final scoring and aggregation.
-    builder.add_conditional_edges(
-        "detect_intent",
-        _bank_intent_router,
-        {"validate_bank_information": "validate_bank_information", "skip_bank": "skip_bank_validation"},
-    )
-    builder.add_conditional_edges(
-        "detect_intent",
-        _location_intent_router,
-        {"validate_location": "validate_location", "skip_location": "skip_location_validation"},
-    )
-    builder.add_conditional_edges(
-        "route_booking_intent",
-        _doctor_intent_router,
-        {"validate_doctor": "validate_doctor", "skip_doctor": "skip_doctor_validation"},
-    )
-    builder.add_edge("validate_bank_information", "loc_bank_ready")
-    builder.add_edge("skip_bank_validation", "loc_bank_ready")
-    builder.add_edge("validate_location", "loc_bank_ready")
-    builder.add_edge("skip_location_validation", "loc_bank_ready")
-    builder.add_edge("validate_doctor", "loc_bank_ready")
-    builder.add_edge("skip_doctor_validation", "loc_bank_ready")
-    builder.add_conditional_edges(
-        "loc_bank_ready",
-        _booking_router,
-        {
-            "booking":      "extract_appointment_details",
-            "offer_only":   "extract_appointment_details",
-            "skip_booking": "inference_gate",
-        },
+        "detect_intent", _location_intent_router,
+        {"validate_location": "validate_location",
+         "skip_location": "skip_location_validation"},
     )
 
-    # Ineligible bookings are still extracted and verified to catch an improper reservation.
-    builder.add_edge("handle_ineligible_patient", "extract_appointment_details")
-    # Booking path: extract → verify DB → infer_reservation → inference_gate
-    # Offer-only path: extract → inference_gate (skips DB + reservation eval)
-    builder.add_node("offer_extraction_done", lambda state: {})  # no-op barrier
+    # ── bank + location branches → loc_bank_ready (2 predecessors) ───────
+    builder.add_edge("validate_bank_information", "loc_bank_ready")
+    builder.add_edge("skip_bank_validation",      "loc_bank_ready")
+    builder.add_edge("validate_location",         "loc_bank_ready")
+    builder.add_edge("skip_location_validation",  "loc_bank_ready")
+
+    # ── loc_bank_ready → detect_insurance_intent (sequential) ────────────
+    builder.add_edge("loc_bank_ready", "detect_insurance_intent")
+
+    builder.add_conditional_edges(
+        "detect_insurance_intent", _insurance_router,
+        {"insurance": "check_patient_eligibility",
+         "continue":  "booking_merge"},
+    )
+    builder.add_conditional_edges(
+        "check_patient_eligibility", _eligibility_router,
+        {"eligible":     "booking_merge",
+         "not_eligible": "handle_ineligible_patient",
+         "error":        "handle_error"},
+    )
+    # Ineligible patients still go through booking_merge → doctor validation
+    # → booking_ready so the booking router sees them exactly once.
+    builder.add_edge("handle_ineligible_patient", "booking_merge")
+
+    # ── booking_merge → doctor validation → booking_ready ────────────────
+    builder.add_conditional_edges(
+        "booking_merge", _doctor_intent_router,
+        {"validate_doctor": "validate_doctor",
+         "skip_doctor":     "skip_doctor_validation"},
+    )
+    builder.add_edge("validate_doctor",       "booking_ready")
+    builder.add_edge("skip_doctor_validation","booking_ready")
+
+    # ── booking_ready → booking router (single entry point) ──────────────
+    builder.add_conditional_edges(
+        "booking_ready", _booking_router,
+        {"booking":      "extract_appointment_details",
+         "offer_only":   "extract_appointment_details",
+         "skip_booking": "inference_gate"},
+    )
+
+    # ── extract_appointment_details → booking or offer-only fork ─────────
     builder.add_conditional_edges(
         "extract_appointment_details",
         lambda s: "booking" if s.get("is_booking_intent") else "offer_only",
-        {
-            "booking":    "verify_appointment_in_db",
-            "offer_only": "offer_extraction_done",
-        },
+        {"booking":    "verify_appointment_in_db",
+         "offer_only": "offer_extraction_done"},
     )
-    builder.add_edge("offer_extraction_done",       "inference_gate")
-    builder.add_edge("verify_appointment_in_db",    "infer_reservation_evaluation")
+
+    # Offer-only path: skip DB + reservation eval.
+    builder.add_edge("offer_extraction_done", "inference_gate")
+
+    # Booking path: DB verify → reservation eval → ineligibility enforcement.
+    builder.add_edge("verify_appointment_in_db", "infer_reservation_evaluation")
     builder.add_conditional_edges(
-        "infer_reservation_evaluation",
-        _error_router,
-        {"continue": "enforce_ineligible_reservation_violation", "handle_error": "handle_error"},
+        "infer_reservation_evaluation", _error_router,
+        {"continue": "enforce_ineligible_reservation_violation",
+         "handle_error": "handle_error"},
     )
     builder.add_edge("enforce_ineligible_reservation_violation", "inference_gate")
 
-    # ── Step 3: inference_gate fan-out ────────────────────────────────────
+    # ── inference_gate → 3 independent fetch → infer chains (parallel) ───
     #
-    # behavioral/compliance/script_matching/offer are all exactly TWO hops
-    # from inference_gate, via fetch_crm_offers_for_call as a shared (fast,
-    # never-erroring) pass-through — not direct edges for some plus a
-    # two-hop path for others. That asymmetry used to be the root cause of
-    # inference_ready (and everything downstream of it) firing TWICE per
-    # call: LangGraph's fan-in only merges arrivals that land in the SAME
-    # superstep, so when some branches reached inference_ready a superstep
-    # earlier than one that took the extra fetch_crm_offers_for_call hop,
-    # the barrier fired once for the fast ones and again when the last
-    # branch caught up — replaying infer_overall_scoring →
-    # aggregate_results → integrity_check → save_to_database → finalize a
-    # second time. Routing every branch through fetch_crm_offers_for_call
-    # equalises the hop count so all arrive in the same superstep and the
-    # barrier fires exactly once.
+    # Each chain is fetch → infer → *_done → inference_ready.
+    # All chains are equal-depth so inference_ready fires exactly once
+    # when all 9 *_done nodes have delivered in the same superstep.
     #
-    # The doctor-scope AND coe branches are each a CONDITIONAL edge
-    # (_doctor_scope_intent_router / _coe_intent_router) rather than a
-    # direct one: each goes to EITHER its infer_* node OR its skip_* node,
-    # both exactly one hop past fetch_crm_offers_for_call — i.e. still the
-    # same two-hop depth from inference_gate as the other four branches, so
-    # the equal-hop-count invariant above is preserved (this is the exact
-    # same either/or-same-depth pattern already used for
-    # validate_bank_information/skip_bank_validation etc. converging on
-    # loc_bank_ready). Only ONE of each pair ever executes per call, so
-    # inference_ready still receives exactly 6 arrivals in one superstep —
-    # never fewer, never more. fetch_crm_offers_for_call never sets
-    # state["error"], and behavioral/compliance/script_matching don't read
-    # its output (only infer_offer_evaluation, infer_doctor_scope_validation,
-    # and infer_coe_validation do — the doctor-scope node reads
-    # state["doctor_validation"], written earlier by validate_doctor_node/
-    # skip_doctor_validation before the booking split, not from
-    # fetch_crm_offers_for_call itself; infer_coe_validation reads only
-    # state["call"] and its own CRM COE fetch).
+    # Chain A: offers  (fetch_crm_offers → behavioral/compliance/script/offer/doctor_scope/coe)
     builder.add_edge("inference_gate", "fetch_crm_offers_for_call")
     builder.add_edge("fetch_crm_offers_for_call", "infer_behavioral_evaluation")
     builder.add_edge("fetch_crm_offers_for_call", "infer_compliance_evaluation")
     builder.add_edge("fetch_crm_offers_for_call", "infer_script_matching")
     builder.add_edge("fetch_crm_offers_for_call", "infer_offer_evaluation")
-    # Services and packages run with their fetch → infer chain in parallel
-    builder.add_edge("inference_gate", "fetch_crm_services_for_call")
-    builder.add_edge("fetch_crm_services_for_call", "infer_service_evaluation")
-    builder.add_edge("inference_gate", "fetch_crm_packages_for_call")
-    builder.add_edge("fetch_crm_packages_for_call", "infer_package_evaluation")
     builder.add_conditional_edges(
-        "fetch_crm_offers_for_call",
-        _doctor_scope_intent_router,
-        {
-            "infer_doctor_scope_validation": "infer_doctor_scope_validation",
-            "skip_doctor_scope": "skip_doctor_scope_validation",
-        },
+        "fetch_crm_offers_for_call", _doctor_scope_intent_router,
+        {"infer_doctor_scope_validation": "infer_doctor_scope_validation",
+         "skip_doctor_scope":             "skip_doctor_scope_validation"},
     )
     builder.add_conditional_edges(
-        "fetch_crm_offers_for_call",
-        _coe_intent_router,
-        {
-            "infer_coe_validation": "infer_coe_validation",
-            "skip_coe": "skip_coe_validation",
-        },
+        "fetch_crm_offers_for_call", _coe_intent_router,
+        {"infer_coe_validation": "infer_coe_validation",
+         "skip_coe":             "skip_coe_validation"},
     )
 
-    # ── Step 4: all six branches fan-in → inference_ready ─────────────────
-    #
-    # LangGraph fires inference_ready only after all six (behavioral,
-    # compliance, script_matching, offer, EITHER doctor_scope or its skip,
-    # and EITHER coe or its skip) complete.
+    # Chain B: services
+    builder.add_edge("inference_gate",             "fetch_crm_services_for_call")
+    builder.add_edge("fetch_crm_services_for_call", "infer_service_evaluation")
+
+    # Chain C: packages
+    builder.add_edge("inference_gate",              "fetch_crm_packages_for_call")
+    builder.add_edge("fetch_crm_packages_for_call", "infer_package_evaluation")
+
+    # ── Each infer node → its own *_done barrier → inference_ready ────────
     builder.add_conditional_edges(
-        "infer_behavioral_evaluation",
-        _error_router,
+        "infer_behavioral_evaluation", _error_router,
         {"continue": "behavioral_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
-        "infer_compliance_evaluation",
-        _error_router,
+        "infer_compliance_evaluation", _error_router,
         {"continue": "compliance_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
-        "infer_offer_evaluation",
-        _error_router,
-        {"continue": "offer_done", "handle_error": "handle_error"},
-    )
-    builder.add_conditional_edges(
-        "infer_script_matching",
-        _error_router,
+        "infer_script_matching", _error_router,
         {"continue": "script_done", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
-        "infer_service_evaluation",
-        _error_router,
+        "infer_offer_evaluation", _error_router,
+        {"continue": "offer_done", "handle_error": "handle_error"},
+    )
+    builder.add_conditional_edges(
+        "infer_service_evaluation", _error_router,
         {"continue": "service_done", "handle_error": "handle_error"},
     )
-    builder.add_conditional_edges(    builder.add_conditional_edges(
-        "infer_doctor_scope_validation",
-        _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
-    )
-    builder.add_edge("skip_doctor_scope_validation", "inference_ready")
     builder.add_conditional_edges(
-        "infer_coe_validation",
-        _error_router,
-        {"continue": "inference_ready", "handle_error": "handle_error"},
-    )
-    builder.add_edge("skip_coe_validation", "inference_ready")
-
-        "infer_package_evaluation",
-        _error_router,
+        "infer_package_evaluation", _error_router,
         {"continue": "package_done", "handle_error": "handle_error"},
     )
+    # doctor_scope: EITHER infer_doctor_scope_validation OR skip → doctor_scope_done
+    builder.add_conditional_edges(
+        "infer_doctor_scope_validation", _error_router,
+        {"continue": "doctor_scope_done", "handle_error": "handle_error"},
+    )
+    builder.add_edge("skip_doctor_scope_validation", "doctor_scope_done")
+    # coe: EITHER infer_coe_validation OR skip → coe_done
+    builder.add_conditional_edges(
+        "infer_coe_validation", _error_router,
+        {"continue": "coe_done", "handle_error": "handle_error"},
+    )
+    builder.add_edge("skip_coe_validation", "coe_done")
+
+    # ── 9 *_done barriers → inference_ready (9 predecessors) ─────────────
     builder.add_edge(
-        [
-            "behavioral_done",
-            "compliance_done",
-            "offer_done",
-            "service_done",
-            "package_done",
-            "script_done",
-        ],
+        ["behavioral_done", "compliance_done", "script_done",
+         "offer_done", "service_done", "package_done",
+         "doctor_scope_done", "coe_done"],
         "inference_ready",
     )
+    # Note: service_done and package_done are already in the list above.
+    # inference_ready now has exactly 8 named predecessors. We keep it at
+    # 8 because service and package share equal hop depth with the others
+    # via their own fetch→infer→done chains.
 
-    # ── Step 5: CRM lead validation → overall scoring → aggregation ───────
+    # ── inference_ready → CRM lead → FAQ → scoring → aggregation ─────────
     builder.add_edge("inference_ready", "validate_crm_lead")
     builder.add_conditional_edges(
-        "validate_crm_lead",
-        _error_router,
+        "validate_crm_lead", _error_router,
         {"continue": "detect_faq_escalation", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
-        "detect_faq_escalation",
-        _faq_router,
+        "detect_faq_escalation", _faq_router,
         {"validate": "validate_faq_record", "skip": "infer_overall_scoring"},
     )
     builder.add_conditional_edges(
-        "validate_faq_record",
-        _error_router,
+        "validate_faq_record", _error_router,
         {"continue": "infer_overall_scoring", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
-        "infer_overall_scoring",
-        _error_router,
+        "infer_overall_scoring", _error_router,
         {"continue": "aggregate_results", "handle_error": "handle_error"},
     )
     builder.add_conditional_edges(
-        "aggregate_results",
-        _error_router,
+        "aggregate_results", _error_router,
         {"continue": "integrity_check", "handle_error": "handle_error"},
     )
 
-    # Safe tail nodes (no error conditions possible)
-    builder.add_edge("integrity_check", "save_to_database")
+    # ── tail chain (non-fatal) ────────────────────────────────────────────
+    builder.add_edge("integrity_check",  "save_to_database")
     builder.add_edge("save_to_database", "finalize")
-    builder.add_edge("finalize", END)
-    builder.add_edge("handle_error", END)
+    builder.add_edge("finalize",         END)
+    builder.add_edge("handle_error",     END)
 
     return builder.compile()

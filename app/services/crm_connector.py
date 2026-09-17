@@ -53,7 +53,6 @@ _ALLOW_INTERACTIVE = os.environ.get("CRM_ALLOW_INTERACTIVE", "1") != "0"
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 
 _token_cache: dict = {"token": None, "expires_at": 0.0}
-_token_caches: dict[str, dict] = {}
 _token_lock = threading.Lock()
 # Set to True when a 28000/connection-expired error is detected so _get_token()
 # forces MSAL to do a real network refresh instead of returning the stale
@@ -65,30 +64,6 @@ _force_token_refresh = False
 # another copy of the same callback, and atexit would fire N copies at
 # shutdown — each writing the same cache file.
 _msal_atexit_registered = False
-<<<<<<<< HEAD:app/service_hub/crm_database.py
- 
- 
-def _crm_host(server: Optional[str] = None) -> str:
-    # "org2f45e702.crm4.dynamics.com,5558" → "org2f45e702.crm4.dynamics.com"
-    return (server if server is not None else CRM_SERVER or "").split(",")[0].strip()
- 
- 
-def _is_configured(server: Optional[str] = None) -> bool:
-    # Server is the only hard requirement — password is optional when a cached
-    # refresh token or interactive login is used.
-    target_server = server if server is not None else CRM_SERVER
-    return bool(target_server and _crm_host(target_server))
-
-
-def _token_state(server: Optional[str] = None) -> dict:
-    """Return an in-memory token cache scoped to the Dynamics host/audience."""
-    host = _crm_host(server)
-    if host == _crm_host(CRM_SERVER):
-        return _token_cache
-    return _token_caches.setdefault(host, {"token": None, "expires_at": 0.0})
- 
- 
-========
 
 
 def _crm_host() -> str:
@@ -102,7 +77,6 @@ def _is_configured() -> bool:
     return bool(CRM_SERVER and _crm_host())
 
 
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
 def _load_msal_cache(msal_mod):
     global _msal_atexit_registered
     cache = msal_mod.SerializableTokenCache()
@@ -129,18 +103,9 @@ def _load_msal_cache(msal_mod):
         atexit.register(_persist)
         _msal_atexit_registered = True
     return cache, _persist
-<<<<<<<< HEAD:app/service_hub/crm_database.py
- 
- 
-def _get_token(
-    force_refresh: bool = False,
-    server: Optional[str] = None,
-) -> Optional[str]:
-========
 
 
 def _get_token(force_refresh: bool = False) -> Optional[str]:
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     """Acquire a bearer token for the CRM TDS endpoint. Caches in memory until near expiry.
 
     Args:
@@ -150,15 +115,9 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
             'Connection expired' error to guarantee a brand-new access token.
     """
     global _force_token_refresh
-    target_server = server if server is not None else CRM_SERVER
-    if not _is_configured(target_server):
+    if not _is_configured():
         return None
-<<<<<<<< HEAD:app/service_hub/crm_database.py
-    token_state = _token_state(target_server)
- 
-========
 
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     now = time.time()
     # Consume the module-level force flag (set by _run_query_with_retry on
     # auth errors) in addition to any caller-supplied force_refresh argument.
@@ -166,25 +125,14 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
 
     with _token_lock:
         _force_token_refresh = False  # consumed — reset immediately
-<<<<<<<< HEAD:app/service_hub/crm_database.py
-        if not effective_force and token_state["token"] and token_state["expires_at"] > now + 60:
-            return token_state["token"]
- 
-========
         if not effective_force and _token_cache["token"] and _token_cache["expires_at"] > now + 60:
             return _token_cache["token"]
 
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
         import msal
 
         authority = f"https://login.microsoftonline.com/{CRM_TENANT}"
-<<<<<<<< HEAD:app/service_hub/crm_database.py
-        scope = [f"https://{_crm_host(target_server)}/.default"]
- 
-========
         scope = [f"https://{_crm_host()}/.default"]
 
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
         cache, persist = _load_msal_cache(msal)
         app = msal.PublicClientApplication(
             CRM_CLIENT_ID, authority=authority, token_cache=cache,
@@ -227,16 +175,6 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
             raise RuntimeError(f"CRM auth failed: {err}")
 
         persist()
-<<<<<<<< HEAD:app/service_hub/crm_database.py
-        token_state["token"] = result["access_token"]
-        token_state["expires_at"] = now + int(result.get("expires_in", 3599))
-        return token_state["token"]
- 
- 
-def _get_connection(server: Optional[str] = None) -> pyodbc.Connection:
-    target_server = server if server is not None else CRM_SERVER
-    token = _get_token(server=target_server)
-========
         _token_cache["token"] = result["access_token"]
         _token_cache["expires_at"] = now + int(result.get("expires_in", 3599))
         return _token_cache["token"]
@@ -244,7 +182,6 @@ def _get_connection(server: Optional[str] = None) -> pyodbc.Connection:
 
 def _get_connection() -> pyodbc.Connection:
     token = _get_token()
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     if not token:
         raise RuntimeError("CRM not configured")
 
@@ -260,10 +197,10 @@ def _get_connection() -> pyodbc.Connection:
     # execute, surfacing as "Communication link failure" on SELECT 1.
     # Connection Timeout=120 must also appear inside the connection string —
     # the pyodbc timeout= kwarg is a connect-phase hint only on some drivers.
-    org = _crm_host(target_server).split(".")[0]
+    org = _crm_host().split(".")[0]
     conn_str = (
         f"DRIVER={{{DB_DRIVER}}};"
-        f"SERVER={target_server};"
+        f"SERVER={CRM_SERVER};"
         f"DATABASE={org};"
         f"Encrypt=yes;"
         f"TrustServerCertificate=no;"
@@ -276,90 +213,16 @@ def _get_connection() -> pyodbc.Connection:
     )
     conn.timeout = 300  # 5-min query timeout for large CRM result sets
     return conn
-<<<<<<<< HEAD:app/service_hub/crm_database.py
- 
- 
-# Walk-in fees live on cr301_table1 (one row per doctor, joined on cr301_doctorkey).
-# Try the richest projection first; fall back to the minimum if the tenant's
-# view is missing any of the denormalized lookup-name columns.
-_QUERY_VARIANTS = [
-    # Full: everything useful for debugging + display
-    """
-    SELECT
-        D.[servhub_doctornameen]          AS DoctorEn,
-        D.[cr301_doctornamear]            AS DoctorAr,
-        D.[cr301_specialtyname]           AS Specialty,
-        D.[cr301_subspecialtyname]        AS SubSpecialty,
-        D.[cr301_businessunitname]        AS BusinessUnit,
-        D.[cr301_stardoctorname]          AS IsStar,
-        D.[cr18c_firstpriorityname]       AS IsPriority,
-        D.[cr301_degreename]             AS Degree,
-        D.[cr301_scopeofservice]          AS ScopeEN,
-        D.[cr301_scopeofservicear]        AS ScopeAR,
-        D.[cr301_opdflag]                 AS OPDFlag,
-        D.[servhub_examinationage]        AS ExaminationAge,
-        F.[cr301_walkinconsultationfees]  AS WalkInPrice
-    FROM {doctor_table} D
-    LEFT JOIN {fee_table} F
-        ON D.[cr301_doctorkey] = F.[cr301_doctorkey]
-    WHERE D.[statuscodename] = 'Active'
-      AND D.[servhub_doctornameen] IS NOT NULL
-    """,
-    # Minimal: just what we actually need to show a price
-    """
-    SELECT
-        D.[servhub_doctornameen]          AS DoctorEn,
-        D.[cr301_doctornamear]            AS DoctorAr,
-        D.[cr301_opdflag]                 AS OPDFlag,
-        F.[cr301_walkinconsultationfees]  AS WalkInPrice
-    FROM {doctor_table} D
-    LEFT JOIN {fee_table} F
-        ON D.[cr301_doctorkey] = F.[cr301_doctorkey]
-    WHERE D.[servhub_doctornameen] IS NOT NULL
-    """,
-]
- 
- 
-def _run_query_with_retry(
-    query: str,
-    max_attempts: int = 3,
-    params: dict | None = None,
-    server: Optional[str] = None,
-) -> list[dict]:
-    """Open a fresh connection and execute the query, retrying on transient errors.
-
-    Args:
-        server:      Optional CRM TDS server override; defaults to CRM_SERVER.
-        query:       SQL string, may contain pyodbc named placeholders (:name).
-        max_attempts: Number of retry attempts on transient errors.
-        params:      Optional dict of bind parameters, e.g. {"bu_name": "AHJ"}.
-                     Placeholders in the query use :name syntax; they are
-                     converted to ? positional markers before execution so
-                     pyodbc (which does not support named params) is happy.
-    """
-    # Convert :name placeholders → ? and build a positional values tuple
-    import re as _re_db
-    _param_values: tuple = ()
-    if params:
-        _keys_in_order: list[str] = _re_db.findall(r":([A-Za-z_][A-Za-z0-9_]*)", query)
-        _param_values = tuple(params[k] for k in _keys_in_order)
-        query = _re_db.sub(r":[A-Za-z_][A-Za-z0-9_]*", "?", query)
-
-========
 
 
 def _run_query_with_retry(query: str, max_attempts: int = 3) -> list[dict]:
     """Open a fresh connection and execute the query, retrying on transient errors."""
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
-            with _get_connection(server=server) as conn:
+            with _get_connection() as conn:
                 cursor = conn.cursor()
-                if _param_values:
-                    cursor.execute(query, _param_values)
-                else:
-                    cursor.execute(query)
+                cursor.execute(query)
                 cols = [c[0] for c in cursor.description]
                 return [dict(zip(cols, r)) for r in cursor.fetchall()]
         except pyodbc.Error as e:
@@ -385,20 +248,18 @@ def _run_query_with_retry(query: str, max_attempts: int = 3) -> list[dict]:
                 global _force_token_refresh
                 _force_token_refresh = True        # tell _get_token() to force-refresh
                 with _token_lock:
-                    token_state = _token_state(server)
-                    token_state["token"] = None
-                    token_state["expires_at"] = 0.0
+                    _token_cache["token"] = None
+                    _token_cache["expires_at"] = 0.0
             if not transient or attempt == max_attempts:
                 raise
             backoff = 2 ** (attempt - 1)
-            print(f"[CRM] transient query failure on attempt {attempt} ({e}); retrying in {backoff}s")
+            print(f"[CRM] query attempt {attempt} failed ({e}); retrying in {backoff}s")
             time.sleep(backoff)
             # For non-auth transient errors, still clear the token as belt-and-braces.
             if not is_auth_err:
                 with _token_lock:
-                    token_state = _token_state(server)
-                    token_state["token"] = None
-                    token_state["expires_at"] = 0.0
+                    _token_cache["token"] = None
+                    _token_cache["expires_at"] = 0.0
     if last_err:
         raise last_err
     return []

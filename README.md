@@ -197,25 +197,37 @@ The original single-prompt approach was hitting token limits, producing inconsis
 The **LangGraph pipeline** solves this by decomposing the analysis into focused, parallel LLM calls:
 
 ```
-load_call → [5 criteria loaders in parallel] → criteria_ready
-    → detect_intent (keyword-based booking detection)
-    → [booking branch: extract → verify → infer_reservation] OR skip
-    → inference_gate (barrier)
-    → [infer_behavioral_evaluation + infer_compliance_evaluation in parallel]
-    → inference_ready (barrier)
-    → infer_overall_scoring
-    → aggregate_results (merge all sub-results)
-    → integrity_check (fix escalation mismatches)
-    → save_to_database (persist to SQL Server)
-    → finalize
+load_call → [6 criteria loaders in parallel] → criteria_ready
+    → detect_intent
+    → [bank validation + location validation in parallel] → loc_bank_ready
+    → detect_insurance_intent → [eligibility check if IQAMA detected] → booking_merge
+    → [doctor validation] → booking_ready
+    → _booking_router
+        → (booking/offer_only) extract_appointment_details
+              → (booking) verify_appointment_in_db → infer_reservation_evaluation
+              → (offer)   offer_extraction_done
+              → inference_gate
+        → (skip_booking) inference_gate
+    → fetch_crm_offers_for_call  ─┬─→ infer_behavioral_evaluation  → behavioral_done
+                                  ├─→ infer_compliance_evaluation  → compliance_done
+                                  ├─→ infer_script_matching        → script_done
+                                  ├─→ infer_offer_evaluation       → offer_done
+                                  ├─→ infer_doctor_scope_validation → doctor_scope_done
+                                  └─→ infer_coe_validation         → coe_done
+    → fetch_crm_services_for_call → infer_service_evaluation → service_done
+    → fetch_crm_packages_for_call → infer_package_evaluation → package_done
+    → inference_ready (barrier — 8 *_done predecessors)
+    → validate_crm_lead → detect_faq_escalation → infer_overall_scoring
+    → aggregate_results → integrity_check → save_to_database → finalize
 ```
 
 **Key benefits:**
-1. **Focused prompts** — each LLM call has a single responsibility (behavioral tone, compliance pillars, or final scoring), reducing hallucinations
-2. **Parallelism** — behavioral + compliance run concurrently, cutting latency by ~40%
-3. **Intent-aware evaluation** — booking calls trigger appointment verification against the live reservations DB
-4. **Automatic persistence** — results are written to `[DWH].[AI].[Call_QA_Results]` with auto-incrementing `Analysis_Version` for re-runs
-5. **Composable** — new evaluation dimensions (e.g. script adherence, sentiment analysis) can be added as new parallel nodes without touching existing logic
+1. **Focused prompts** — each LLM call has a single responsibility, reducing hallucinations
+2. **Full parallelism** — 8 independent inference branches run concurrently after `inference_gate`
+3. **Two-way offer validation** — `infer_offer_evaluation` checks both what the agent said AND what the CRM had available, raising a violation if a relevant offer was skipped
+4. **Intent-aware booking** — booking calls trigger appointment verification against the live reservations DB
+5. **Loop-free wiring** — every barrier node has a fixed, known predecessor count; no node can be reached twice per call
+6. **Automatic persistence** — results written to `[DWH].[AI].[Call_QA_Results]` with auto-incrementing `Analysis_Version`
 
 ### Prompting Strategy
 

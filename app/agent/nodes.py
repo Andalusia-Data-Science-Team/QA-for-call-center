@@ -400,7 +400,6 @@ async def _focused_llm_call(
     state: AgentState,
     max_tokens: int | None = None,
     max_json_retries: int = 2,
-    max_tokens: int | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Call the LLM and retry generation when its JSON is invalid or truncated."""
     parse_attempts = settings.LLM_JSON_PARSE_RETRIES + 1
@@ -1637,6 +1636,13 @@ async def detect_faq_escalation(state: AgentState) -> dict:
     """Route only chats that claim a request was sent to a responsible team."""
     call = state["call"]
     detected = transcript_has_faq_escalation(call.transcript)
+    logger.info(
+        "detect_faq_escalation | call_id=%s phone=%s detected=%s transcript_length=%d",
+        call.call_id,
+        call.Patient_Phone,
+        detected,
+        len(call.transcript or ""),
+    )
     return {
         "is_faq_escalation": detected,
         "faq_eval": {
@@ -2039,6 +2045,7 @@ async def aggregate_results(state: AgentState) -> dict:
     seen: set[tuple] = set()
     deduped_flags: list[dict] = []
     for flag in all_flags:
+        flag = _normalize_flag_type(flag)
         excerpt = str(flag.get("transcript_excerpt") or "").strip()
         evidence_key = (
             str(flag.get("description") or "")[:80]

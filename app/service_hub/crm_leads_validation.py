@@ -21,6 +21,31 @@ from app.models.input import CallTranscript
 logger = logging.getLogger(__name__)
 _IDENTIFIER_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Business unit abbreviation equivalence mappings.
+# Different abbreviations for the same business unit are used interchangeably
+# in chat transcripts and CRM records.
+_BU_EQUIVALENCE_GROUPS = [
+    {"HJH", "AHJ"},
+    {"SNB", "AFW"},
+    {"CHT", "LCH", "ALW"},
+    {"MKR", "ADC", "JDC"},
+]
+
+
+def normalize_business_unit(bu: str | None) -> str:
+    """Normalize a business unit abbreviation to a canonical form for comparison.
+
+    Returns the first (alphabetically sorted) abbreviation from the equivalence
+    group, or the uppercased input if no mapping exists.
+    """
+    if not bu:
+        return ""
+    normalized = str(bu).strip().upper()
+    for group in _BU_EQUIVALENCE_GROUPS:
+        if normalized in group:
+            return sorted(group)[0]
+    return normalized
+
 
 def _quoted_table_name(raw_table: str) -> str:
     """Validate and quote a one- or two-part SQL identifier."""

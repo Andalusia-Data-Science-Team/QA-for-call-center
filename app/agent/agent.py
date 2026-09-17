@@ -13,15 +13,19 @@ Internals:
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 from app.agent.graph import build_qa_graph
 from app.agent.state import AgentState
+from app.agent.telemetry import (
+    begin_node_execution_tracking,
+    build_jsonl_logger,
+    end_node_execution_tracking,
+    write_jsonl,
+)
 from app.config import settings
 from app.models.input import CallTranscript
 from app.models.output import QAAnalysisResult
@@ -47,31 +51,79 @@ def _summarize_chat_usage(usage_entries: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
-def _build_token_usage_logger() -> tuple[logging.Logger, Path]:
-    """Create a dedicated rotating JSONL logger for per-call LLM usage."""
-    configured_path = Path(settings.TOKEN_USAGE_LOG_PATH)
-    project_root = Path(__file__).resolve().parents[2]
-    log_path = configured_path if configured_path.is_absolute() else project_root / configured_path
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+def _summarize_node_usage(
+    node_trace: list[str],
+    usage_entries: list[dict[str, Any]],
+    *,
+    default_provider: str,
+    default_model: str,
+) -> list[dict[str, Any]]:
+    """Build one consumption record for every graph node in the execution trace."""
+    ordered_nodes: list[str] = []
+    execution_counts: dict[str, int] = {}
+    for trace_entry in node_trace:
+        node_name = str(trace_entry).split("[", 1)[0]
+        execution_counts[node_name] = execution_counts.get(node_name, 0) + 1
+        if node_name not in ordered_nodes:
+            ordered_nodes.append(node_name)
 
-    usage_logger = logging.getLogger("token_usage")
-    usage_logger.setLevel(logging.INFO)
-    usage_logger.propagate = False
-    resolved_path = str(log_path.resolve())
-    if not any(
-        isinstance(handler, RotatingFileHandler)
-        and getattr(handler, "baseFilename", None) == resolved_path
-        for handler in usage_logger.handlers
-    ):
-        handler = RotatingFileHandler(
-            log_path,
-            maxBytes=settings.TOKEN_USAGE_LOG_MAX_BYTES,
-            backupCount=settings.TOKEN_USAGE_LOG_BACKUP_COUNT,
-            encoding="utf-8",
+    usage_by_node: dict[str, list[dict[str, Any]]] = {}
+    for entry in usage_entries:
+        if isinstance(entry, dict) and entry.get("node"):
+            usage_by_node.setdefault(str(entry["node"]), []).append(entry)
+
+    records: list[dict[str, Any]] = []
+    for sequence, node_name in enumerate(ordered_nodes, start=1):
+        entries = usage_by_node.get(node_name, [])
+        known_costs = [
+            entry.get("cost_usd")
+            for entry in entries
+            if entry.get("cost_usd") is not None
+        ]
+        uses_llm = bool(entries)
+        cost_complete = not uses_llm or all(
+            bool(entry.get("cost_complete")) for entry in entries
         )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        usage_logger.addHandler(handler)
-    return usage_logger, log_path
+        records.append(
+            {
+                "node": node_name,
+                "sequence": sequence,
+                "execution_count": execution_counts[node_name],
+                "provider": (
+                    entries[-1].get("provider") or default_provider
+                    if uses_llm else None
+                ),
+                "model": (
+                    entries[-1].get("model") or default_model
+                    if uses_llm else None
+                ),
+                "request_count": sum(int(entry.get("requests") or 0) for entry in entries),
+                "prompt_tokens": sum(int(entry.get("prompt_tokens") or 0) for entry in entries),
+                "completion_tokens": sum(int(entry.get("completion_tokens") or 0) for entry in entries),
+                "total_tokens": sum(int(entry.get("total_tokens") or 0) for entry in entries),
+                "cost_usd": (
+                    round(sum(float(cost) for cost in known_costs), 12)
+                    if cost_complete else None
+                ),
+                "known_cost_usd": round(sum(float(cost) for cost in known_costs), 12),
+                "cost_complete": cost_complete,
+                "uses_llm": uses_llm,
+            }
+        )
+    return records
+
+
+def _build_consumption_logger(
+    logger_name: str, configured_path: str
+) -> tuple[logging.Logger, Path]:
+    """Create a dedicated rotating JSONL consumption logger."""
+    return build_jsonl_logger(logger_name, configured_path)
+
+
+def _build_token_usage_logger() -> tuple[logging.Logger, Path]:
+    """Backward-compatible builder for the former combined usage log."""
+    configured_path = settings.TOKEN_USAGE_LOG_PATH or settings.OVERALL_CONSUMPTION_LOG_PATH
+    return build_jsonl_logger("token_usage", configured_path)
 
 
 class AnalysisError(Exception):
@@ -94,7 +146,16 @@ class QAAgent:
 
     def __init__(self, llm_client: LLMClient) -> None:
         self.llm_client = llm_client
-        self._token_usage_logger, self._token_usage_log_path = _build_token_usage_logger()
+        self._node_consumption_logger, self._node_consumption_log_path = (
+            _build_consumption_logger(
+                "node_consumption", settings.NODE_CONSUMPTION_LOG_PATH
+            )
+        )
+        self._overall_consumption_logger, self._overall_consumption_log_path = (
+            _build_consumption_logger(
+                "overall_consumption", settings.OVERALL_CONSUMPTION_LOG_PATH
+            )
+        )
         # Compile the graph once — reused across all requests
         self._graph = build_qa_graph(llm_client)
         logger.info(
@@ -132,11 +193,28 @@ class QAAgent:
             "usage_list": [],
         }
 
-        final_state: AgentState = await self._graph.ainvoke(initial_state)
+        tracking_token = begin_node_execution_tracking()
+        try:
+            final_state: AgentState = await self._graph.ainvoke(initial_state)
+        finally:
+            executed_nodes = end_node_execution_tracking(tracking_token)
 
-        usage = _summarize_chat_usage(final_state.get("usage_list") or [])
+        usage_entries = final_state.get("usage_list") or []
+        usage = _summarize_chat_usage(usage_entries)
+        node_usage = _summarize_node_usage(
+            executed_nodes or final_state.get("node_trace") or [],
+            usage_entries,
+            default_provider=self.llm_client.provider,
+            default_model=self.llm_client.model,
+        )
+        timestamp_utc = datetime.now(timezone.utc).isoformat()
+        for node_record in node_usage:
+            write_jsonl(
+                self._node_consumption_logger,
+                {"timestamp_utc": timestamp_utc, "call_id": call.call_id, **node_record},
+            )
         usage_record = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": timestamp_utc,
             "call_id": call.call_id,
             "provider": self.llm_client.provider,
             "model": self.llm_client.model,
@@ -148,11 +226,10 @@ class QAAgent:
             "known_cost_usd": usage["known_cost_usd"],
             "cost_complete": usage["cost_complete"],
             "currency": "USD",
-            "nodes": usage["nodes"],
+            "node_count": len(node_usage),
+            "llm_node_count": sum(1 for record in node_usage if record["uses_llm"]),
         }
-        self._token_usage_logger.info(
-            json.dumps(usage_record, ensure_ascii=False, default=str)
-        )
+        write_jsonl(self._overall_consumption_logger, usage_record)
         logger.info(
             "LLM usage | call_id=%s provider=%s model=%s requests=%d "
             "prompt_tokens=%d completion_tokens=%d total_tokens=%d "
@@ -166,7 +243,7 @@ class QAAgent:
             usage["total_tokens"],
             usage["cost_usd"] if usage["cost_usd"] is not None else "unavailable",
             usage["cost_complete"],
-            self._token_usage_log_path,
+            self._overall_consumption_log_path,
         )
 
         result = final_state.get("result")

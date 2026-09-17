@@ -142,7 +142,6 @@ class LLMClient:
         response = await client.messages.create(
             model=self.model,
             max_tokens=max_tokens or settings.llm_max_tokens,
-            max_tokens=max_tokens or settings.llm_max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -170,7 +169,6 @@ class LLMClient:
 
         response = await client.chat.completions.create(
             model=self.model,
-            max_tokens=max_tokens or settings.llm_max_tokens,
             max_tokens=max_tokens or settings.llm_max_tokens,
             response_format={"type": "json_object"},  # JSON mode
             messages=[
@@ -210,7 +208,6 @@ class LLMClient:
                 model=self.model,
                 messages=messages,
                 max_tokens=max_tokens or settings.llm_max_tokens,
-                max_tokens=max_tokens or settings.llm_max_tokens,
             )
         except Exception as exc:
             raise LLMError(f"HuggingFace API call failed: {exc}") from exc
@@ -249,7 +246,6 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": max_tokens or settings.llm_max_tokens,
             "max_tokens": max_tokens or settings.llm_max_tokens,
             "temperature": 0,
             "response_format": {"type": "json_object"},

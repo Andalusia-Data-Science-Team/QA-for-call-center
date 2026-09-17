@@ -51,6 +51,10 @@ _RAISE_OR_ESCALATE_TERMS = (
     "رفع",
     "تصعيد",
     "صعد",
+    "تقديم",
+    "تم تقديم طلب",
+    "تم رفع طلب",
+    "تم تقديم الطلب",
     "raise",
     "raised",
     "escalat",
@@ -59,6 +63,10 @@ _SEND_OR_TRANSFER_TERMS = (
     "ارسل",
     "حول",
     "تحويل",
+   "تقديم",
+    "تم تقديم طلب",
+    "تم رفع طلب",
+    "تم تقديم الطلب",
     "submit",
     "send",
     "sent",
@@ -67,6 +75,7 @@ _SEND_OR_TRANSFER_TERMS = (
 )
 _REQUEST_TERMS = (
     "طلب",
+    "الطلب",
     "استفسار",
     "شكوي",
     "بلاغ",
@@ -145,7 +154,7 @@ def detect_faq_escalation(transcript: str) -> bool:
     transfer_action = _contains_any(text, _SEND_OR_TRANSFER_TERMS)
     has_request = _contains_any(text, _REQUEST_TERMS)
     has_destination = _contains_any(text, _DESTINATION_TERMS)
-    return has_destination and (strong_action or (transfer_action and has_request))
+    return has_destination or (strong_action or (transfer_action and has_request))
 
 
 def _normalize_email(value: object) -> str:

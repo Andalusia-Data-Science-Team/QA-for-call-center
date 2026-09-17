@@ -3,6 +3,7 @@ import time
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
  
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query, Form, status
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
@@ -14,6 +15,7 @@ from app.models.output import QAAnalysisResult, BatchQAAnalysisResult
 from app.agent import QAAgent
 from app.services.llm_client import LLMClient
 from app.services.sql_helpers import DatabaseWritePermissionError, update_escalation_row
+from app.services.log_parser import LogParser
 from app.config import settings
  
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -52,6 +54,7 @@ USER_STORE = {
  
 llm_client = LLMClient(provider=settings.llm_provider, model=settings.llm_model)
 analyzer   = QAAgent(llm_client=llm_client)
+log_parser = LogParser(logs_dir=str(Path(__file__).parent.parent / "logs"))
  
  
 @app.middleware("http")
@@ -122,6 +125,11 @@ async def agents_dashboard_page(request: Request):
 @app.get("/qa-supervisor", response_class=HTMLResponse)
 async def qa_supervisor_page(request: Request):
     return templates.TemplateResponse(request, "qa-supervisor.html")
+
+
+@app.get("/logs-dashboard", response_class=HTMLResponse)
+async def logs_dashboard_page(request: Request):
+    return templates.TemplateResponse(request, "logs-dashboard.html")
  
  
 # ── Agent email list ──────────────────────────────────────────────────────────
@@ -201,8 +209,7 @@ async def dismiss_escalation(payload: dict):
 @app.get("/agents/emails")
 async def list_agent_emails(
     json_file: str = Query(default="/home/ai/Workspace/Rafik/QA_System-main/app/Passcode.json"),
-    db_key:    str = Query(default="CM"),
-    db_key:    str = Query(default="CM"),
+    db_key:    str = Query(default="CM")
 ):
     import sys
     sys.path.insert(0, str(CM_DIR))
@@ -396,3 +403,86 @@ async def batch_analyze(payload: BatchCallTranscripts) -> BatchQAAnalysisResult:
     }
     logger.info("batch-analyze done | summary=%s", summary)
     return BatchQAAnalysisResult(results=list(results), summary=summary)
+
+
+# ── Logs API endpoints ────────────────────────────────────────────────────────
+
+@app.get("/api/logs/search")
+async def search_logs(
+    call_id: Optional[str] = Query(None, description="Filter by call ID (partial match)"),
+    agent_name: Optional[str] = Query(None, description="Filter by agent name"),
+    agent_email: Optional[str] = Query(None, description="Filter by agent email"),
+    mobile: Optional[str] = Query(None, description="Filter by mobile number"),
+    date_from: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    assessment: Optional[str] = Query(None, description="Filter by assessment status"),
+):
+    """
+    Search QA analysis logs with flexible filters.
+    Returns aggregated data from node_consumption, overall_consumption, and node_output logs.
+    """
+    try:
+        result = log_parser.search_logs(
+            call_id=call_id,
+            agent_name=agent_name,
+            agent_email=agent_email,
+            mobile=mobile,
+            date_from=date_from,
+            date_to=date_to,
+            assessment=assessment,
+        )
+        return result
+    except Exception as e:
+        logger.exception("search_logs failed")
+        raise HTTPException(status_code=500, detail=f"Log search failed: {e}")
+
+
+@app.get("/api/logs/call/{call_id}")
+async def get_call_detail(call_id: str):
+    """Get detailed logs for a specific call ID."""
+    try:
+        detail = log_parser.get_call_detail(call_id)
+        if not detail:
+            raise HTTPException(status_code=404, detail=f"Call {call_id} not found in logs")
+        return detail
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("get_call_detail failed | call_id=%s", call_id)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve call detail: {e}")
+
+
+@app.get("/api/logs/recent")
+async def get_recent_calls(limit: int = Query(50, ge=1, le=200)):
+    """Get the most recent calls from logs."""
+    try:
+        calls = log_parser.get_recent_calls(limit=limit)
+        return {"calls": calls, "count": len(calls)}
+    except Exception as e:
+        logger.exception("get_recent_calls failed")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve recent calls: {e}")
+
+
+@app.get("/api/logs/agent-summary")
+async def get_agent_summary(agent_email: str = Query(..., description="Agent email address")):
+    """Get summary statistics for a specific agent."""
+    try:
+        summary = log_parser.get_agent_summary(agent_email)
+        return summary
+    except Exception as e:
+        logger.exception("get_agent_summary failed | agent=%s", agent_email)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve agent summary: {e}")
+
+
+@app.get("/api/logs/date-range-summary")
+async def get_date_range_summary(
+    date_from: str = Query(..., description="Start date (YYYY-MM-DD)"),
+    date_to: str = Query(..., description="End date (YYYY-MM-DD)"),
+):
+    """Get summary statistics for a date range."""
+    try:
+        summary = log_parser.get_date_range_summary(date_from, date_to)
+        return summary
+    except Exception as e:
+        logger.exception("get_date_range_summary failed | %s to %s", date_from, date_to)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve date range summary: {e}")

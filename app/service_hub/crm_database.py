@@ -1,19 +1,7 @@
 """
-<<<<<<< HEAD
-Dynamics 365 CRM connector — generic auth/connection/query-execution layer
-for the CRM SQL/TDS endpoint using Azure AD auth.
-
-This module is intentionally domain-agnostic: it knows nothing about offers,
-doctors, locations, or bank accounts — it just gets a token and runs a query.
-app/service_hub/crm_offers.py (promotional offers), app/service_hub/crm_bank.py
-(KSA bank-account reference data), app/service_hub/crm_location.py (KSA
-branch/location reference data), and app/service_hub/crm_database.py (doctor
-walk-in prices) all depend on it. Keeping it neutral and shared here avoids
-those domains reaching into one another's modules just to get connection
-primitives — this used to live inside what's now crm_database.py, which
-made every other CRM-backed domain reach into an "offers" module for
-something that has nothing to do with offers.
-
+Dynamics 365 CRM connector — pulls doctor reference data (walk-in/cash price,
+specialty, etc.) from the CRM SQL/TDS endpoint using Azure AD auth.
+ 
 Auth strategy (MSAL, public client):
   1. Silent — read a cached refresh token from disk (works after first login).
   2. Username+password — headless fallback when CRM_PASSWORD is set and MFA
@@ -21,8 +9,10 @@ Auth strategy (MSAL, public client):
   3. Interactive — opens a browser so the user can complete MFA. Only useful
      on a dev machine; on the deployed server the token cache must already
      exist (run scripts/check_crm_prices.py locally, then copy the cache).
-
+ 
 Connection: pyodbc with the access token via SQL_COPT_SS_ACCESS_TOKEN.
+Cache: in-memory dict with a TTL (default 24h) — CRM data changes slowly
+and we never want to block the booking flow on CRM latency.
 """
 import atexit
 import os
@@ -30,35 +20,22 @@ import struct
 import threading
 import time
 from typing import Optional
-=======
-CRM doctor reference data — walk-in/cash price, specialty, etc. — pulled
-from Dynamics 365 via the shared connector in app/services/crm_connector.py.
-
-Location/bank reference data used to be fetched from this module too; that
-now lives in its own independent modules — app/service_hub/crm_bank.py and
-app/service_hub/crm_location.py — and the generic auth/connection/retry
-primitives all three depend on live in app/services/crm_connector.py
-(no domain module owns them).
-
-Cache: in-memory dict with a TTL (default 24h) — CRM data changes slowly
-and we never want to block the booking flow on CRM latency.
-"""
-import threading
-import time
->>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b
-
+ 
 import pyodbc
-
+ 
 from app.config import settings
-<<<<<<< HEAD
 
 CRM_SERVER = settings.CRM_SERVER
 CRM_CLIENT_ID = settings.CRM_CLIENT_ID
 CRM_TENANT = settings.CRM_TENANT
 CRM_USERNAME = settings.CRM_USERNAME
 CRM_PASSWORD = settings.CRM_PASSWORD
+CRM_DOCTOR_TABLE = settings.CRM_DOCTOR_TABLE
+CRM_OFFER_TABLE = settings.CRM_OFFER_TABLE
+CRM_FEE_TABLE = settings.CRM_FEE_TABLE
+CRM_PRICE_CACHE_TTL_SECONDS = settings.CRM_PRICE_CACHE_TTL_SECONDS
 DB_DRIVER = settings.DB_DRIVER
-
+ 
 # Where MSAL persists the refresh token between runs. Override with
 # MSAL_TOKEN_CACHE_PATH if you want a different location (e.g. shared volume).
 _MSAL_CACHE_PATH = os.environ.get(
@@ -67,9 +44,9 @@ _MSAL_CACHE_PATH = os.environ.get(
 )
 # Enable the interactive (browser) flow on first run. Disable on the server.
 _ALLOW_INTERACTIVE = os.environ.get("CRM_ALLOW_INTERACTIVE", "1") != "0"
-
+ 
 SQL_COPT_SS_ACCESS_TOKEN = 1256
-
+ 
 _token_cache: dict = {"token": None, "expires_at": 0.0}
 _token_caches: dict[str, dict] = {}
 _token_lock = threading.Lock()
@@ -77,13 +54,15 @@ _token_lock = threading.Lock()
 # forces MSAL to do a real network refresh instead of returning the stale
 # cached access token that Dynamics rejected.
 _force_token_refresh = False
-
+ 
+_doctor_cache: dict = {"doctors": [], "loaded_at": 0.0, "failed": False}
+_doctor_lock = threading.Lock()
+ 
 # Set to True after the first call to `_load_msal_cache` registers its persist
 # callback with atexit. Without this guard, every token refresh would queue
 # another copy of the same callback, and atexit would fire N copies at
 # shutdown — each writing the same cache file.
 _msal_atexit_registered = False
-<<<<<<<< HEAD:app/service_hub/crm_database.py
  
  
 def _crm_host(server: Optional[str] = None) -> str:
@@ -106,21 +85,6 @@ def _token_state(server: Optional[str] = None) -> dict:
     return _token_caches.setdefault(host, {"token": None, "expires_at": 0.0})
  
  
-========
-
-
-def _crm_host() -> str:
-    # "org2f45e702.crm4.dynamics.com,5558" → "org2f45e702.crm4.dynamics.com"
-    return (CRM_SERVER or "").split(",")[0].strip()
-
-
-def _is_configured() -> bool:
-    # Server is the only hard requirement — password is optional when a cached
-    # refresh token or interactive login is used.
-    return bool(CRM_SERVER and _crm_host())
-
-
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
 def _load_msal_cache(msal_mod):
     global _msal_atexit_registered
     cache = msal_mod.SerializableTokenCache()
@@ -130,7 +94,7 @@ def _load_msal_cache(msal_mod):
                 cache.deserialize(f.read())
     except Exception as e:
         print(f"[CRM] token cache unreadable ({e}); starting fresh")
-
+ 
     def _persist():
         if cache.has_state_changed:
             try:
@@ -139,7 +103,7 @@ def _load_msal_cache(msal_mod):
                     f.write(cache.serialize())
             except Exception as e:
                 print(f"[CRM] could not persist token cache: {e}")
-
+ 
     # Register at most once per process. `_load_msal_cache` is called from
     # `_get_token` on every token refresh; without the guard each call queues
     # another copy of `_persist` into atexit, leaking unboundedly.
@@ -147,20 +111,14 @@ def _load_msal_cache(msal_mod):
         atexit.register(_persist)
         _msal_atexit_registered = True
     return cache, _persist
-<<<<<<<< HEAD:app/service_hub/crm_database.py
  
  
 def _get_token(
     force_refresh: bool = False,
     server: Optional[str] = None,
 ) -> Optional[str]:
-========
-
-
-def _get_token(force_refresh: bool = False) -> Optional[str]:
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     """Acquire a bearer token for the CRM TDS endpoint. Caches in memory until near expiry.
-
+ 
     Args:
         force_refresh: When True, bypasses both the in-memory token cache AND
             MSAL's internal SerializableTokenCache, forcing a real network
@@ -171,45 +129,30 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
     target_server = server if server is not None else CRM_SERVER
     if not _is_configured(target_server):
         return None
-<<<<<<<< HEAD:app/service_hub/crm_database.py
     token_state = _token_state(target_server)
  
-========
-
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     now = time.time()
     # Consume the module-level force flag (set by _run_query_with_retry on
     # auth errors) in addition to any caller-supplied force_refresh argument.
     effective_force = force_refresh or _force_token_refresh
-
+ 
     with _token_lock:
         _force_token_refresh = False  # consumed — reset immediately
-<<<<<<<< HEAD:app/service_hub/crm_database.py
         if not effective_force and token_state["token"] and token_state["expires_at"] > now + 60:
             return token_state["token"]
  
-========
-        if not effective_force and _token_cache["token"] and _token_cache["expires_at"] > now + 60:
-            return _token_cache["token"]
-
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
         import msal
-
+ 
         authority = f"https://login.microsoftonline.com/{CRM_TENANT}"
-<<<<<<<< HEAD:app/service_hub/crm_database.py
         scope = [f"https://{_crm_host(target_server)}/.default"]
  
-========
-        scope = [f"https://{_crm_host()}/.default"]
-
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
         cache, persist = _load_msal_cache(msal)
         app = msal.PublicClientApplication(
             CRM_CLIENT_ID, authority=authority, token_cache=cache,
         )
-
+ 
         result = None
-
+ 
         # 1. Silent — refresh token from disk cache.
         #    Pass force_refresh=True when we detected a 28000 error so MSAL
         #    makes a real HTTP refresh request instead of returning the stale
@@ -225,27 +168,26 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
                     f"{'ok' if result and 'access_token' in result else 'failed'}",
                     flush=True,
                 )
-
+ 
         # 2. Username + password — only if password was provided
         if (not result or "access_token" not in result) and CRM_USERNAME and CRM_PASSWORD:
             print("[CRM] Authenticating with username+password…", flush=True)
             result = app.acquire_token_by_username_password(
                 username=CRM_USERNAME, password=CRM_PASSWORD, scopes=scope,
             )
-
+ 
         # 3. Interactive — opens a browser (useful for MFA-enabled accounts)
         if (not result or "access_token" not in result) and _ALLOW_INTERACTIVE:
             print("[CRM] opening browser for interactive login…")
             result = app.acquire_token_interactive(
                 scopes=scope, login_hint=CRM_USERNAME or None,
             )
-
+ 
         if not result or "access_token" not in result:
             err = result.get('error_description') if result else 'no result'
             raise RuntimeError(f"CRM auth failed: {err}")
-
+ 
         persist()
-<<<<<<<< HEAD:app/service_hub/crm_database.py
         token_state["token"] = result["access_token"]
         token_state["expires_at"] = now + int(result.get("expires_in", 3599))
         return token_state["token"]
@@ -254,24 +196,15 @@ def _get_token(force_refresh: bool = False) -> Optional[str]:
 def _get_connection(server: Optional[str] = None) -> pyodbc.Connection:
     target_server = server if server is not None else CRM_SERVER
     token = _get_token(server=target_server)
-========
-        _token_cache["token"] = result["access_token"]
-        _token_cache["expires_at"] = now + int(result.get("expires_in", 3599))
-        return _token_cache["token"]
-
-
-def _get_connection() -> pyodbc.Connection:
-    token = _get_token()
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     if not token:
         raise RuntimeError("CRM not configured")
-
+ 
     token_bytes = token.encode("UTF-16-LE")
     # Little-endian unsigned int (<I) is what SQL Server actually requires.
     # The previous =i (native signed) worked on x86 but could silently break
     # on big-endian hosts. Matches the proven working db.py pattern.
     token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
-
+ 
     # Dynamics TDS endpoint requires TLS and a Database= value equal to the
     # org name (first DNS label of the server, e.g. "org2f45e702"). Without
     # these the driver opens the socket but the server drops it on first
@@ -294,21 +227,8 @@ def _get_connection() -> pyodbc.Connection:
     )
     conn.timeout = 300  # 5-min query timeout for large CRM result sets
     return conn
-<<<<<<<< HEAD:app/service_hub/crm_database.py
  
  
-=======
-from app.services.crm_connector import _run_query_with_retry, _is_configured
-
-CRM_DOCTOR_TABLE = settings.CRM_DOCTOR_TABLE
-CRM_FEE_TABLE = settings.CRM_FEE_TABLE
-CRM_PRICE_CACHE_TTL_SECONDS = settings.CRM_PRICE_CACHE_TTL_SECONDS
-
-_doctor_cache: dict = {"doctors": [], "loaded_at": 0.0, "failed": False}
-_doctor_lock = threading.Lock()
-
-
->>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b
 # Walk-in fees live on cr301_table1 (one row per doctor, joined on cr301_doctorkey).
 # Try the richest projection first; fall back to the minimum if the tenant's
 # view is missing any of the denormalized lookup-name columns.
@@ -348,7 +268,6 @@ _QUERY_VARIANTS = [
     WHERE D.[servhub_doctornameen] IS NOT NULL
     """,
 ]
-<<<<<<< HEAD
  
  
 def _run_query_with_retry(
@@ -376,12 +295,6 @@ def _run_query_with_retry(
         _param_values = tuple(params[k] for k in _keys_in_order)
         query = _re_db.sub(r":[A-Za-z_][A-Za-z0-9_]*", "?", query)
 
-========
-
-
-def _run_query_with_retry(query: str, max_attempts: int = 3) -> list[dict]:
-    """Open a fresh connection and execute the query, retrying on transient errors."""
->>>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b:app/services/crm_connector.py
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -433,18 +346,17 @@ def _run_query_with_retry(query: str, max_attempts: int = 3) -> list[dict]:
     if last_err:
         raise last_err
     return []
-=======
-
-
+ 
+ 
 def get_crm_doctors_by_specialty(
     specialty_en: str,
     child_age: int = None,
 ) -> list[dict]:
     """Return all active CRM doctors for the given specialty (English name).
-
+ 
     When child_age is provided, only doctors whose ExaminationAge covers that
     age are returned (same logic as _filter_dental_for_child in routing.py).
-
+ 
     Each returned dict has at minimum:
         DoctorEn, DoctorAr, Specialty, SubSpecialty, ExaminationAge,
         WalkInPrice, IsStar, IsPriority, Degree, ScopeEN, ScopeAR
@@ -453,16 +365,16 @@ def get_crm_doctors_by_specialty(
     all_doctors = fetch_all_doctor_prices()
     if not all_doctors:
         return []
-
+ 
     matched = [
         r for r in all_doctors
         if _specialty_matches(specialty_en, r.get("Specialty") or "")
         and r.get("DoctorEn")
     ]
-
+ 
     if child_age is None:
         return matched
-
+ 
     # Filter by ExaminationAge when child age is known
     from nodes.routing import _parse_examination_age_range  # lazy import
     eligible = []
@@ -479,8 +391,8 @@ def get_crm_doctors_by_specialty(
         if lo <= child_age <= hi:
             eligible.append(r)
     return eligible
-
-
+ 
+ 
 def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
     """
     Return list of dicts: {DoctorEn, DoctorAr, Specialty, WalkInPrice, BusinessUnit}.
@@ -491,7 +403,7 @@ def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
     """
     if not _is_configured():
         return []
-
+ 
     with _doctor_lock:
         now = time.time()
         cached = _doctor_cache["doctors"]
@@ -502,7 +414,7 @@ def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
         if _doctor_cache["failed"] and age < 300:
             print("[CRM] skipping fetch — last attempt failed, in 5-min backoff", flush=True)
             return cached
-
+ 
         print("[CRM] Fetching all doctor prices from Dynamics 365...", flush=True)
         t0 = time.time()
         rows: list[dict] = []
@@ -522,10 +434,9 @@ def fetch_all_doctor_prices(force_refresh: bool = False) -> list[dict]:
             _doctor_cache["failed"] = True
             _doctor_cache["loaded_at"] = now
             return _doctor_cache["doctors"] or []
-
+ 
         print(f"[CRM] Fetched {len(rows)} doctor price records in {time.time()-t0:.1f}s", flush=True)
         _doctor_cache["doctors"] = rows
         _doctor_cache["loaded_at"] = now
         _doctor_cache["failed"] = False
         return rows
->>>>>>> 388efc58f71a52cf6dd68b3897ca5a0d93c4946b

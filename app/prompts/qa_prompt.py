@@ -1925,8 +1925,7 @@ VALIDATION RULES
    Booking intent boolean is a broad routing hint that may include appointment
    inquiries/reschedules; classify the actual objective from the transcript and
    do not apply these two checks unless a booking was created.
-4. description must be a short note that accurately describes the chat objective.
-   Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
+4. Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
    wording differences are acceptable; contradictory or unrelated descriptions are not.
 5. new_lastcallresult must match the final outcome actually reached in the chat
    (for example booked, rescheduled, inquiry answered, callback/pending, patient

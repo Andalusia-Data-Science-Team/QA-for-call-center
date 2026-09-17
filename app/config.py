@@ -39,7 +39,16 @@ class Settings(BaseSettings):
     LLM_JSON_PARSE_RETRIES: int = max(0, int(os.getenv("LLM_JSON_PARSE_RETRIES", "1")))
     LLM_INPUT_COST_PER_MILLION_USD: float = max(0.0, float(os.getenv("LLM_INPUT_COST_PER_MILLION_USD", "0")))
     LLM_OUTPUT_COST_PER_MILLION_USD: float = max(0.0, float(os.getenv("LLM_OUTPUT_COST_PER_MILLION_USD", "0")))
+    # Dedicated JSONL telemetry files. TOKEN_USAGE_LOG_PATH remains for
+    # backwards compatibility with callers of the former combined logger.
     TOKEN_USAGE_LOG_PATH: str = os.getenv("TOKEN_USAGE_LOG_PATH", "logs/token_usage.log")
+    NODE_CONSUMPTION_LOG_PATH: str = os.getenv(
+        "NODE_CONSUMPTION_LOG_PATH", "logs/node_consumption.log"
+    )
+    OVERALL_CONSUMPTION_LOG_PATH: str = os.getenv(
+        "OVERALL_CONSUMPTION_LOG_PATH", "logs/overall_consumption.log"
+    )
+    NODE_OUTPUT_LOG_PATH: str = os.getenv("NODE_OUTPUT_LOG_PATH", "logs/node_output.log")
     TOKEN_USAGE_LOG_MAX_BYTES: int = max(1024, int(os.getenv("TOKEN_USAGE_LOG_MAX_BYTES", "10485760")))
     TOKEN_USAGE_LOG_BACKUP_COUNT: int = max(1, int(os.getenv("TOKEN_USAGE_LOG_BACKUP_COUNT", "5")))
     llm_timeout_seconds: float = 60.0
