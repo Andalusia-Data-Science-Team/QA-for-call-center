@@ -50,6 +50,14 @@ class QAAnalysisResult(BaseModel):
     overall_assessment: OverallAssessment
     assessment_reasoning: str = Field(..., description="2–4 sentences explaining the assessment.")
     compliance_flags: list[ComplianceFlag]
+    # Non-punitive quality notices (e.g. doctor name_completeness) — kept
+    # STRICTLY separate from compliance_flags: never a C2B/compliance
+    # violation, never counted toward scoring/escalation/needs_review.
+    # Loosely typed (like bank_validation/doctor_validation below) so a
+    # backward-compatible new warning shape never requires a schema
+    # migration; always a list (never null) so a consumer never has to
+    # special-case "not computed" vs "no warnings".
+    doctor_warnings: list[dict[str, Any]] = Field(default_factory=list)
     agent_performance: AgentPerformance
     escalation_required: bool
     escalation_reason: Optional[str] = None
