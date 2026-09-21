@@ -107,8 +107,8 @@ SELECT top 100
 	  ,[new_lastcallcreatedbyname]
       ,[new_lastphone]
   FROM [dbo].[lead] 
-  where leadsourcecodename = 'Whatsapp'
-  and statuscodename != 'Untouched'
+ -- where leadsourcecodename = 'Whatsapp'
+  WHERE statuscodename != 'Untouched'
   and new_lastcallcreatedbyname != 'Andalusia Sharepoint'
   and mobilephone = :mobile_number
   and CAST([createdon] AS DATE) = :Report_Date

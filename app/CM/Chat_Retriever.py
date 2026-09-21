@@ -21,6 +21,7 @@ _STR_COLUMNS = [
     "Content", "SenderType", "OwnerName", "RelationName",
     "SenderIdName", "ConversationChannel", "Scope",
     "ConversationState", "WebStoreName", "OwnerId", "RelationId",
+    "answer_state",  # Database returns integer but model expects string
 ]
 
 

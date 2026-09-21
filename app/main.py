@@ -266,7 +266,7 @@ async def retrieve_and_analyze(
             agent_email=agent_email,
             filter_date=filter_date,
             db_handler=handler,
-            sql_file=str(SQL_DIR / "CM_Chat_Search.sql"),
+            sql_file=str(SQL_DIR / "NEWFIX_CM_Chat_Search.sql"),
         )
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc))

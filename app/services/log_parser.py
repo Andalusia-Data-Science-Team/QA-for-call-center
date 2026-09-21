@@ -160,6 +160,12 @@ class LogParser:
 
             filtered.append(call_data)
 
+        # Sort by timestamp (newest first)
+        filtered.sort(
+            key=lambda x: x.get("timestamp") or "",
+            reverse=True
+        )
+
         # Calculate statistics
         statistics = self._calculate_statistics(filtered)
 

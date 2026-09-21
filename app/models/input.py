@@ -178,12 +178,20 @@ class CallTranscript(BaseModel):
             v = v[3:]
         return v
 
-    @field_validator("answer_state")
+    @field_validator("answer_state", mode="before")
     @classmethod
-    def validate_answer_state(cls, v: Optional[str]) -> Optional[str]:
-        if v not in {"OnTime", "Late", None}:
-            raise ValueError(f"answer_state must be 'OnTime', 'Late', or None — got '{v}'")
-        return v
+    def validate_answer_state(cls, v) -> Optional[str]:
+        # Accept both string and integer values from database
+        if v is None:
+            return None
+        # Convert integer to string if needed
+        v_str = str(v).strip() if v else None
+        if v_str not in {"OnTime", "Late", "1", "0", None}:
+            raise ValueError(f"answer_state must be 'OnTime', 'Late', '1', '0', or None — got '{v_str}'")
+        # Normalize numeric values to string representation
+        if v_str in {"1", "0"}:
+            return v_str
+        return v_str
 
     @model_validator(mode="after")
     def detect_business_unit(self) -> "CallTranscript":
