@@ -25,55 +25,73 @@ class LogParser:
         self.node_output_file = self.logs_dir / "node_output.log"
 
     def parse_all_logs(self) -> Dict[str, Any]:
-        """Parse all log files and aggregate by call_id."""
-        calls = {}
+        """Return the latest successful evaluation for every evaluated chat.
 
-        # Parse node consumption logs
-        node_consumption = self._parse_jsonl(self.node_consumption_file)
-        for entry in node_consumption:
-            call_id = entry.get("call_id")
-            if not call_id:
-                continue
-            
-            if call_id not in calls:
-                calls[call_id] = {
-                    "call_id": call_id,
-                    "node_consumption": [],
-                    "consumption": {},
-                    "evaluation": {},
-                    "timestamp": entry.get("timestamp_utc"),
-                }
-            
-            calls[call_id]["node_consumption"].append(entry)
-
-        # Parse overall consumption logs
-        overall_consumption = self._parse_jsonl(self.overall_consumption_file)
-        for entry in overall_consumption:
-            call_id = entry.get("call_id")
-            if call_id and call_id in calls:
-                calls[call_id]["consumption"] = entry
-                calls[call_id]["cost_usd"] = entry.get("cost_usd", 0)
-                calls[call_id]["total_tokens"] = entry.get("total_tokens", 0)
-                calls[call_id]["node_count"] = entry.get("node_count", 0)
-
-        # Parse node output logs
+        ``aggregate_results`` is the authoritative record that an evaluation
+        completed. Consumption logs are supplementary: they must never hide a
+        completed evaluation when their records are absent or incomplete.
+        """
+        calls: Dict[str, Dict[str, Any]] = {}
         node_outputs = self._parse_jsonl(self.node_output_file)
+
+        # A successful aggregate record means the chat was evaluated, even if
+        # no consumption data was emitted for that run.
+        for entry in node_outputs:
+            if entry.get("node") != "aggregate_results" or entry.get("status") != "success":
+                continue
+            call_id = entry.get("call_id")
+            evaluation_date = entry.get("timestamp_utc") or ""
+            if not call_id or evaluation_date < (calls.get(call_id, {}).get("evaluation_date") or ""):
+                continue
+
+            result = (entry.get("output") or {}).get("result") or {}
+            calls[call_id] = {
+                "call_id": call_id,
+                "node_consumption": [],
+                "consumption": {},
+                "evaluation": result,
+                "evaluation_date": entry.get("timestamp_utc"),
+                # Retained for clients that previously used this field.
+                "timestamp": entry.get("timestamp_utc"),
+                "overall_assessment": result.get("overall_assessment"),
+                "agent_name": result.get("agent_name"),
+                "compliance_flags": result.get("compliance_flags", []),
+            }
+
+        # Consumption enriches evaluation details but never controls whether a
+        # completed evaluation is visible. Keep its newest run per chat.
+        latest_consumption_timestamp: Dict[str, str] = {}
+        for entry in self._parse_jsonl(self.node_consumption_file):
+            call_id = entry.get("call_id")
+            if call_id not in calls:
+                continue
+            timestamp = entry.get("timestamp_utc") or ""
+            latest = latest_consumption_timestamp.get(call_id, "")
+            if timestamp > latest:
+                latest_consumption_timestamp[call_id] = timestamp
+                calls[call_id]["node_consumption"] = [entry]
+            elif timestamp == latest:
+                calls[call_id]["node_consumption"].append(entry)
+
+        latest_overall_timestamp: Dict[str, str] = {}
+        for entry in self._parse_jsonl(self.overall_consumption_file):
+            call_id = entry.get("call_id")
+            if call_id not in calls:
+                continue
+            timestamp = entry.get("timestamp_utc") or ""
+            if timestamp < latest_overall_timestamp.get(call_id, ""):
+                continue
+            latest_overall_timestamp[call_id] = timestamp
+            calls[call_id]["consumption"] = entry
+            calls[call_id]["cost_usd"] = entry.get("cost_usd") or 0
+            calls[call_id]["total_tokens"] = entry.get("total_tokens") or 0
+            calls[call_id]["node_count"] = entry.get("node_count") or 0
+
         for entry in node_outputs:
             call_id = entry.get("call_id")
-            node = entry.get("node")
-            
-            if call_id and call_id in calls:
-                # Extract key evaluation data from specific nodes
-                if node == "aggregate_results" and entry.get("status") == "success":
-                    output = entry.get("output", {})
-                    result = output.get("result", {})
-                    calls[call_id]["evaluation"] = result
-                    calls[call_id]["overall_assessment"] = result.get("overall_assessment")
-                    calls[call_id]["agent_name"] = result.get("agent_name")
-                    calls[call_id]["compliance_flags"] = result.get("compliance_flags", [])
-                
-                # Store finalize timestamp
-                if node == "finalize":
+            if entry.get("node") == "finalize" and call_id in calls:
+                timestamp = entry.get("timestamp_utc") or ""
+                if timestamp >= (calls[call_id].get("completed_at") or ""):
                     calls[call_id]["completed_at"] = entry.get("timestamp_utc")
 
         return calls
@@ -87,6 +105,8 @@ class LogParser:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         assessment: Optional[str] = None,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Search logs with filters and return results with statistics.
@@ -135,7 +155,7 @@ class LogParser:
                     continue
 
             # Filter by date range
-            timestamp = call_data.get("timestamp")
+            timestamp = call_data.get("evaluation_date") or call_data.get("timestamp")
             if timestamp:
                 try:
                     # Parse ISO timestamp
@@ -160,20 +180,41 @@ class LogParser:
 
             filtered.append(call_data)
 
-        # Sort by timestamp (newest first)
+        # Sort by the actual evaluation time, newest first.
         filtered.sort(
-            key=lambda x: x.get("timestamp") or "",
+            key=lambda x: x.get("evaluation_date") or x.get("timestamp") or "",
             reverse=True
         )
 
         # Calculate statistics
         statistics = self._calculate_statistics(filtered)
 
-        return {
-            "results": filtered,
+        total_results = len(filtered)
+        if page is not None and page_size is not None:
+            page = max(page, 1)
+            page_size = max(page_size, 1)
+            total_pages = max((total_results + page_size - 1) // page_size, 1)
+            page = min(page, total_pages)
+            start = (page - 1) * page_size
+            results = filtered[start:start + page_size]
+            pagination = {
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
+                "total_results": total_results,
+            }
+        else:
+            results = filtered
+            pagination = None
+
+        response = {
+            "results": results,
             "statistics": statistics,
-            "total_results": len(filtered),
+            "total_results": total_results,
         }
+        if pagination:
+            response["pagination"] = pagination
+        return response
 
     def get_call_detail(self, call_id: str) -> Optional[Dict[str, Any]]:
         """Get detailed information for a specific call."""
@@ -221,9 +262,12 @@ class LogParser:
                 "pass_rate": "0%",
             }
 
-        total_cost = sum(c.get("cost_usd", 0) for c in calls)
-        total_tokens = sum(c.get("total_tokens", 0) for c in calls)
-        total_nodes = sum(c.get("node_count", 0) for c in calls)
+        # JSON logs can contain explicit null values for incomplete or
+        # non-LLM runs. dict.get(..., 0) does not replace an existing None,
+        # so normalize falsy numeric values before summing.
+        total_cost = sum(c.get("cost_usd") or 0 for c in calls)
+        total_tokens = sum(c.get("total_tokens") or 0 for c in calls)
+        total_nodes = sum(c.get("node_count") or 0 for c in calls)
         
         assessment_counts = defaultdict(int)
         for call in calls:
@@ -246,13 +290,13 @@ class LogParser:
         }
 
     def get_recent_calls(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get the most recent calls, sorted by timestamp."""
+        """Get the most recently evaluated calls."""
         all_calls = self.parse_all_logs()
         calls_list = list(all_calls.values())
         
         # Sort by timestamp (most recent first)
         calls_list.sort(
-            key=lambda x: x.get("timestamp") or "",
+            key=lambda x: x.get("evaluation_date") or x.get("timestamp") or "",
             reverse=True
         )
         

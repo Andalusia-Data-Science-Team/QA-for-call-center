@@ -242,12 +242,11 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
 When APPOINTMENT VERIFICATION says `found: true`, the booking has been verified against the database.
 Do NOT flag a wrong doctor, wrong specialty, wrong appointment assignment, or `C2C_005` from the
 transcript in that case. The only exception is the explicit ineligible-patient rule below.
+if APPOINTMENT VERIFICATION is not found raise a critical C2C flag
 
 ## SEVERITY REMINDER — apply before flagging anything as critical
 - critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
-               dangerous medical misinformation given as fact.
-- moderate   → process failure without safety risk.
-- minor      → small deviation, negligible impact.
+               dangerous medical misinformation given as fact, or ineligibile reservation based on eligibility check
 - NOT a violation: a callback promise within a stated window, a patient citing a prior unresolved inquiry,
   the agent deferring a medication availability check to a specialist or pharmacy team.
 
@@ -1896,7 +1895,7 @@ Transcript:
 {transcript}
 """
 
-
+from app.service_hub.crm_leads_validation import _BU_EQUIVALENCE_GROUPS
 
 def build_crm_lead_validation_prompt(
     call: CallTranscript,
@@ -1920,6 +1919,7 @@ VALIDATION RULES
 2. new_clinicbu must match the chat business unit. Treat known code
    and full-name representations as equivalent. Known input mappings include
    MKR=BU-MKR, LCH=BU-LCH, SNB=BU-SNB, ALW=BU-ALW, AKW=BU-AKW, and LIVE=BU-AHJ.
+   also there is equivalent BU groupings: {json.dumps(_BU_EQUIVALENCE_GROUPS, ensure_ascii=False, default=str)}.
 3. When the objective is booking, new_doctor must match the extracted/verified
    doctor and new_reservationdate must match the appointment date. The supplied
    Booking intent boolean is a broad routing hint that may include appointment

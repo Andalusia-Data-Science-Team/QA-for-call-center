@@ -89,6 +89,14 @@
             display: flex;
             gap: 10px;
             justify-content: flex-end;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .refresh-status {
+            margin-right: auto;
+            color: #495057;
+            font-size: 0.9rem;
         }
 
         .btn {
@@ -496,6 +504,54 @@
             background: #555;
         }
 
+        .pagination {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-top: 1.25rem;
+            color: #495057;
+            font-size: 0.9rem;
+        }
+
+        .pagination-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .page-button {
+            min-width: 2.5rem;
+            padding: 0.5rem 0.75rem;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            background: #fff;
+            color: #495057;
+            cursor: pointer;
+            font: inherit;
+            font-weight: 600;
+        }
+
+        .page-button:hover:not(:disabled),
+        .page-button:focus-visible {
+            border-color: #667eea;
+            color: #4c5bc3;
+            outline: 3px solid rgba(102, 126, 234, 0.18);
+            outline-offset: 2px;
+        }
+
+        .page-button:disabled {
+            cursor: not-allowed;
+            opacity: 0.55;
+        }
+
+        .page-indicator {
+            min-width: 5.5rem;
+            text-align: center;
+            font-weight: 600;
+        }
+
         /* Responsive adjustments */
         @media (max-width: 768px) {
             .container {
@@ -558,8 +614,9 @@
                 </div>
             </div>
             <div class="filter-actions">
+                <span id="refresh-status" class="refresh-status" role="status" aria-live="polite">Loading latest log data...</span>
                 <button class="btn btn-secondary" onclick="clearFilters()">Clear Filters</button>
-                <button class="btn btn-primary" onclick="searchLogs()">🔍 Search Logs</button>
+                <button class="btn btn-primary" onclick="searchLogs(false, 1)">🔍 Search Logs</button>
             </div>
         </div>
 
@@ -588,7 +645,14 @@
     </div>
 
     <script>
-        async function searchLogs() {
+        let refreshInProgress = false;
+        let currentPage = 1;
+        const PAGE_SIZE = 30;
+
+        async function searchLogs(silent = false, page = currentPage) {
+            if (refreshInProgress) return;
+            refreshInProgress = true;
+            currentPage = page;
             const params = new URLSearchParams();
             const callId = document.getElementById('call-id').value.trim();
             const agentName = document.getElementById('agent-name').value.trim();
@@ -605,19 +669,28 @@
             if (dateFrom) params.append('date_from', dateFrom);
             if (dateTo) params.append('date_to', dateTo);
             if (assessment) params.append('assessment', assessment);
+            params.set('page', currentPage.toString());
+            params.set('page_size', PAGE_SIZE.toString());
+            // Defeat intermediary caches as well as the browser cache.
+            params.set('_', Date.now().toString());
 
             const loading = document.getElementById('loading');
             const errorContainer = document.getElementById('error-container');
             const resultsContainer = document.getElementById('results-container');
             const statsContainer = document.getElementById('stats-container');
 
-            loading.style.display = 'block';
-            errorContainer.innerHTML = '';
-            resultsContainer.innerHTML = '';
-            statsContainer.style.display = 'none';
+            if (!silent) {
+                loading.style.display = 'block';
+                errorContainer.innerHTML = '';
+                resultsContainer.innerHTML = '';
+                statsContainer.style.display = 'none';
+            }
 
             try {
-                const response = await fetch(`/api/logs/search?${params.toString()}`);
+                const response = await fetch(`/api/logs/search?${params.toString()}`, {
+                    cache: 'no-store',
+                    headers: { 'Accept': 'application/json' }
+                });
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
@@ -625,15 +698,20 @@
                 
                 loading.style.display = 'none';
                 displayStats(data.statistics);
-                displayResults(data.results);
+                currentPage = data.pagination ? data.pagination.page : currentPage;
+                displayResults(data.results, data.pagination);
+                document.getElementById('refresh-status').textContent =
+                    'Last updated ' + new Date().toLocaleTimeString();
             } catch (error) {
                 loading.style.display = 'none';
+                document.getElementById('refresh-status').textContent = 'Refresh failed';
                 errorContainer.innerHTML = `
                     <div class="error-message">
                         <strong>Error:</strong> ${error.message}
                     </div>
                 `;
             }
+            refreshInProgress = false;
         }
 
         function displayStats(stats) {
@@ -669,7 +747,7 @@
             container.style.display = 'grid';
         }
 
-        function displayResults(results) {
+        function displayResults(results, pagination) {
             const container = document.getElementById('results-container');
             
             if (!results || results.length === 0) {
@@ -682,12 +760,13 @@
                 return;
             }
 
-            let html = '<h2 class="section-title">Search Results</h2>';
+            let html = '<h2 class="section-title">Evaluated Chats</h2>';
             html += '<div class="table-container"><table>';
             html += `
                 <thead>
                     <tr>
                         <th>Call ID</th>
+                        <th>Evaluation Date</th>
                         <th>Agent</th>
                         <th>Assessment</th>
                         <th>Actions</th>
@@ -704,10 +783,8 @@
                 
                 html += `
                     <tr>
-                        <td>
-                            <strong>${result.call_id}</strong>
-                            <div class="call-details">${result.timestamp || 'N/A'}</div>
-                        </td>
+                        <td><strong>${result.call_id}</strong></td>
+                        <td>${result.evaluation_date || result.timestamp || 'N/A'}</td>
                         <td>${result.agent_name || 'Unknown'}</td>
                         <td><span class="badge ${badgeClass}">${assessment}</span></td>
                         <td>
@@ -718,7 +795,7 @@
                         </td>
                     </tr>
                     <tr class="detail-row" id="detail-${index}">
-                        <td colspan="4">
+                        <td colspan="5">
                             <div class="detail-content">
                                 ${generateDetailView(result, index)}
                             </div>
@@ -728,6 +805,20 @@
             });
 
             html += '</tbody></table></div>';
+            if (pagination) {
+                const firstResult = pagination.total_results ? ((pagination.page - 1) * pagination.page_size) + 1 : 0;
+                const lastResult = Math.min(pagination.page * pagination.page_size, pagination.total_results);
+                html += `
+                    <nav class="pagination" aria-label="Evaluated chat pages">
+                        <span>Showing ${firstResult}&ndash;${lastResult} of ${pagination.total_results} evaluated chats</span>
+                        <div class="pagination-actions">
+                            <button class="page-button" type="button" onclick="goToPage(${pagination.page - 1})" ${pagination.page === 1 ? 'disabled' : ''}>Previous</button>
+                            <span class="page-indicator" aria-current="page">Page ${pagination.page} of ${pagination.total_pages}</span>
+                            <button class="page-button" type="button" onclick="goToPage(${pagination.page + 1})" ${pagination.page === pagination.total_pages ? 'disabled' : ''}>Next</button>
+                        </div>
+                    </nav>
+                `;
+            }
             container.innerHTML = html;
         }
 
@@ -849,6 +940,12 @@
             }
         }
 
+        function goToPage(page) {
+            if (page < 1) return;
+            searchLogs(false, page);
+            document.getElementById('results-container').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
         function clearFilters() {
             document.getElementById('call-id').value = '';
             document.getElementById('agent-name').value = '';
@@ -869,6 +966,15 @@
             `;
             document.getElementById('stats-container').style.display = 'none';
         }
+
+        // Load immediately, then keep the view synchronized with files that
+        // the running QA process continues to append to.
+        document.addEventListener('DOMContentLoaded', () => {
+            searchLogs(false, 1);
+            window.setInterval(() => {
+                if (!document.hidden) searchLogs(true, currentPage);
+            }, 15000);
+        });
     </script>
 </body>
 </html>

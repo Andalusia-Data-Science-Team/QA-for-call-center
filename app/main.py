@@ -63,6 +63,9 @@ async def add_process_time_header(request: Request, call_next):
     response = await call_next(request)
     elapsed  = time.perf_counter() - start
     response.headers["X-Process-Time"] = f"{elapsed:.3f}s"
+    if request.url.path == "/logs-dashboard" or request.url.path.startswith("/api/logs/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
     return response
  
  
@@ -416,6 +419,8 @@ async def search_logs(
     date_from: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     assessment: Optional[str] = Query(None, description="Filter by assessment status"),
+    page: int = Query(1, ge=1, description="Results page number"),
+    page_size: int = Query(30, ge=1, le=100, description="Results per page"),
 ):
     """
     Search QA analysis logs with flexible filters.
@@ -430,6 +435,8 @@ async def search_logs(
             date_from=date_from,
             date_to=date_to,
             assessment=assessment,
+            page=page,
+            page_size=page_size,
         )
         return result
     except Exception as e:
