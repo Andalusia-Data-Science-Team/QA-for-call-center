@@ -1,7 +1,10 @@
 import json                          # ← was missing; needed by upload_analyze
 import time
 import logging
+import urllib.parse
 from contextlib import asynccontextmanager
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional
  
@@ -133,6 +136,11 @@ async def qa_supervisor_page(request: Request):
 @app.get("/logs-dashboard", response_class=HTMLResponse)
 async def logs_dashboard_page(request: Request):
     return templates.TemplateResponse(request, "logs-dashboard.html")
+
+
+@app.get("/qa-results-dashboard", response_class=HTMLResponse)
+async def qa_results_dashboard_page(request: Request):
+    return templates.TemplateResponse(request, "qa-results-dashboard.html")
  
  
 # ── Agent email list ──────────────────────────────────────────────────────────
@@ -156,7 +164,7 @@ async def create_escalation(payload: dict):
             qa_review_comment=None,
             supervisor_name=supervisor_name,
             supervisor_email_address=supervisor_email_address,
-            coaching_status="Pending Review",
+            coaching_status=None,
             flag_description=flag_description,
             transcript_excerpt=transcript_excerpt,
             conversation_link=conversation_link,
@@ -180,7 +188,7 @@ async def review_escalation(payload: dict):
             call_id,
             qa_reviewed=True,
             qa_review_comment=review_comment if review_comment is not None else "",
-            coaching_status="Reviewed",
+            coaching_status="Pending",
         )
     except DatabaseWritePermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -198,9 +206,9 @@ async def dismiss_escalation(payload: dict):
     try:
         updated = update_escalation_row(
             call_id,
-            qa_reviewed=False,
+            qa_reviewed=True,
             qa_review_comment=None,
-            coaching_status="Dismissed",
+            coaching_status=None,
         )
     except DatabaseWritePermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -292,6 +300,12 @@ async def retrieve_and_analyze(
         batch = df_to_batch(df)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Transcript conversion failed: {exc}")
+
+    # Stamp the search email (the agent email selected in the dashboard)
+    # onto every call — it is the authoritative Agent_Email_Address that
+    # gets persisted by insert_qa_result via call.agent_email.
+    for c in batch.calls:
+        c.agent_email = agent_email
  
     logger.info("retrieve-and-analyze | %d calls passed validation", len(batch.calls))
  
@@ -493,3 +507,138 @@ async def get_date_range_summary(
     except Exception as e:
         logger.exception("get_date_range_summary failed | %s to %s", date_from, date_to)
         raise HTTPException(status_code=500, detail=f"Failed to retrieve date range summary: {e}")
+
+
+# ── Stored QA results (DWH.AI.Call_QA_Results) ───────────────────────────────
+
+@app.get("/api/qa-results")
+async def get_qa_results(
+    agent_name:           Optional[str] = Query(None, description="Filter by agent name (partial match)"),
+    date_from:            Optional[str] = Query(None, description="Call date from (YYYY-MM-DD)"),
+    date_to:              Optional[str] = Query(None, description="Call date to (YYYY-MM-DD)"),
+    overall_assessment:   Optional[str] = Query(None, description="pass | needs_review | escalate | error"),
+    agent_classification: Optional[str] = Query(None, description="A | B | C | D"),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """
+    Query [DWH].[AI].[Call_QA_Results] using the QA_DB credentials,
+    with optional filters on agent name, call date range,
+    overall assessment, and agent classification.
+    """
+    from sqlalchemy import create_engine, text as sa_text
+
+    passcodes_path = Path(__file__).parent / "Passcode.json"
+    if not passcodes_path.exists():
+        raise HTTPException(status_code=500, detail=f"Credentials file not found: {passcodes_path}")
+
+    with passcodes_path.open("r", encoding="utf-8") as fh:
+        db_names = json.load(fh)["DB_NAMES"]
+        # Prefer the QA_DB entry, but fall back to DWH (same server hosting
+        # [DWH].[AI].[Call_QA_Results]) when QA_DB is unreachable.
+        creds = db_names.get("QA_DB") or db_names["DWH"]
+
+    def _engine_for(c: dict):
+        p = urllib.parse.quote_plus(
+            f"DRIVER={c['driver']};"
+            f"SERVER={c['Server']};"
+            f"DATABASE={c['Database']};"
+            f"UID={c['UID']};"
+            f"PWD={c['PWD']};"
+            f"Connection Timeout=300;"
+        )
+        return create_engine("mssql+pyodbc:///?odbc_connect={}".format(p))
+
+    engine = _engine_for(creds)
+
+    clauses, bind = [], {}
+    if agent_name:
+        clauses.append("Agent_Name LIKE :agent_name")
+        bind["agent_name"] = f"%{agent_name}%"
+    if date_from:
+        clauses.append("CAST(Created_at AS DATE) >= :date_from")
+        bind["date_from"] = date_from
+    if date_to:
+        clauses.append("CAST(Created_at AS DATE) <= :date_to")
+        bind["date_to"] = date_to
+    if overall_assessment:
+        clauses.append("Overall_Assessment = :overall_assessment")
+        bind["overall_assessment"] = overall_assessment
+    if agent_classification:
+        clauses.append("Agent_Classification = :agent_classification")
+        bind["agent_classification"] = agent_classification
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    # The table is denormalized: one row per compliance flag, with call-level
+    # fields repeated. Fetch all matching rows, then group flags per Call_ID
+    # (keeping the most recent row's call-level fields).
+    sql = sa_text(f"""
+        SELECT *
+        FROM [DWH].[AI].[Call_QA_Results]
+        {where}
+        ORDER BY CAST(Created_at AS DATETIME2) DESC
+    """)
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(sql, bind).mappings().all()
+    except Exception as exc:
+        logger.warning("get_qa_results: primary credentials (%s) failed: %s — falling back to DWH",
+                       creds.get("Server"), exc)
+        try:
+            with _engine_for(db_names["DWH"]).connect() as conn:
+                rows = conn.execute(sql, bind).mappings().all()
+        except Exception as exc:
+            logger.exception("get_qa_results: DB query failed")
+            raise HTTPException(status_code=500, detail=f"Database query failed: {exc}")
+
+    def clean(row) -> dict:
+        out = {}
+        for k, v in row.items():
+            if isinstance(v, (datetime, date)):
+                v = v.isoformat()
+            elif isinstance(v, Decimal):
+                v = float(v)
+            elif isinstance(v, bytes):
+                v = v.decode("utf-8", errors="replace")
+            out[k.lower()] = v
+        return out
+
+    # ── group rows into calls, collecting compliance flags ──
+    calls: dict = {}
+    order: list = []
+    for row in rows:
+        r = clean(row)
+        cid = r.get("call_id")
+        if cid not in calls:
+            calls[cid] = {k: v for k, v in r.items()
+                          if k not in ("compliance_flag_type", "severity", "violation",
+                                       "flag_description", "transcript_excerpt")}
+            calls[cid]["compliance_flags"] = []
+            order.append(cid)
+        flag = {
+            "type":               r.get("compliance_flag_type"),
+            "severity":           r.get("severity"),
+            "violation":          r.get("violation"),
+            "description":        r.get("flag_description"),
+            "transcript_excerpt": r.get("transcript_excerpt"),
+        }
+        # only add rows that actually carry a flag
+        if flag["type"] or flag["description"]:
+            calls[cid]["compliance_flags"].append(flag)
+
+    results = [calls[cid] for cid in order][:limit]
+
+    def count(a):
+        return sum(1 for r in results if r.get("overall_assessment") == a)
+
+    weighted = [r["weighted_score"] for r in results if r.get("weighted_score") is not None]
+    summary = {
+        "total":             len(results),
+        "pass":              count("pass"),
+        "needs_review":      count("needs_review"),
+        "escalate":          count("escalate"),
+        "errors":            count("error"),
+        "avg_weighted_score": round(sum(weighted) / len(weighted), 2) if weighted else None,
+    }
+    return {"results": results, "summary": summary}

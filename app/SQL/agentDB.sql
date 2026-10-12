@@ -17,8 +17,6 @@ INSERT INTO [DWH].[AI].[Call_QA_Results]
     Overall_Assessment,
     Assessment_Reasoning,
     Professionalism_Score,
-    Accuracy_Score,
-    Resolution_Score,
     Strengths,
     Improvements,
     Escalation_Required,
@@ -34,7 +32,8 @@ INSERT INTO [DWH].[AI].[Call_QA_Results]
     Coaching_Status,
     Escalated,
     QA_Reviewed,
-    QA_Review_Comment
+    QA_Review_Comment,
+    Customer_Phone_Number
 )
 VALUES
 (
@@ -55,8 +54,6 @@ VALUES
     :Overall_Assessment,
     :Assessment_Reasoning,
     :Professionalism_Score,
-    :Accuracy_Score,
-    :Resolution_Score,
     :Strengths,
     :Improvements,
     :Escalation_Required,
@@ -72,5 +69,6 @@ VALUES
     :Coaching_Status,
     :Escalated,
     :QA_Reviewed,
-    :QA_Review_Comment
+    :QA_Review_Comment,
+    :Customer_Phone_Number
 );

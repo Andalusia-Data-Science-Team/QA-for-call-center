@@ -6,6 +6,11 @@ import logging
 import time
 from typing import Any
 
+try:
+    import mlflow
+except ImportError:  # pragma: no cover - optional dependency
+    mlflow = None
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -27,6 +32,14 @@ class LLMClient:
     def __init__(self, provider: str, model: str):
         self.provider = provider.lower()
         self.model = model
+        self._mlflow_enabled = mlflow is not None
+        if self._mlflow_enabled:
+            try:
+                mlflow.set_tracking_uri("http://10.24.105.220:5001")
+                mlflow.set_experiment("QA for call center")
+            except Exception:
+                logger.warning("MLflow initialization failed; continuing without tracing.", exc_info=True)
+                self._mlflow_enabled = False
         self._validate_provider()
 
     def _validate_provider(self):
@@ -54,10 +67,97 @@ class LLMClient:
         Raises LLMError if all attempts fail.
         """
         last_exc: Exception | None = None
+        run = None
+        if self._mlflow_enabled:
+            active_run = mlflow.active_run()
+            run = mlflow.start_run(
+                run_name=f"{self.provider}_{self.model}_call",
+                nested=True if active_run is not None else False,
+            )
+
+        try:
+            if self._mlflow_enabled and run is not None:
+                mlflow.log_param("provider", self.provider)
+                mlflow.log_param("model", self.model)
+                mlflow.log_param("max_tokens", max_tokens or settings.llm_max_tokens)
+                mlflow.log_text(system_prompt, "system_prompt.txt")
+                mlflow.log_text(user_prompt, "user_prompt.txt")
+            for attempt in range(1, settings.llm_max_retries + 1):
+                try:
+                    start = time.perf_counter()
+                    text, usage = await self._call_with_mlflow_trace(
+                        system_prompt,
+                        user_prompt,
+                        max_tokens=max_tokens,
+                    )
+                    usage["provider"] = self.provider
+                    usage["model"] = self.model
+                    if usage.get("cost_usd") is None:
+                        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+                        completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+                        input_rate = settings.LLM_INPUT_COST_PER_MILLION_USD
+                        output_rate = settings.LLM_OUTPUT_COST_PER_MILLION_USD
+                        if input_rate or output_rate:
+                            usage["cost_usd"] = (
+                                (prompt_tokens * input_rate)
+                                + (completion_tokens * output_rate)
+                            ) / 1_000_000
+                            usage["cost_source"] = "configured_rates"
+                        else:
+                            usage["cost_usd"] = None
+                            usage["cost_source"] = "unavailable"
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    logger.info(
+                        "LLM call succeeded | provider=%s model=%s attempt=%d latency=%.0fms "
+                        "prompt_tokens=%s completion_tokens=%s cost_usd=%s",
+                        self.provider,
+                        self.model,
+                        attempt,
+                        elapsed_ms,
+                        usage.get("prompt_tokens") or usage.get("input_tokens"),
+                        usage.get("completion_tokens") or usage.get("output_tokens"),
+                        usage.get("cost_usd"),
+                    )
+                    usage["latency_ms"] = elapsed_ms
+                    if self._mlflow_enabled and run is not None:
+                        mlflow.log_metric("latency_ms", float(elapsed_ms))
+                        for key, value in usage.items():
+                            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                mlflow.log_metric(f"usage_{key}", float(value))
+                        mlflow.log_text(text, "response.txt")
+                    return text, usage
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < settings.llm_max_retries:
+                        delay = settings.llm_retry_delay_seconds * (2 ** (attempt - 1))
+                        logger.warning(
+                            "LLM call failed (attempt %d/%d) — retrying in %.1fs | %s",
+                            attempt,
+                            settings.llm_max_retries,
+                            delay,
+                            exc,
+                        )
+                        if self._mlflow_enabled and run is not None:
+                            mlflow.log_metric("retry_count", float(attempt))
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            "LLM call failed after %d attempts | %s", settings.llm_max_retries, exc
+                        )
+                        if self._mlflow_enabled and run is not None:
+                            mlflow.log_metric("failed_attempts", float(settings.llm_max_retries))
+                        raise LLMError(f"LLM call failed after {settings.llm_max_retries} attempts") from last_exc
+        finally:
+            if self._mlflow_enabled and run is not None:
+                mlflow.end_run()
         for attempt in range(1, settings.llm_max_retries + 1):
             try:
                 start = time.perf_counter()
-                text, usage = await self._call(system_prompt, user_prompt, max_tokens=max_tokens)
+                text, usage = await self._call_with_mlflow_trace(
+                    system_prompt,
+                    user_prompt,
+                    max_tokens=max_tokens,
+                )
                 usage["provider"] = self.provider
                 usage["model"] = self.model
                 if usage.get("cost_usd") is None:
@@ -106,6 +206,21 @@ class LLMClient:
                     )
 
         raise LLMError(f"LLM call failed after {settings.llm_max_retries} attempts") from last_exc
+
+    async def _call_with_mlflow_trace(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, dict]:
+        if not self._mlflow_enabled or self.provider != "openrouter":
+            return await self._call(system_prompt, user_prompt, max_tokens=max_tokens)
+
+        @mlflow.trace(name="call_center_eval_step", span_type="LLM")
+        async def traced_provider_call() -> tuple[str, dict]:
+            return await self._call(system_prompt, user_prompt, max_tokens=max_tokens)
+
+        return await traced_provider_call()
 
     # Provider dispatcher
 
