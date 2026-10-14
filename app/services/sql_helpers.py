@@ -72,18 +72,12 @@ def _build_engine():
 
 def _weighted_score(result: QAAnalysisResult) -> float:
     """
-    Weighted composite score: professionalism 40 %, accuracy 30 %, resolution 30 %.
-    Passed_Threshold is a computed column in the DB derived from this value.
+    Weighted composite score — professionalism only (accuracy and resolution
+    scores were removed from the pipeline).  Passed_Threshold is a computed
+    column in the DB derived from this value.
     """
     perf = result.agent_performance
-    accuracy_score = perf.accuracy_score if perf.accuracy_score is not None else 0.0
-    resolution_score = perf.resolution_score if perf.resolution_score is not None else 0.0
-    return round(
-        perf.professionalism_score * 0.40
-        + accuracy_score * 0.30
-        + resolution_score * 0.30,
-        4,
-    )
+    return round(perf.professionalism_score, 4)
 
 
 def _call_level_params(
@@ -109,8 +103,6 @@ def _call_level_params(
         "Overall_Assessment":    result.overall_assessment,
         "Assessment_Reasoning":  result.assessment_reasoning,
         "Professionalism_Score": perf.professionalism_score,
-        "Accuracy_Score":        perf.accuracy_score if perf.accuracy_score is not None else 0.0,
-        "Resolution_Score":      perf.resolution_score if perf.resolution_score is not None else 0.0,
         "Strengths":             json.dumps(perf.strengths,    ensure_ascii=False),
         "Improvements":          json.dumps(perf.improvements, ensure_ascii=False),
         "Escalation_Required":   1 if result.escalation_required else 0,
@@ -119,14 +111,22 @@ def _call_level_params(
         "Created_at":            created_at,
         "Agent_Classification":  perf.agent_classification,
         "Profiling_Comment":     perf.profiling_comment,
-        "BU":                    result.business_unit,
-        "Agent_Email_Address":   result.agent_email_address,
+        # Prefer the chat's own metadata (authoritative, from CM retrieval);
+        # fall back to the LLM-extracted values when the chat has none.
+        # "LIVE" is a placeholder BU — map it to HJH; anything else stays as-is.
+        "BU": (
+            (lambda bu: "HJH" if bu == "LIVE" else bu)(
+                call.business_unit or result.business_unit
+            )
+        ),
+        "Agent_Email_Address":   call.agent_email or result.agent_email_address,
         "Supervisor_Name":       result.supervisor_name,
         "Supervisor_Email_Address": result.supervisor_email_address,
         "Coaching_Status":       result.coaching_status,
         "Escalated":             1 if result.escalated else 0,
         "QA_Reviewed":           1 if result.qa_reviewed else 0,
         "QA_Review_Comment":     result.qa_review_comment,
+        "Customer_Phone_Number": call.Patient_Phone,
     }
 
 
@@ -142,7 +142,7 @@ def update_escalation_row(
     qa_review_comment: object = _UNSET,
     supervisor_name: Optional[str] = None,
     supervisor_email_address: Optional[str] = None,
-    coaching_status: Optional[str] = None,
+    coaching_status: object = _UNSET,
     flag_description: Optional[str] = None,
     transcript_excerpt: Optional[str] = None,
     conversation_link: Optional[str] = None,
@@ -177,7 +177,7 @@ def update_escalation_row(
             values["Supervisor_Name"] = supervisor_name
         if supervisor_email_address is not None:
             values["Supervisor_Email_Address"] = supervisor_email_address
-        if coaching_status is not None:
+        if coaching_status is not _UNSET:
             values["Coaching_Status"] = coaching_status
         if conversation_link is not None:
             values["Conversation_Link"] = conversation_link

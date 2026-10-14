@@ -15,7 +15,7 @@ except ImportError:
     SENDER_EMAIL = "rafik.atallah@andalusiagroup.net"
     SMTP_USER = "andalusia\\rafik.atallah"
     SMTP_PASSWORD = "rafik2001"
-    USE_TLS = False
+    USE_TLS = True
     USE_SSL = True
 
 

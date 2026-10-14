@@ -1,0 +1,77 @@
+{
+    "ID": 1162238,
+    "Code": "1008934",
+    "ArFirstName": "عبدالمجيد",
+    "ArSecondName": "مطير",
+    "ArThirdName": "صليح",
+    "ArLastName": "الزهراني",
+    "EnFirstName": "ABDULMAJEED",
+    "EnSecondName": "MUTAIR",
+    "EnThridName": "SULAYYIH",
+    "EnLastName": "ALZAHRANI",
+    "DateOfBirth": "2001-08-16T00:00:00+03:00",
+    "HijriDateOfBirth": "1422-05-26 00:00:00",
+    "IdentificationValue": "1120579634",
+    "AgeEstimated": false,
+    "Email": null,
+    "MainPhone": "0508382553",
+    "Phones": "0508382553,",
+    "IsActive": true,
+    "DateOfDeath": "2026-09-09T06:17:26.967+03:00",
+    "CreatedBy": 0,
+    "CreatedDate": "2024-07-17T00:57:27+03:00",
+    "UpdatedBy": 9213,
+    "UpdatedDate": "2026-09-14T12:24:30.053+03:00",
+    "EntityID": 102,
+    "ModifiedTS": "AAAAARyrufI=",
+    "EntityKey": "AHJ",
+    "DirectParentID": null,
+    "FinalParentID": null,
+    "PatientNote": null,
+    "HealthId": 30000004707026,
+    "isYaqueenRetrieved": false,
+    "YaqeenVerifiedFields": 0,
+    "IsForeigner": false,
+    "HasInfectiousDisease": false,
+    "Gender": {
+        "Code": "m",
+        "NameAr": "ذكر",
+        "NameEn": "Male"
+    },
+    "MaritalStatus": {
+        "Code": "s",
+        "NameAr": "أعزب",
+        "NameEn": "Single"
+    },
+    "Nationality": {
+        "Code": "113",
+        "NameAr": "العربية السعودية",
+        "NameEn": "Saudi Arabia"
+    },
+    "Religion": {
+        "Code": "m",
+        "NameAr": "مسلم",
+        "NameEn": "Muslim"
+    },
+    "PatientClassification": {
+        "Code": "Dead",
+        "NameAr": "متوفى",
+        "NameEn": "Dead"
+    },
+    "Occupation": {
+        "Code": null,
+        "NameAr": "آخرون",
+        "NameEn": "Others"
+    },
+    "BloodGroup": {
+        "Code": null,
+        "NameAr": "O RhD positive",
+        "NameEn": "O RhD positive"
+    },
+    "IdentificationType": {
+        "Code": "1",
+        "NameAr": "رقم هوية",
+        "NameEn": "Identity Card"
+    },
+    "PatientDeathInfo": null
+}

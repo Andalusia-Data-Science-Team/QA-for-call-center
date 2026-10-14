@@ -1,7 +1,7 @@
-DECLARE @ConversationId UNIQUEIDENTIFIER = NULL --:ConversationId ;
-DECLARE @AgentFullName  NVARCHAR(200) = NULL --:AgentFullName;
-DECLARE @AgentEmail     NVARCHAR(200) = 'aya.mansour@andalusiagroup.net'--:AgentEmail;
-DECLARE @FilterDate     DATE = '2026-09-17' --:FilterDate;
+DECLARE @ConversationId UNIQUEIDENTIFIER = :ConversationId ;
+DECLARE @AgentFullName  NVARCHAR(200) = :AgentFullName;
+DECLARE @AgentEmail     NVARCHAR(200) = :AgentEmail;
+DECLARE @FilterDate     DATE = :FilterDate;
 
 
 ;WITH ConvSummary AS

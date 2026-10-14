@@ -27,10 +27,10 @@ INTERNAL_CONFIG = {
     "SMTP_SERVER": "mail.andalusiagroup.net",
     "SMTP_PORT": 587,
     "SMTP_USER": "andalusia\\rafik.atallah",
-    "SMTP_PASSWORD": "refa2001",
+    "SMTP_PASSWORD": "rafik2001",
     "SENDER_EMAIL": "rafik.atallah@andalusiagroup.net",
     "USE_TLS": True,
-    "USE_SSL": False,
+    "USE_SSL": True,
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -41,9 +41,9 @@ INTERNAL_CONFIG = {
 GMAIL_CONFIG = {
     "SMTP_SERVER": "smtp.gmail.com",
     "SMTP_PORT": 587,
-    "SMTP_USER": "your.email@gmail.com",
-    "SMTP_PASSWORD": "your-app-password-here",
-    "SENDER_EMAIL": "your.email@gmail.com",
+    "SMTP_USER": "rafiksameh123@gmail.com",
+    "SMTP_PASSWORD": "147258369Rafik#",
+    "SENDER_EMAIL": "rafiksameh123@gmail.com",
     "USE_TLS": True,
     "USE_SSL": False,
 }

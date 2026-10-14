@@ -2318,7 +2318,15 @@ async def save_to_database(state: AgentState) -> dict:
         return {"node_trace": _trace(state, "save_to_database")}
 
     try:
-        insert_qa_result(result, call, channel_name="Whatsapp")
+        # insert_qa_result reads Patient_Phone, agent_email and business_unit
+        # from `call` itself; the channel is the only per-call metadata that
+        # must be passed explicitly — use the call's real channel rather than
+        # a hardcoded label.
+        insert_qa_result(
+            result,
+            call,
+            channel_name=getattr(call, "channel", None) or "Whatsapp",
+        )
         logger.info(
             "save_to_database | call_id=%s — result persisted to DB",
             call.call_id,
