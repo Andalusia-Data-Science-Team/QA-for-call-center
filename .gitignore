@@ -27,3 +27,8 @@ passcode.json
 *.csv
 *.ipynb
 *.iqy
+# Local automation ledger (SQLite). Contains the selection audit trail —
+# back it up on the host, but never commit it.
+data/qa_automation.sqlite3
+data/qa_automation.sqlite3-wal
+data/qa_automation.sqlite3-shm

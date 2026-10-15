@@ -80,6 +80,7 @@ BUSINESS_UNIT_KEYWORD_MAP: dict[str, str] = {
     "BU-AHJ": "LIVE",
     "BU-AFW": "AFW",
     "BU-MKR": "MKR",
+    "BU-ADC": "MKR",
     "BU-SNB": "SNB",
 }
 
@@ -181,16 +182,14 @@ class CallTranscript(BaseModel):
     @field_validator("answer_state", mode="before")
     @classmethod
     def validate_answer_state(cls, v) -> Optional[str]:
-        # Accept both string and integer values from database
+        # Keep CM's raw numeric codes without assigning undocumented meanings.
         if v is None:
             return None
-        # Convert integer to string if needed
-        v_str = str(v).strip() if v else None
-        if v_str not in {"OnTime", "Late", "1", "0", None}:
-            raise ValueError(f"answer_state must be 'OnTime', 'Late', '1', '0', or None — got '{v_str}'")
-        # Normalize numeric values to string representation
-        if v_str in {"1", "0"}:
-            return v_str
+        v_str = str(v).strip()
+        if not v_str:
+            return None
+        if v_str not in {"OnTime", "Late"} and not v_str.isdecimal():
+            raise ValueError(f"answer_state must be a CM numeric code, 'OnTime', or 'Late' — got '{v_str}'")
         return v_str
 
     @model_validator(mode="after")

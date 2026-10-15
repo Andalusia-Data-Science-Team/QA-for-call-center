@@ -12,6 +12,19 @@ class AgentState(TypedDict, total=False):
     # ── Input ─────────────────────────────────────────────────────────────
     call: CallTranscript
 
+    # Automation job this evaluation belongs to, when it came from the
+    # automated sampler rather than the dashboard. None for manual runs.
+    # save_to_database passes it to insert_qa_result so the worker can link
+    # the persisted row in its local ledger — we have no DDL rights on DWH,
+    # so it cannot be a column there.
+    qa_job_id: Optional[str]
+
+    # Set by save_to_database when the DWH write fails. The manual path treats
+    # a failed write as non-fatal (the caller still has the result in memory);
+    # an automated job must NOT be marked completed on the strength of a
+    # result that was never persisted, so the worker reads this.
+    persist_error: Optional[str]
+
     # ── Criteria blocks (loaded in parallel) ──────────────────────────────
     behavioral_criteria: str        # written by load_behavioral_criteria
     compliance_pillars: str         # written by load_compliance_pillars
@@ -72,6 +85,15 @@ class AgentState(TypedDict, total=False):
     eligibility_result: Optional[dict[str, Any]]
     ineligible_reason: Optional[str]
     final_response: Optional[str]
+
+    # ── Patient Profile Validation sub-flow ───────────────────────────────
+    # patient_profile_result — written by fetch_patient_profile
+    #   keys: found (bool), profile (dict|None), error (str|None), env (str)
+    # patient_profile_eval   — written by validate_patient_profile
+    #   keys: validation_status (str), missing_fields (list), mismatches (list),
+    #         profile_updates (list), compliance_flags (list)
+    patient_profile_result: Optional[dict[str, Any]]
+    patient_profile_eval: Optional[dict[str, Any]]
 
     crm_offers_context: Optional[str]   # written by fetch_crm_offers_for_call
     # Bank and location are separate graph nodes (both backed by

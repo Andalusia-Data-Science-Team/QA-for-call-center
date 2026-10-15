@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from app.agent.graph import build_qa_graph
 from app.agent.state import AgentState
@@ -30,6 +30,7 @@ from app.config import settings
 from app.models.input import CallTranscript
 from app.models.output import QAAnalysisResult
 from app.services.llm_client import LLMClient
+from app.services import persist_context
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,12 @@ class QAAgent:
             llm_client.model,
         )
 
-    async def analyze(self, call: CallTranscript) -> QAAnalysisResult:
+    async def analyze(
+        self,
+        call: CallTranscript,
+        *,
+        job_id: Optional[str] = None,
+    ) -> QAAnalysisResult:
         """
         Run the full QA pipeline for a single call transcript.
 
@@ -172,6 +178,12 @@ class QAAgent:
         ----------
         call : CallTranscript
             The validated inbound call object.
+        job_id : str, optional
+            Automation job id, when this evaluation was dispatched by the
+            automated sampler. Threaded through to save_to_database so the
+            persisted row can be linked in the local ledger. Defaults to None,
+            which is exactly the manual-dashboard behaviour that existed
+            before — every current caller is unaffected.
 
         Returns
         -------
@@ -191,7 +203,14 @@ class QAAgent:
             "error": None,
             "error_node": None,
             "usage_list": [],
+            "qa_job_id": job_id,
+            "persist_error": None,
         }
+
+        # Clear any outcome left by a previous evaluation in this context, so
+        # that a caller reading persist_context.last() after this call cannot
+        # mistake a stale success for this evaluation's.
+        persist_context.reset()
 
         tracking_token = begin_node_execution_tracking()
         try:

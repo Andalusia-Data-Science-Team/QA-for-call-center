@@ -10,7 +10,7 @@ try:
     )
 except ImportError:
     # Fallback to inline config if mail_config.py not found
-    SMTP_SERVER = "mail.andalusiagroup.net"
+    SMTP_SERVER = "10.24.98.13"
     SMTP_PORT = 587
     SENDER_EMAIL = "rafik.atallah@andalusiagroup.net"
     SMTP_USER = "andalusia\\rafik.atallah"

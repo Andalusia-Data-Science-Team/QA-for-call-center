@@ -20,6 +20,10 @@ class LLMError(Exception):
     """Raised when the LLM call fails after all retries."""
 
 
+class LLMQuotaError(LLMError):
+    """The provider cannot accept more requests until credits are available."""
+
+
 class LLMClient:
     """
     Provider-agnostic async LLM client.
@@ -32,7 +36,7 @@ class LLMClient:
     def __init__(self, provider: str, model: str):
         self.provider = provider.lower()
         self.model = model
-        self._mlflow_enabled = mlflow is not None
+        self._mlflow_enabled = False  # tracing is disabled for this deployment
         if self._mlflow_enabled:
             try:
                 mlflow.set_tracking_uri("http://10.24.105.220:5001")
@@ -126,6 +130,9 @@ class LLMClient:
                                 mlflow.log_metric(f"usage_{key}", float(value))
                         mlflow.log_text(text, "response.txt")
                     return text, usage
+                except LLMQuotaError:
+                    logger.error("LLM provider credits exhausted; skipping retries")
+                    raise
                 except Exception as exc:
                     last_exc = exc
                     if attempt < settings.llm_max_retries:
@@ -371,6 +378,8 @@ class LLMClient:
                 async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=settings.llm_timeout_seconds)) as response:
                     response_text = await response.text()
                     
+                    if response.status == 402:
+                        raise LLMQuotaError("OpenRouter insufficient credits (HTTP 402)")
                     if response.status != 200:
                         raise LLMError(f"OpenRouter API returned status {response.status}: {response_text}")
                     
@@ -406,6 +415,8 @@ class LLMClient:
             
             return text, usage
 
+        except LLMQuotaError:
+            raise
         except aiohttp.ClientError as e:
             raise LLMError(f"OpenRouter network error: {str(e)}") from e
         except Exception as e:

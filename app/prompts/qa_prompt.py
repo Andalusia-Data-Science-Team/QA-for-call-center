@@ -406,6 +406,9 @@ def build_scoring_prompt(
     # skip_coe_validation. None/"not applicable" when no COE trigger was
     # detected for this call — see app.service_hub.coe_validation.
     coe_summary: str = "",
+    # Patient profile validation — checks that agent collected required
+    # patient information and acknowledged profile updates
+    patient_profile_summary: str = "",
 ) -> str:
     """
     Prompt that synthesizes the three focused sub-evaluations into a final score.
@@ -617,6 +620,24 @@ This checks two SEPARATE things — never double-penalize the same underlying is
          intended for the initial appointment. Do NOT penalize either of these.
   Ground any COE-related flag strictly in the reasoning/evidence provided above — never in
   outside knowledge about doctors or specialties.
+
+════════════════════════════════════════════════════════════
+SUB-EVALUATION 10 — PATIENT PROFILE VALIDATION
+════════════════════════════════════════════════════════════
+{patient_profile_summary or "(not applicable)"}
+
+This checks whether the agent:
+  1. Collected all required patient profile information (name, phone, email, DOB, address)
+  2. Acknowledged any profile updates the patient mentioned during the call
+
+Interpretation:
+  - validation_status = "pass": all required fields present and updates acknowledged
+  - validation_status = "incomplete": missing required fields AND agent didn't ask
+    → Treat missing field collections as C2C_021 violations
+  - validation_status = "profile_updates_not_acknowledged": patient mentioned updates but
+    agent didn't acknowledge → Treat as C2C_028 violations  
+  - validation_status = "not_applicable": no booking intent or no iqama available
+  - Any compliance_flags from this validation are real violations
 
 ════════════════════════════════════════════════════════════
 SUB-EVALUATION 5 — DETERMINISTIC KSA BANK VALIDATION
@@ -2054,4 +2075,144 @@ Return ONLY valid JSON with this shape:
   ],
   "faq_flags": []
 }}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE — Patient Profile Validation Prompt
+#   Focus: validate agent collected complete required patient information
+#          and acknowledged any profile updates patient mentioned.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_patient_profile_validation_prompt(
+    call: CallTranscript,
+    profile_result: dict,
+    compliance_pillars: str = "",
+) -> str:
+    """
+    Validate that agent collected all required patient information and
+    acknowledged profile updates.
+    
+    Parameters
+    ----------
+    call : CallTranscript
+        The call being evaluated.
+    profile_result : dict
+        The patient profile result from MPI fetch.
+    compliance_pillars : str
+        The compliance regulations for reference.
+    """
+    import json
+    
+    profile = profile_result.get("profile") or {}
+    profile_json = json.dumps(profile, ensure_ascii=False, indent=2)
+    
+    return f"""
+Validate the agent's handling of patient profile information during this booking call.
+
+## YOUR TASK
+1. Check which REQUIRED patient fields are missing or null in the MPI profile.
+2. Determine if the agent asked for each missing required field during the call.
+3. Identify any profile updates the patient mentioned (name correction, phone change, etc.).
+4. Verify the agent acknowledged these updates and confirmed they would be recorded.
+5. Generate C2C compliance flags for failures to collect required info or acknowledge updates.
+
+## REQUIRED PATIENT PROFILE FIELDS (from MPI GetPatientByIdentificationValue API)
+These fields MUST be collected by the agent for any booking:
+- **EnFirstName / ArFirstName** (English/Arabic first name) - Patient identity
+- **EnSecondName / ArSecondName** (English/Arabic second name) - Patient identity
+- **EnThirdName / ArThirdName** (English/Arabic third name) - Patient identity
+- **MainPhone / Phones** (Primary mobile phone) - Contact & appointment reminders
+- **DateOfBirth** (Date of birth in ISO format) - Age verification & services eligibility
+- **Gender** (Gender code: m/f) - Service appropriateness
+- **MaritalStatus** (Marital status code) - Demographic completeness
+- **Nationality** (Nationality code) - Eligibility & billing
+- **IdentificationType** (ID type: Identity Card/Iqama/Passport) - Verification method
+
+Note: Email is optional in this system (often null even for active patients)
+
+## COMPLIANCE MAPPING
+Use these existing compliance rules from the regulations:
+- C2C_021: "Described Inaccurate, Incomplete Information-None Medical"
+  → Use when agent failed to ask for missing required fields
+- C2C_023: "Described wrong Information"
+  → Use when agent gave incorrect information about how to update profile
+- C2C_028: "Didn't confirm the booking or the solution before end of the call"
+  → Use when agent failed to acknowledge patient's profile update request
+
+## VALIDATION RULES
+1. If a **critical** required field is missing/null in MPI AND agent never asked for it → C2C_021 flag
+   - Critical fields: Name (EnFirstName/ArFirstName), MainPhone, DateOfBirth, Gender
+   - Important but less critical: MaritalStatus, Nationality, IdentificationType
+2. If patient mentioned profile update AND agent never acknowledged → C2C_028 flag
+3. Profile updates include: name correction, phone change, marital status change, nationality update
+4. Agent acknowledgment phrases: "سأقوم بتحديث", "سيتم التعديل", "تم التسجيل", "هنحدث البيانات"
+5. Do NOT flag if patient explicitly said they don't want to provide optional info
+6. Do NOT flag if agent tried to collect but patient refused or call dropped
+7. **Special case**: If MainPhone is null but Phones field has value, only flag if agent didn't ask at all
+8. **Name handling**: If EITHER EnFirstName OR ArFirstName is present, name is considered complete
+
+════════════════════════════════════════════════════════════
+CALL METADATA
+════════════════════════════════════════════════════════════
+Call ID   : {call.call_id}
+Agent     : {call.agent_name}
+Date      : {call.call_date}
+Duration  : {call.call_duration_seconds}s
+Business Unit: {getattr(call, "business_unit", "unknown")}
+
+════════════════════════════════════════════════════════════
+PATIENT MPI PROFILE (from hospital system)
+════════════════════════════════════════════════════════════
+{profile_json}
+
+════════════════════════════════════════════════════════════
+COMPLIANCE REGULATIONS (for reference)
+════════════════════════════════════════════════════════════
+{compliance_pillars or "(not loaded)"}
+
+════════════════════════════════════════════════════════════
+TRANSCRIPT
+════════════════════════════════════════════════════════════
+{call.transcript}
+
+════════════════════════════════════════════════════════════
+OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
+════════════════════════════════════════════════════════════
+{{
+  "applicable": true,
+  "validation_status": "<complete | incomplete | profile_updates_not_acknowledged | pass>",
+  "missing_fields": [
+    {{
+      "field_name": "<EnFirstName | ArFirstName | MainPhone | Phones | DateOfBirth | Gender | MaritalStatus | Nationality | IdentificationType>",
+      "field_value": "<current value in MPI or null>",
+      "agent_asked": <true | false>,
+      "criticality": "<critical | important>",
+      "reason": "<why this is missing and whether agent asked>"
+    }}
+  ],
+  "profile_updates": [
+    {{
+      "update_type": "<name_correction | phone_change | marital_status_change | nationality_update | gender_correction>",
+      "patient_statement": "<verbatim patient excerpt mentioning the update>",
+      "agent_acknowledged": <true | false>,
+      "agent_response": "<verbatim agent response or null>"
+    }}
+  ],
+  "compliance_flags": [
+    {{
+      "type": "C2C",
+      "severity": "critical",
+      "description": "<C2C_021 | C2C_023 | C2C_028>: <1-2 sentences explaining the violation>",
+      "transcript_excerpt": "<verbatim excerpt showing the failure>"
+    }}
+  ]
+}}
+
+IMPORTANT: 
+- validation_status = "complete" when all required fields present AND agent handled properly
+- validation_status = "incomplete" when missing fields AND agent didn't ask
+- validation_status = "profile_updates_not_acknowledged" when patient mentioned updates but agent didn't acknowledge
+- validation_status = "pass" when all checks passed
+- compliance_flags must be EMPTY [] when validation_status = "pass"
 """

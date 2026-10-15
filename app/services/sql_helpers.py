@@ -28,6 +28,7 @@ from sqlalchemy import create_engine, text as sa_text
 
 from app.models.input import CallTranscript
 from app.models.output import QAAnalysisResult
+from app.services import persist_context
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,8 @@ def insert_qa_result(
     *,
     agent_id: Optional[str] = None,
     channel_name: Optional[str] = "WhatsApp",
-) -> None:
+    qa_job_id: Optional[str] = None,
+) -> dict:
     """
     Insert QA evaluation results into [DWH].[AI].[Call_QA_Results].
 
@@ -223,6 +225,18 @@ def insert_qa_result(
     call         : Original CallTranscript (agent name, date, duration, …).
     agent_id     : Internal agent identifier (optional).
     channel_name : Channel label, e.g. "Phone", "Chat" (optional).
+    qa_job_id    : Automation job this insert belongs to, when the call came
+                   from the automated sampler. Recorded on the context-local
+                   outcome so the worker can link the row in its local ledger.
+                   We have no DDL rights on DWH, so this CANNOT be stored as a
+                   column on the table — see
+                   docs/AUTOMATION_IMPLEMENTATION_PLAN.md §2.2.
+
+    Returns
+    ───────
+    dict with ``analysis_version`` and ``rows_inserted``. The automation's
+    persistence protocol needs to know which version landed; manual callers
+    may ignore it.
 
     Notes
     ─────
@@ -294,6 +308,16 @@ def insert_qa_result(
             conn.execute(query, row)
 
     logger.info(
-        "insert_qa_result | call_id=%s version=%d — %d row(s) inserted successfully",
+        "insert_qa_result | call_id=%s version=%d — %d row(s) inserted successfully%s",
         call.call_id, analysis_version, len(rows),
+        f" (job {qa_job_id})" if qa_job_id else "",
     )
+
+    outcome = persist_context.PersistOutcome(
+        call_id=call.call_id,
+        analysis_version=analysis_version,
+        rows_inserted=len(rows),
+        job_id=qa_job_id,
+    )
+    persist_context.record(outcome)
+    return {"analysis_version": analysis_version, "rows_inserted": len(rows)}

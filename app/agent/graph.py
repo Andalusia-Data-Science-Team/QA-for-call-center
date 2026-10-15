@@ -196,6 +196,10 @@ from app.agent.nodes import (
     infer_coe_validation,
     skip_coe_validation,
 )
+from app.agent.patient_profile_nodes import (
+    fetch_patient_profile,
+    validate_patient_profile,
+)
 from app.service_hub.bank_validation import detect_bank_signals, bank_validation_needed
 from app.service_hub.location_validation import detect_location_signals, location_validation_needed
 from app.service_hub.doctor_validation import (
@@ -298,6 +302,18 @@ def _insurance_router(state: AgentState) -> Literal["insurance", "continue"]:
     if state.get("is_insurance_intent"):
         return "insurance"
     return "continue"
+
+
+def _patient_profile_router(state: AgentState) -> Literal["fetch_profile", "skip_profile"]:
+    """Route to patient profile validation whenever iqama number is available.
+    
+    This runs in parallel with the booking flow - patient profile validation
+    happens regardless of booking intent, as long as we have an iqama number.
+    """
+    iqama = state.get("iqama_number")
+    if iqama:
+        return "fetch_profile"
+    return "skip_profile"
 
 
 def _faq_router(state: AgentState) -> Literal["validate", "skip"]:
@@ -549,15 +565,20 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     # Barrier: fires once bank branch AND location branch both complete (2 predecessors).
     builder.add_node("loc_bank_ready", lambda state: {})
 
-    # ── Stage 4: insurance / eligibility → doctor validation ─────────────
+    # ── Stage 4: insurance / eligibility + patient profile (parallel) → doctor validation ─────
     builder.add_node("detect_insurance_intent", detect_insurance_intent)
     builder.add_node("check_patient_eligibility", check_patient_eligibility)
     builder.add_node("handle_ineligible_patient", handle_ineligible_patient)
-    # no-op barrier that merges the insurance→eligible path and the
-    # no-insurance path into a single token before doctor routing.
-    # Also receives handle_ineligible_patient so ineligible calls still
-    # reach doctor validation (to catch an improper reservation) without
-    # bypassing booking_ready.
+    builder.add_node("fetch_patient_profile", fetch_patient_profile)
+    builder.add_node(
+        "validate_patient_profile",
+        functools.partial(validate_patient_profile, llm_client=llm_client),
+    )
+    # Barrier nodes for parallel path completion
+    builder.add_node("insurance_done", lambda state: {})  # Insurance/eligibility path done
+    builder.add_node("profile_done", lambda state: {})     # Patient profile path done
+    # Final merge point: waits for BOTH insurance_done AND profile_done (2 predecessors)
+    # before proceeding to doctor validation
     builder.add_node("booking_merge", lambda state: {})
     builder.add_node(
         "validate_doctor",
@@ -707,23 +728,38 @@ def build_qa_graph(llm_client: LLMClient) -> StateGraph:
     builder.add_edge("validate_location",         "loc_bank_ready")
     builder.add_edge("skip_location_validation",  "loc_bank_ready")
 
-    # ── loc_bank_ready → detect_insurance_intent (sequential) ────────────
+    # ── loc_bank_ready → detect_insurance_intent → PARALLEL SPLIT ────────
     builder.add_edge("loc_bank_ready", "detect_insurance_intent")
 
+    # ── PARALLEL PATH 1: Insurance/Eligibility check ─────────────────────
     builder.add_conditional_edges(
         "detect_insurance_intent", _insurance_router,
         {"insurance": "check_patient_eligibility",
-         "continue":  "booking_merge"},
+         "continue":  "insurance_done"},
     )
     builder.add_conditional_edges(
         "check_patient_eligibility", _eligibility_router,
-        {"eligible":     "booking_merge",
+        {"eligible":     "insurance_done",
          "not_eligible": "handle_ineligible_patient",
          "error":        "handle_error"},
     )
-    # Ineligible patients still go through booking_merge → doctor validation
-    # → booking_ready so the booking router sees them exactly once.
-    builder.add_edge("handle_ineligible_patient", "booking_merge")
+    builder.add_edge("handle_ineligible_patient", "insurance_done")
+    
+    # ── PARALLEL PATH 2: Patient Profile validation (if iqama available) ──
+    builder.add_conditional_edges(
+        "detect_insurance_intent", _patient_profile_router,
+        {"fetch_profile": "fetch_patient_profile",
+         "skip_profile":  "profile_done"},
+    )
+    builder.add_edge("fetch_patient_profile", "validate_patient_profile")
+    builder.add_conditional_edges(
+        "validate_patient_profile", _error_router,
+        {"continue": "profile_done", "handle_error": "handle_error"},
+    )
+    
+    # ── FAN-IN: Both paths must complete before continuing ────────────────
+    # booking_merge waits for BOTH insurance_done AND profile_done
+    builder.add_edge(["insurance_done", "profile_done"], "booking_merge")
 
     # ── booking_merge → doctor validation → booking_ready ────────────────
     builder.add_conditional_edges(

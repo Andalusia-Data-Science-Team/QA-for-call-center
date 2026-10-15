@@ -124,6 +124,12 @@ from app.service_hub.crm_leads_validation import (
     matched_crm_lead_attributes,
     normalize_crm_lead_evaluation,
 )
+from app.services.get_patient import (
+    get_patient,
+    get_token_for_env,
+    build_patient_url,
+    login,
+)
 from app.FAQs.faq_validation import (
     detect_faq_escalation as transcript_has_faq_escalation,
     lookup_faq_record,
@@ -1771,6 +1777,7 @@ async def infer_overall_scoring(
     doctor_summary       = json.dumps(state.get("doctor_validation") or {}, ensure_ascii=False)
     doctor_scope_summary = json.dumps(state.get("doctor_scope_validation") or {}, ensure_ascii=False)
     coe_summary          = json.dumps(state.get("coe_validation") or {}, ensure_ascii=False)
+    patient_profile_summary = json.dumps(state.get("patient_profile_eval") or {}, ensure_ascii=False)
 
     user_prompt = build_scoring_prompt(
         call,
@@ -1786,6 +1793,7 @@ async def infer_overall_scoring(
         doctor_summary=doctor_summary,
         doctor_scope_summary=doctor_scope_summary,
         coe_summary=coe_summary,
+        patient_profile_summary=patient_profile_summary,
     )
     logger.debug(
         "infer_overall_scoring | call_id=%s prompt_len=%d",
@@ -2094,6 +2102,10 @@ async def aggregate_results(state: AgentState) -> dict:
             flag["severity"] = "positive"
         _package_flags.append(flag)
 
+    # Patient profile validation flags
+    patient_profile = state.get("patient_profile_eval") or {}
+    patient_profile_flags = patient_profile.get("compliance_flags", [])
+    
     # Merge all compliance flag lists from all focused evaluations
     all_flags: list[dict] = (
         behavioral.get("behavioral_flags", [])
@@ -2108,6 +2120,7 @@ async def aggregate_results(state: AgentState) -> dict:
         + location_flags
         + doctor_flags
         + coe_flags
+        + patient_profile_flags
         + script.get("script_flags", [])
         + scoring.get("compliance_flags", [])
     )
@@ -2317,26 +2330,43 @@ async def save_to_database(state: AgentState) -> dict:
         )
         return {"node_trace": _trace(state, "save_to_database")}
 
+    job_id = state.get("qa_job_id")
+
     try:
         # insert_qa_result reads Patient_Phone, agent_email and business_unit
         # from `call` itself; the channel is the only per-call metadata that
         # must be passed explicitly — use the call's real channel rather than
         # a hardcoded label.
-        insert_qa_result(
+        outcome = insert_qa_result(
             result,
             call,
             channel_name=getattr(call, "channel", None) or "Whatsapp",
+            qa_job_id=job_id,
         )
         logger.info(
-            "save_to_database | call_id=%s — result persisted to DB",
+            "save_to_database | call_id=%s version=%s — result persisted to DB",
             call.call_id,
+            outcome.get("analysis_version"),
         )
     except Exception as exc:  # noqa: BLE001
+        # Non-fatal for the MANUAL path: the caller already holds the result in
+        # memory and should not lose it to a transient DB blip.
+        #
+        # NOT non-fatal for an AUTOMATED job. A job marked completed on the
+        # strength of a result that was never persisted is a silent hole in the
+        # day's coverage — the dashboard would show 300 evaluated and the table
+        # would hold 299. The error is recorded in state so the worker can see
+        # it and retry; the pipeline itself still finishes normally.
         logger.error(
-            "save_to_database | call_id=%s — DB insert failed (non-fatal): %s",
+            "save_to_database | call_id=%s — DB insert failed%s: %s",
             call.call_id,
+            " (AUTOMATED JOB — will be retried)" if job_id else " (non-fatal)",
             exc,
         )
+        return {
+            "persist_error": str(exc),
+            "node_trace": _trace(state, "save_to_database"),
+        }
 
     return {"node_trace": _trace(state, "save_to_database")}
 
