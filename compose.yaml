@@ -1,0 +1,27 @@
+x-qa-base: &qa-base
+  build: .
+  image: qa-system:dev
+  working_dir: /workspace
+  user: "${QA_DOCKER_UID:-1000}:${QA_DOCKER_GID:-1000}"
+  init: true
+  volumes:
+    - type: bind
+      source: .
+      target: /workspace
+    - type: bind
+      source: /home/ai/.andalusia_crm_cache.bin
+      target: /tmp/.andalusia_crm_cache.bin
+      read_only: true
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+    PYTHONUNBUFFERED: "1"
+    HOME: /tmp
+    TZ: Africa/Cairo
+    WATCHFILES_FORCE_POLLING: "true"
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *qa-base
+    ports:
+      - "${QA_API_PORT:-8001}:8000"

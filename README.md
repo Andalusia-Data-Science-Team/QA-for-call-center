@@ -113,6 +113,50 @@ uvicorn app.main:app --reload
 The API will be available at `http://localhost:8000`.  
 Interactive docs: `http://localhost:8000/docs`
 
+### Docker development setup
+
+The Compose API container runs both Uvicorn and the automation daemon under
+Supervisor. The checkout is bind mounted at `/workspace`, so Python, SQL, YAML,
+and template edits are visible immediately. Uvicorn reloads when files under
+`app/` change. Rebuild the image after changing `requirements.txt` or the
+`Dockerfile`.
+
+Keep the project's `.env`, `app/Passcode.json`, and `app/CM/passcode.json` in
+this checkout. They are available through the bind mount and are excluded from
+the built image. The automation ledger in `data/` and files in `logs/` also
+remain on the host. Changing `.env` requires restarting the affected service.
+
+```bash
+docker compose up --build -d api
+docker compose logs -f api
+```
+
+The container API is at `http://localhost:8001/docs` by default. Set
+`QA_API_PORT` when running Compose to use another host port; port 8000 remains
+available for the local `uvicorn` command above.
+
+After the first build, use `docker compose up -d api` for normal work. Source
+edits are bind mounted and hot reloaded, so `--build` is needed only after
+changing `Dockerfile` or `requirements.txt`. A clean machine must download the
+Python base image once; later builds reuse Docker's cached layers.
+
+Supervisor starts both processes when the container starts. Check their state
+or stop and restart only the automation daemon while leaving the API available:
+
+```bash
+docker compose exec api supervisorctl status
+docker compose exec api supervisorctl stop automation
+docker compose exec api supervisorctl start automation
+```
+
+Stopping automation sends it `SIGTERM`: it stops claiming new work and lets an
+active evaluation finish. Supervisor can wait up to 600 seconds before
+forcefully stopping it. One-shot runner commands remain available with
+`docker compose exec api python -m app.automation.runner <command>`.
+
+Run `docker compose down` to stop both processes with the container. The bind
+mounted files and the local automation ledger remain in the checkout.
+
 ### 6. Test a transcript
 
 ```bash
