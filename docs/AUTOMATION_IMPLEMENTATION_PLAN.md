@@ -377,15 +377,32 @@ changed no behaviour.
 If a real shift feed ever appears, `plan_day` is the only caller that needs
 an agent's time bounds, and it is the place to reintroduce them.
 
-**D2 — attribution: still open, implemented as proposed.**
+**D2 — attribution: inbox owner, as NEWFIX does it.**
 
-The responsible agent is the human who sent the **last non-system message**,
-resolved `Messages.Sender_UniqueId → Participations → People` with
-`People.Discriminator = 'User'`. Their final message timestamp decides the
-reporting day and interval. The current inbox owner is deliberately *not*
-used, but is returned as `InboxOwnerEmail` with an `OwnerDiffersFromHandler`
-flag so the two can be compared on real transferred chats before sign-off.
-Every candidate row stores `AttributionRule = 'last_human_message'`.
+The automation queries are derived from `NEWFIX_CM_Chat_Search.sql`, the query
+the manual dashboard uses, and attribute a conversation to its inbox owner
+(`owner.UserEmailAddress`). Every candidate row stores
+`AttributionRule = 'inbox_owner'`. NEWFIX itself is not modified; the
+automation has its own copies in `app/SQL/automation/`:
+
+| file | from NEWFIX | used for |
+|---|---|---|
+| `automation_active_agents.sql` | owner join | the roster |
+| `automation_day_conversations.sql` | `ConvSummary` without APPLYs or messages | candidates |
+| `automation_chat_by_ids.sql` | the whole query, selected by id, no TOP | transcripts |
+
+**Roster: CM agents, not `DWH.AI.Agents`.** On 2026-10-17 only 3 of the 18
+people who owned conversations in CM were in `DWH.AI.Agents`, so planning
+against it gave quota to agents with no chats and the day reserved 12 of 300.
+The roster is now everyone who owned and replied in a conversation closed
+during the `QA_ROSTER_LOOKBACK_DAYS` (default 14) before the reporting day — the
+same source the dashboard's agent list uses. A dry run of 2026-10-17 against
+live CM_DWH with this roster reserved **300 of 300**, all distinct, none
+back-to-back, across 17 agents and all 24 hours, with an identical selection
+fingerprint on two fresh ledgers.
+
+Candidates are windowed on `ArchiveDateTime`, so a conversation is sampled in
+the interval it closed in and is always finished when snapshotted.
 
 **Completion state.** `ArchiveDateTime IS NOT NULL` is the only completion
 signal used. CM's `State` and `AnswerState` codes are carried through but
@@ -421,15 +438,16 @@ a test asserts exactly that. The remaining gaps above are real data limits:
 ## 7a. Running it
 
 ```bash
-python -m app.automation.runner dry-run --date 2026-10-29   # plan + select, NO LLM calls
-python -m app.automation.runner status  --date 2026-10-29
-python -m app.automation.runner plan    --date 2026-10-29
+python -m app.automation.runner status     # today's run in the reporting timezone
+python -m app.automation.runner plan       # plan today if the daemon has not done so
 python -m app.automation.runner dispatch
 python -m app.automation.runner work
-python -m app.automation.runner reconcile --date 2026-10-29
-python -m app.automation.runner backfill  --date 2026-10-29  # top up a short day
+python -m app.automation.runner reconcile --date YYYY-MM-DD
+python -m app.automation.runner backfill  --date YYYY-MM-DD  # top up a short day
 python -m app.automation.runner repair                       # unstick a wedged ledger
+python -m app.automation.runner replan    --date YYYY-MM-DD  # re-plan a day against the CM roster
 python -m app.automation.runner                              # the daemon
+QA_LEDGER_DB_PATH=/tmp/qa-dry-run.sqlite3 python -m app.automation.runner dry-run --date YYYY-MM-DD
 ```
 
 `dry-run` is the gate before go-live. It plans and dispatches a whole day,

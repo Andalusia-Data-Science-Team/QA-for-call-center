@@ -69,7 +69,7 @@ class UnevenCM:
                                            if self.closed else None),
                     "StartDateTimeUtc": moment.replace(tzinfo=None),
                     "LastUpdatedUtc": moment.replace(tzinfo=None),
-                    "HumanMessageCount": 4, "TotalMessageCount": 8,
+                    "AgentReplied": 1,
                     "WasForwarded": 0, "WebStoreName": "AHJ",
                 })
         self._cache = pd.DataFrame(rows)
@@ -175,7 +175,7 @@ def test_uneven_agent_volumes_still_reach_the_target(tmp_path, monkeypatch):
                         "ArchiveDateTimeUtc": moment.replace(tzinfo=None) + timedelta(minutes=5),
                         "StartDateTimeUtc": moment.replace(tzinfo=None),
                         "LastUpdatedUtc": moment.replace(tzinfo=None),
-                        "HumanMessageCount": 4, "TotalMessageCount": 8,
+                        "AgentReplied": 1,
                         "WasForwarded": 0, "WebStoreName": "AHJ",
                     })
             self._cache = pd.DataFrame(rows)

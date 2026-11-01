@@ -26,6 +26,7 @@ Connection: pyodbc with the access token via SQL_COPT_SS_ACCESS_TOKEN.
 import atexit
 import os
 import struct
+import tempfile
 import threading
 import time
 from typing import Optional
@@ -47,6 +48,7 @@ _MSAL_CACHE_PATH = os.environ.get(
     "MSAL_TOKEN_CACHE_PATH",
     os.path.join(os.path.expanduser("~"), ".andalusia_crm_cache.bin"),
 )
+_MSAL_CACHE_SEED_PATH = os.environ.get("MSAL_TOKEN_CACHE_SEED_PATH")
 # Enable the interactive (browser) flow on first run. Disable on the server.
 _ALLOW_INTERACTIVE = os.environ.get("CRM_ALLOW_INTERACTIVE", "1") != "0"
 
@@ -80,21 +82,38 @@ def _is_configured() -> bool:
 def _load_msal_cache(msal_mod):
     global _msal_atexit_registered
     cache = msal_mod.SerializableTokenCache()
-    try:
-        if os.path.exists(_MSAL_CACHE_PATH):
-            with open(_MSAL_CACHE_PATH, "r", encoding="utf-8") as f:
+    read_paths = [_MSAL_CACHE_PATH]
+    if _MSAL_CACHE_SEED_PATH and _MSAL_CACHE_SEED_PATH != _MSAL_CACHE_PATH:
+        read_paths.append(_MSAL_CACHE_SEED_PATH)
+    for cache_path in read_paths:
+        if not os.path.exists(cache_path):
+            continue
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
                 cache.deserialize(f.read())
-    except Exception as e:
-        print(f"[CRM] token cache unreadable ({e}); starting fresh")
+            break
+        except Exception as e:
+            print(f"[CRM] token cache unreadable at {cache_path} ({e})")
 
     def _persist():
         if cache.has_state_changed:
+            temporary_path = None
             try:
-                os.makedirs(os.path.dirname(_MSAL_CACHE_PATH) or ".", exist_ok=True)
-                with open(_MSAL_CACHE_PATH, "w", encoding="utf-8") as f:
+                cache_dir = os.path.dirname(_MSAL_CACHE_PATH) or "."
+                os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+                fd, temporary_path = tempfile.mkstemp(
+                    prefix=".andalusia_crm_cache.", dir=cache_dir
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(cache.serialize())
+                os.replace(temporary_path, _MSAL_CACHE_PATH)
             except Exception as e:
                 print(f"[CRM] could not persist token cache: {e}")
+                if temporary_path and os.path.exists(temporary_path):
+                    try:
+                        os.unlink(temporary_path)
+                    except OSError:
+                        pass
 
     # Register at most once per process. `_load_msal_cache` is called from
     # `_get_token` on every token refresh; without the guard each call queues

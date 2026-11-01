@@ -1376,7 +1376,17 @@ def test_bu_match_helper_rejects_partial_bu_strings():
     """Item 8: comparison is exact, never substring/fuzzy — "MK" must not
     match "MKR" in either direction."""
     assert _match_doctor_business_unit("MK", {"cr301_businessunitname": "MKR", "cr18c_buname": "ADC"}) is None
-    assert _match_doctor_business_unit("MKR", {"cr301_businessunitname": "MK", "cr18c_buname": "ADC"}) is None
+    assert _match_doctor_business_unit("MKR", {"cr301_businessunitname": "MK", "cr18c_buname": "AKW"}) is None
+
+
+def test_bu_match_helper_treats_makarona_codes_as_same_branch():
+    """MKR, ADC and JDC are the same Makarona business unit — a claim of
+    any one of them must match a CRM record carrying another."""
+    for claimed in ("MKR", "ADC", "JDC"):
+        for crm in ("MKR", "ADC", "JDC"):
+            record = {"cr301_businessunitname": None, "cr18c_buname": crm}
+            assert _match_doctor_business_unit(claimed, record) == "cr18c_buname"
+    assert _match_doctor_business_unit("MKR", {"cr18c_buname": "AKW"}) is None
 
 
 def test_observed_scenario_bu_claim_passes_while_degree_still_fails():
@@ -1405,6 +1415,26 @@ def test_observed_scenario_bu_claim_passes_while_degree_still_fails():
     assert result["validated_fields"]["degree"]["outcome"] == "FAIL"
     assert result["outcome"] == "FAIL"
     assert "bu_scoped" in (result.get("resolution_source") or "")
+
+
+def test_makarona_claim_passes_against_adc_only_crm_record():
+    """Reported false positive: the Agent said "مكرونة" (MKR) while the
+    doctor's CRM record carries ADC on both BU fields. MKR/ADC/JDC are the
+    same business unit, so the BU claim must PASS."""
+    doctor = {
+        **DOC_RAMI, "cr301_doctorkey": "700700105",
+        "servhub_doctornameen": "Asmaa Hamdy", "cr301_doctornamear": "اسماء حمدي",
+        "cr18c_buname": "ADC", "cr301_businessunitname": "ADC",
+    }
+    c = CallTranscript(
+        call_id="bu-makarona-adc", agent_name="Agent", Patient_Phone="501234567",
+        call_date="2026-10-18", call_duration_seconds=1, department="Scheduling",
+        business_unit="MKR", transcript="Agent: دكتورة اسماء حمدي في مكرونة",
+    )
+    result = validate_doctor_information(c, [doctor])
+    bu_field = result["validated_fields"]["business_unit"]
+    assert bu_field["outcome"] == "PASS"
+    assert bu_field["reference"] == "ADC"
 
 
 def test_multi_doctor_bu_claims_do_not_leak_between_doctors():

@@ -1,5 +1,6 @@
 """
-The agent roster.
+The agent roster: the chat agents in CM, not DWH.AI.Agents (see
+fetch_active_agents for why).
 
 There is no shift or working-period model. Sampling covers every active agent
 across the whole reporting day, which is what the architecture asks for —
@@ -27,35 +28,45 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def fetch_active_agents(dwh_engine) -> list[dict]:
+def fetch_active_agents(cm_handler, *, day_start_utc, lookback_days: int) -> list[dict]:
     """
-    Active human agents from DWH.AI.Agents. Read-only.
+    The chat agents to plan a reporting day for, taken from CM itself.
 
-    Takes the **DWH** engine, not the CM handler. The two live on different
-    servers (CM_DWH is reached from the CM connection through a linked server;
-    AI.Agents is on the DWH instance), and querying the agents table over the
-    CM connection would depend on a linked server that may not exist.
+    The roster is everyone who owned — and replied in — a conversation closed
+    during the ``lookback_days`` before ``day_start_utc``. The window ends where
+    the reporting day begins, so the roster is fixed before the day starts and
+    is not shaped by that day's traffic.
 
-    Agent_Email_Password is deliberately not selected. The automation has no
-    use for it and it should not travel through this process.
+    WHY NOT DWH.AI.Agents
+    ─────────────────────
+    It is not the list of people who work in CM. On 2026-10-17 only 3 of the
+    18 inbox owners were in it, and the busiest CM agents were missing
+    entirely; planning against it gave quota to 46 people, 43 of whom had no
+    chats, and the day finished at 12 of 300. The manual dashboard already
+    takes its agent list from CM (CM_users.sql), and NEWFIX attributes a chat
+    to its inbox owner, so the roster comes from the same source.
+
+    An agent with no closed conversations in the look-back window — a new
+    starter, or someone back from leave — is not on that day's roster and gets
+    no quota until the next day's plan picks them up.
     """
-    from sqlalchemy import text as sa_text
+    from datetime import timedelta
 
-    query = sa_text(
-        "SELECT Agent_id, Agent_Name, Department, is_Active, "
-        "       Agent_Email_Address, Level, Supervisor_Name "
-        "  FROM [DWH].[AI].[Agents] "
-        " WHERE is_Active = 1 AND Agent_Email_Address IS NOT NULL "
-        " ORDER BY Agent_Email_Address"
+    from app.CM.candidate_queries import fetch_cm_roster
+
+    frame = fetch_cm_roster(
+        cm_handler, day_start_utc - timedelta(days=lookback_days), day_start_utc,
     )
-    with dwh_engine.connect() as conn:
-        agents = [dict(row._mapping) for row in conn.execute(query)]
+    agents = frame.to_dict(orient="records") if not frame.empty else []
 
-    logger.info("fetch_active_agents | %d active agent(s)", len(agents))
+    logger.info(
+        "fetch_active_agents | %d CM agent(s) handled chats in the %d day(s) before %s",
+        len(agents), lookback_days, day_start_utc.isoformat(),
+    )
     if not agents:
         logger.error(
-            "fetch_active_agents | DWH.AI.Agents returned no active agents. "
-            "Planning cannot allocate quota against an empty roster."
+            "fetch_active_agents | no CM agent closed a conversation in the "
+            "look-back window. Planning cannot allocate quota against an empty roster."
         )
     return agents
 

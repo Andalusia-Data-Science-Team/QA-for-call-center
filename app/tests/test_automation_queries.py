@@ -40,48 +40,105 @@ def sql_code(name: str) -> str:
 
 # ── The SQL itself ───────────────────────────────────────────────────────────
 
-def test_candidate_sql_has_no_top_clause():
-    """The TOP (10) in NEWFIX_CM_Chat_Search.sql is why automation needs its own."""
-    sql = sql_code("day_candidates.sql").upper()
-    assert "TOP (10)" not in sql
-    # OUTER APPLY ... TOP (1) is a per-conversation lookup, not a result cap.
-    assert "SELECT TOP" not in sql.replace("SELECT TOP (1)", "")
+NEWFIX = SQL_DIR.parent / "NEWFIX_CM_Chat_Search.sql"
 
 
-def test_candidate_sql_attributes_by_last_human_message_not_inbox_owner():
-    sql = sql_code("day_candidates.sql")
-    assert "p.Discriminator = 'User'" in sql
-    assert "ORDER BY m.CreationDateTime DESC" in sql
-    # The inbox owner is returned for comparison, but not used to attribute.
-    assert "InboxOwnerEmail" in sql
-    assert "lastHuman.AgentEmail" in sql
+def _normalise(sql: str) -> str:
+    return " ".join(sql.split())
 
 
-def test_candidate_sql_applies_no_fixed_timezone_offset():
-    """A hard-coded +3 is wrong for Africa/Cairo for half the year."""
-    assert "DATEADD(HOUR, 3," not in sql_code("day_candidates.sql")
-    assert "DATEADD(HOUR, 3," not in sql_code("transcripts_by_ids.sql")
+def test_transcript_query_is_newfix_with_only_the_selection_changed():
+    """
+    The automation copy must build the same transcript the manual dashboard
+    builds. Everything from TopConversations' consumer onwards — the message
+    joins, the column list, the DATEADD presentation — must match NEWFIX,
+    apart from the added MessageId column and its ORDER BY key.
+    """
+    ours = _normalise(sql_code("automation_chat_by_ids.sql"))
+    theirs = _normalise(_COMMENT_LINE.sub("", _COMMENT_BLOCK.sub("", NEWFIX.read_text())))
+
+    def tail(sql):
+        return sql[sql.index("SELECT tc.*"):]
+
+    expected = tail(theirs).replace(
+        "m.SenderWasOwner,", "m.UniqueId AS MessageId, m.SenderWasOwner,", 1
+    ).replace("tc.UniqueId, m.CreationDateTime;", "tc.UniqueId, m.CreationDateTime, m.UniqueId;")
+    assert tail(ours) == expected
+
+    # The ConvSummary CTE is NEWFIX's too, up to its WHERE clause.
+    def conv_summary_head(sql):
+        return sql[sql.index("WITH ConvSummary AS"):sql.index("WHERE", sql.index("WITH ConvSummary AS"))]
+    assert conv_summary_head(ours) == conv_summary_head(theirs)
 
 
-def test_transcript_sql_deduplicates_messages():
-    sql = sql_code("transcripts_by_ids.sql")
-    assert "ROW_NUMBER() OVER" in sql
-    assert "PARTITION BY m.Conversation_UniqueId, m.UniqueId" in sql
-    assert "d.rn = 1" in sql
+def test_transcript_query_selects_by_id_list_without_a_top():
+    sql = sql_code("automation_chat_by_ids.sql")
+    assert "c.UniqueId IN ({id_placeholders})" in sql
+    assert sql.count("{id_placeholders}") == 1
+    assert "TOP (10" not in sql and "TOP (100)" not in sql
+    assert ":AgentEmail" not in sql and "@FilterDate" not in sql
 
 
-def test_transcript_sql_orders_deterministically():
-    """Equal timestamps must not leave message order to chance."""
-    sql = sql_code("transcripts_by_ids.sql")
-    assert "ORDER BY\n    t.UniqueId,\n    d.CreationDateTime,\n    d.MessageId" in sql
+def test_newfix_itself_is_untouched_by_the_automation():
+    """The dashboard's query keeps its own filters; the automation never edits it."""
+    sql = NEWFIX.read_text()
+    assert ":AgentEmail" in sql and "@FilterDate" in sql
+    assert "{id_placeholders}" not in sql
 
 
-def test_transcript_sql_uses_a_placeholder_token_not_interpolated_values():
-    raw = (SQL_DIR / "transcripts_by_ids.sql").read_text()
-    # Exactly two, both in executable SQL — one per CTE. A third occurrence in
-    # a comment would also be substituted, which is harmless but misleading.
-    assert raw.count("{id_placeholders}") == 2
-    assert sql_code("transcripts_by_ids.sql").count("{id_placeholders}") == 2
+def test_candidate_query_attributes_by_inbox_owner_like_newfix():
+    sql = _normalise(sql_code("automation_day_conversations.sql"))
+    assert "c.InboxOwnerPersonUniqueId = owner.UniqueId" in sql
+    assert "owner.UserEmailAddress AS AgentEmail" in sql
+
+
+def test_candidate_query_windows_on_archive_time_with_two_bound_values():
+    """
+    Archive time, so every candidate is already closed when its interval is
+    snapshotted. Direct column predicates, so the linked server filters first.
+    """
+    sql = sql_code("automation_day_conversations.sql")
+    assert "c.ArchiveDateTime >= ?" in sql
+    assert "c.ArchiveDateTime < ?" in sql
+    assert sql.count("?") == 2
+
+
+def test_candidate_query_has_no_correlated_apply_and_no_top():
+    """Row-by-row OUTER APPLYs over the linked server timed out in production."""
+    sql = sql_code("automation_day_conversations.sql").upper()
+    assert "APPLY" not in sql
+    assert "TOP" not in sql
+
+
+def test_candidate_query_reports_whether_the_agent_replied():
+    sql = sql_code("automation_day_conversations.sql")
+    assert "m.SenderWasOwner = 1" in sql
+    assert "AS AgentReplied" in sql
+
+
+def test_automation_window_queries_apply_no_fixed_timezone_offset():
+    """
+    Window bounds come from calendar.py, which handles Cairo's DST. A fixed
+    +3 in a filter would be wrong for half the year.
+    """
+    for name in ("automation_day_conversations.sql", "automation_active_agents.sql"):
+        assert "DATEADD" not in sql_code(name).upper(), name
+
+
+def test_roster_query_reads_cm_inbox_owners_not_dwh_agents():
+    sql = sql_code("automation_active_agents.sql")
+    assert "[DWH].[AI].[Agents]" not in sql
+    assert "c.InboxOwnerPersonUniqueId = owner.UniqueId" in sql
+    assert "AS Agent_Email_Address" in sql
+    assert sql.count("?") == 2
+
+
+def test_no_question_marks_hide_in_comments():
+    """ODBC drivers can mistake a '?' in a comment for a parameter marker."""
+    for name in ("automation_day_conversations.sql", "automation_active_agents.sql",
+                 "automation_chat_by_ids.sql"):
+        raw = (SQL_DIR / name).read_text()
+        assert raw.count("?") == sql_code(name).count("?"), name
 
 
 # ── Binding ──────────────────────────────────────────────────────────────────
@@ -112,17 +169,17 @@ def test_ids_are_passed_as_bound_parameters(recorder, monkeypatch):
     cq.fetch_transcripts_by_ids(recorder, ids)
 
     sql, params = recorder.calls[0]
-    # Each id is bound twice (once per CTE) and appears nowhere in the text.
-    assert params == ids + ids
+    # Each id is bound once and appears nowhere in the text.
+    assert params == ids
     for cid in ids:
         assert cid not in sql
-    assert sql.count("?") == len(ids) * 2
+    assert sql.count("?") == len(ids)
 
 
 def test_placeholder_count_matches_the_id_count(recorder):
     cq.fetch_transcripts_by_ids(recorder, ["a", "b", "c", "d", "e"])
     sql, params = recorder.calls[0]
-    assert len(params) == 10
+    assert len(params) == 5
     assert ", ".join("?" for _ in range(5)) in sql
 
 
@@ -141,7 +198,7 @@ def test_an_id_containing_sql_is_bound_not_interpolated(recorder):
 def test_long_id_lists_are_chunked(recorder):
     cq.fetch_transcripts_by_ids(recorder, [f"id-{i}" for i in range(450)], chunk_size=200)
     assert len(recorder.calls) == 3
-    assert [len(params) for _, params in recorder.calls] == [400, 400, 100]
+    assert [len(params) for _, params in recorder.calls] == [200, 200, 50]
 
 
 def test_empty_id_list_runs_no_query(recorder):
@@ -152,7 +209,7 @@ def test_empty_id_list_runs_no_query(recorder):
 def test_duplicate_ids_are_collapsed(recorder):
     cq.fetch_transcripts_by_ids(recorder, ["a", "a", "b"])
     _, params = recorder.calls[0]
-    assert params == ["a", "b", "a", "b"]
+    assert params == ["a", "b"]
 
 
 # ── Shortfall detection ──────────────────────────────────────────────────────
@@ -211,47 +268,77 @@ def test_empty_window_is_rejected(recorder):
         cq.fetch_day_candidates(recorder, moment, moment)
 
 
-def test_candidate_query_runs_on_remote_server_with_safe_utc_literals(recorder):
-    """The full candidate join must execute on CM_DWH, not over four-part names."""
+def test_candidate_window_is_bound_as_naive_utc(recorder):
+    """CM_DWH stores naive datetimes holding UTC."""
     cq.fetch_day_candidates(
         recorder,
         datetime(2026, 10, 29, 6, tzinfo=UTC),
         datetime(2026, 10, 29, 8, tzinfo=UTC),
     )
     sql, params = recorder.calls[0]
-    assert sql.startswith("SELECT * FROM OPENQUERY([CM_DWH], '")
-    assert "[CM_DWH].[msc_sub_35033_XYLJV]" not in sql
-    assert sql.count("2026-10-29T06:00:00.000000") == 2
-    assert sql.count("2026-10-29T08:00:00.000000") == 2
-    assert "''User''" in sql
-    assert "?" not in sql
-    assert params == []
+    assert params == [datetime(2026, 10, 29, 6), datetime(2026, 10, 29, 8)]
+    assert all(p.tzinfo is None for p in params)
+    assert sql.count("?") == len(params)
 
 
-def test_candidate_query_converts_aware_bounds_to_utc(recorder):
-    cairo = timezone(timedelta(hours=3))
+def test_candidate_window_converts_other_offsets_to_utc(recorder):
+    """A Cairo-summer (UTC+3) bound must reach the server as its UTC value."""
+    cairo_summer = timezone(timedelta(hours=3))
     cq.fetch_day_candidates(
         recorder,
-        datetime(2026, 10, 29, 9, tzinfo=cairo),
-        datetime(2026, 10, 29, 11, tzinfo=cairo),
+        datetime(2026, 10, 29, 9, tzinfo=cairo_summer),
+        datetime(2026, 10, 29, 11, tzinfo=cairo_summer),
     )
-    sql, _ = recorder.calls[0]
-    assert "2026-10-29T06:00:00.000000" in sql
-    assert "2026-10-29T08:00:00.000000" in sql
-    assert "2026-10-29T09:00:00.000000" not in sql
+    _, params = recorder.calls[0]
+    assert params == [datetime(2026, 10, 29, 6), datetime(2026, 10, 29, 8)]
 
 
-def test_candidate_query_is_driven_from_messages_not_conversations():
+def test_roster_lookback_is_bound_as_naive_utc(recorder):
+    cq.fetch_cm_roster(
+        recorder,
+        datetime(2026, 10, 4, 21, tzinfo=UTC),
+        datetime(2026, 10, 18, 21, tzinfo=UTC),
+    )
+    sql, params = recorder.calls[0]
+    assert params == [datetime(2026, 10, 4, 21), datetime(2026, 10, 18, 21)]
+    assert "Agent_Email_Address" in sql
+
+
+def test_roster_rejects_naive_and_empty_windows(recorder):
+    with pytest.raises(ValueError, match="tz-aware"):
+        cq.fetch_cm_roster(recorder, datetime(2026, 10, 4), datetime(2026, 10, 18, tzinfo=UTC))
+    moment = datetime(2026, 10, 18, tzinfo=UTC)
+    with pytest.raises(ValueError, match="Empty look-back"):
+        cq.fetch_cm_roster(recorder, moment, moment)
+
+
+# ── NEWFIX result quirks ─────────────────────────────────────────────────────
+
+def test_duplicate_webstorename_column_is_dropped(monkeypatch):
     """
-    The first version filtered on an OUTER APPLY's result, forcing evaluation
-    against every conversation in the warehouse. Over a linked server that
-    timed out and killed the connection — 179 intervals failed on the first
-    live run. The Touched CTE narrows by an indexed date column first.
+    NEWFIX selects tc.* and then tc.WebStoreName again. A duplicated label
+    makes df[col] return a DataFrame and breaks sanitising.
     """
-    sql = sql_code("day_candidates.sql")
-    assert "WITH Touched AS" in sql
-    assert sql.index("WITH Touched AS") < sql.index("FROM Touched t")
-    assert "m.CreationDateTime >= ?" in sql
+    frame = pd.DataFrame(
+        [["c1", "m1", "AHJ", "AHJ"]],
+        columns=["UniqueId", "MessageId", "WebStoreName", "WebStoreName"],
+    )
+    handler = RecordingHandler(frame)
+    monkeypatch.setattr(cq, "_execute", lambda h, sql, params: h._result)
+    df = cq.fetch_transcripts_by_ids(handler, ["c1"])
+    assert list(df.columns) == ["UniqueId", "MessageId", "WebStoreName"]
+
+
+def test_duplicated_message_rows_are_removed(monkeypatch):
+    frame = pd.DataFrame([
+        {"UniqueId": "c1", "MessageId": "m1", "Content": "hi"},
+        {"UniqueId": "c1", "MessageId": "m1", "Content": "hi"},
+        {"UniqueId": "c1", "MessageId": "m2", "Content": "bye"},
+    ])
+    handler = RecordingHandler(frame)
+    monkeypatch.setattr(cq, "_execute", lambda h, sql, params: h._result)
+    df = cq.fetch_transcripts_by_ids(handler, ["c1"])
+    assert list(df["MessageId"]) == ["m1", "m2"]
 
 
 # ── Sanitisation ─────────────────────────────────────────────────────────────

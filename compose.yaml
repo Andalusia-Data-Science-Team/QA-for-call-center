@@ -18,6 +18,12 @@ x-qa-base: &qa-base
     HOME: /tmp
     TZ: Africa/Cairo
     WATCHFILES_FORCE_POLLING: "true"
+    QA_AUTOMATION_ENABLED: "${QA_AUTOMATION_ENABLED:-true}"
+    QA_AUTOMATION_START_DATE: "${QA_AUTOMATION_START_DATE:-2026-10-25}"
+    QA_DAILY_TARGET: "${QA_DAILY_TARGET:-50}"
+    MSAL_TOKEN_CACHE_PATH: /workspace/data/.andalusia_crm_cache.bin
+    MSAL_TOKEN_CACHE_SEED_PATH: /tmp/.andalusia_crm_cache.bin
+    CRM_ALLOW_INTERACTIVE: "0"
   restart: unless-stopped
 
 services:

@@ -8,6 +8,7 @@ import re
 import struct
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,35 +17,54 @@ import httpx
 
 from app.config import settings
 from app.models.input import CallTranscript
+from app.services.text_helpers import normalize_arabic_text
 
 
 logger = logging.getLogger(__name__)
 _IDENTIFIER_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Business unit abbreviation equivalence mappings.
-# Different abbreviations for the same business unit are used interchangeably
-# in chat transcripts and CRM records.
-_BU_EQUIVALENCE_GROUPS = [
-    {"HJH", "AHJ"},
-    {"SNB", "AFW"},
-    {"CHT", "LCH", "ALW"},
-    {"MKR", "ADC", "JDC"},
-]
+# Business unit abbreviations. Different abbreviations for the same branch
+# are used interchangeably in chat transcripts and CRM records; each maps to
+# the one code that branch is evaluated as.
+LEAD_BU_CODE: dict[str, str] = {
+    "AHJ": "HJH", "HJH": "HJH",
+    "SNB": "AFW", "AFW": "AFW",
+    "CHT": "ALW", "LCH": "ALW", "ALW": "ALW",
+    "MKR": "ADC", "JDC": "ADC", "ADC": "ADC",
+    "AKW": "AKW",
+}
+
+
+def lead_clinic_bu(record: dict[str, Any]) -> tuple[Any, str]:
+    """The lead's branch to evaluate, and the field it came from: new_clinicbu,
+    or new_sourcebusinessunitname only when new_clinicbu is empty."""
+    clinic = record.get("new_clinicbu")
+    if str(clinic or "").strip():
+        return clinic, "new_clinicbu"
+    source = record.get("new_sourcebusinessunitname")
+    if str(source or "").strip():
+        return source, "new_sourcebusinessunitname"
+    return clinic, "new_clinicbu"
+
+
+def lead_bu_code(bu: str | None) -> str | None:
+    """The branch code *bu* is evaluated as ("BU-MKR" → "ADC"), or None when
+    it is empty or not a known code (e.g. a full branch name)."""
+    if not bu:
+        return None
+    code = str(bu).strip().upper().removeprefix("BU-").strip()
+    return LEAD_BU_CODE.get(code)
 
 
 def normalize_business_unit(bu: str | None) -> str:
     """Normalize a business unit abbreviation to a canonical form for comparison.
 
-    Returns the first (alphabetically sorted) abbreviation from the equivalence
-    group, or the uppercased input if no mapping exists.
+    Returns the branch code from LEAD_BU_CODE, or the uppercased input if no
+    mapping exists.
     """
     if not bu:
         return ""
-    normalized = str(bu).strip().upper()
-    for group in _BU_EQUIVALENCE_GROUPS:
-        if normalized in group:
-            return sorted(group)[0]
-    return normalized
+    return lead_bu_code(bu) or str(bu).strip().upper()
 
 
 def _quoted_table_name(raw_table: str) -> str:
@@ -60,7 +80,9 @@ def _quoted_table_name(raw_table: str) -> str:
 
 
 _SAUDI_NATIONAL_RE = re.compile(r"^5\d{8}$")
-_PLACEHOLDER_NATIONAL = "0555555550"
+# CRM saves every non-Saudi patient with mobilephone 0555555550 and types the
+# real number into new_notes.
+_PLACEHOLDER_NATIONAL = "555555550"
 
 
 def _is_saudi_national(national: str) -> bool:
@@ -74,9 +96,9 @@ def _phone_values(phone: str) -> tuple[dict[str, str], bool]:
     Returns a tuple of (phone_dict, is_non_saudi).
 
     If the supplied phone cannot be normalised to a 9-digit Saudi national
-    number (e.g. a foreign number like +49…) the mobilephone lookup is
-    performed with a placeholder that will never match, and is_non_saudi is
-    set to True so the caller can trigger a fallback search via new_notes.
+    number (e.g. a foreign number like +20…), it is parsed into the CRM
+    placeholder 0555555550 and is_non_saudi is set to True; the caller then
+    narrows the placeholder leads by the real number in new_notes.
     """
     digits = re.sub(r"\D", "", str(phone or ""))
     if digits.startswith("966"):
@@ -90,8 +112,7 @@ def _phone_values(phone: str) -> tuple[dict[str, str], bool]:
     if is_non_saudi:
         logger.warning(
             "Phone '%s' is not a recognised Saudi number; "
-            "using placeholder %s for mobilephone lookup, "
-            "will fall back to new_notes search.",
+            "looking up the placeholder mobilephone 0%s, filtered by new_notes.",
             phone,
             _PLACEHOLDER_NATIONAL,
         )
@@ -108,33 +129,20 @@ def _phone_values(phone: str) -> tuple[dict[str, str], bool]:
     )
 
 
-def _notes_phone_variants(phone: str) -> list[str]:
-    """Return the distinct digit-normalised representations of a phone for
-    a new_notes LIKE search (raw digits, with leading +, with spaces stripped).
-
-    These are used as ``%<variant>%`` patterns so the search matches however
-    the operator pasted the number into the notes field.
-    """
-    raw = str(phone or "").strip()
-    digits_only = re.sub(r"\D", "", raw)
-    variants: list[str] = []
-    # Add the original string as typed (e.g. "+4917612345678")
-    if raw:
-        variants.append(raw)
-    # Add the pure-digit form (e.g. "4917612345678")
-    if digits_only and digits_only != raw:
-        variants.append(digits_only)
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique: list[str] = []
-    for v in variants:
-        if v not in seen:
-            seen.add(v)
-            unique.append(v)
-    return unique
+def notes_phone_pattern(phone: str) -> str:
+    """The patient's number as it is typed into new_notes: "+" and its digits
+    ("201001234567", "+201001234567" and "00201001234567" → "+201001234567")."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    return "+" + (digits[2:] if digits.startswith("00") else digits)
 
 
-def _load_query() -> str:
+def notes_contain_phone(notes: Any, phone: str) -> bool:
+    """True when free-text *notes* contain the patient's "+" number — the same
+    test as the query's new_notes LIKE '%+<digits>%'."""
+    return notes_phone_pattern(phone) in str(notes or "")
+
+
+def _load_query(non_saudi: bool = False) -> str:
     sql_path = Path(__file__).resolve().parent.parent / "SQL" / "CRM_leads.sql"
     query = sql_path.read_text(encoding="utf-8")
     table = _quoted_table_name(settings.CRM_LEADS_TABLE)
@@ -142,35 +150,12 @@ def _load_query() -> str:
     # Accept the phone formats used by both chat retrieval and Dynamics.
     query = query.replace(
         "mobilephone = :mobile_number",
-        "mobilephone IN (:mobile_number, :local_number, :intl_number, :plus_intl_number)",
+        "mobilephone IN (:mobile_number, :local_number, :intl_number, :plus_intl_number)"
+        # Non-Saudi patients share the placeholder 0555555550; their real
+        # number, written "+<digits>", is in new_notes.
+        + (" AND new_notes LIKE :notes_phone" if non_saudi else ""),
     )
     return query
-
-
-def _load_notes_query(variants: list[str]) -> tuple[str, dict]:
-    """Build a SQL query that searches new_notes for any of the phone variants.
-
-    Returns (query_string, params_dict) ready for
-    ``_run_crm_leads_query_with_retry``.
-    """
-    sql_path = Path(__file__).resolve().parent.parent / "SQL" / "CRM_leads.sql"
-    query = sql_path.read_text(encoding="utf-8")
-    table = _quoted_table_name(settings.CRM_LEADS_TABLE)
-    query = query.replace("[dbo].[lead]", table)
-
-    # Replace the mobilephone filter with OR-ed new_notes LIKE conditions.
-    like_clauses = " OR ".join(
-        f"new_notes LIKE :notes_phone_{i}" for i in range(len(variants))
-    )
-    query = query.replace(
-        "mobilephone = :mobile_number",
-        f"({like_clauses})",
-    )
-    # Remove the four mobilephone params from the IN(...) replacement that
-    # _load_query() does — this query never went through that substitution, so
-    # we only need the notes params.
-    params: dict = {f"notes_phone_{i}": f"%{v}%" for i, v in enumerate(variants)}
-    return query, params
 
 
 # CRM Leads uses a confidential Azure application (client credentials).
@@ -460,7 +445,6 @@ def _normalize_web_api_lead(record: dict[str, Any]) -> dict[str, Any]:
     normalized["new_clinicbu"] = (
         record.get("new_clinicbu")
         or _display_value(record, "new_clinicbu")
-        #or _display_value(record, "new_sourcebusinessunit")
     )
     normalized["new_doctor"] = _display_value(record, "new_doctor")
     normalized["new_lastcallresult"] = _display_value(record, "new_lastcallresult")
@@ -471,6 +455,18 @@ def _normalize_web_api_lead(record: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _saudi_day_utc_filter(report_date: str) -> str:
+    """OData createdon bounds (UTC) for the Saudi (UTC+3) calendar day
+    *report_date*: 21:00Z the day before up to 21:00Z on the day."""
+    day = datetime.strptime(report_date, "%Y-%m-%d")
+    start = day - timedelta(hours=3)
+    end = start + timedelta(days=1)
+    return (
+        f"createdon ge {start:%Y-%m-%dT%H:%M:%SZ} and "
+        f"createdon lt {end:%Y-%m-%dT%H:%M:%SZ}"
+    )
+
+
 def _fetch_crm_leads_web_api_once(
     phone: str,
     report_date: str,
@@ -478,7 +474,7 @@ def _fetch_crm_leads_web_api_once(
 ) -> list[dict]:
     """Fetch matching leads through Dataverse Web API using the app token."""
     token = _get_crm_leads_access_token(force_refresh=force_token_refresh)
-    phone_dict, _ = _phone_values(phone)
+    phone_dict, is_non_saudi = _phone_values(phone)
     phone_clause = " or ".join(
         f"mobilephone eq '{_odata_escape(value)}'"
         for value in dict.fromkeys(phone_dict.values())
@@ -486,6 +482,12 @@ def _fetch_crm_leads_web_api_once(
     )
     if not phone_clause:
         return []
+    if is_non_saudi:
+        # Same as the SQL path's new_notes LIKE '%+<digits>%'.
+        phone_clause = (
+            f"({phone_clause}) and "
+            f"contains(new_notes,'{_odata_escape(notes_phone_pattern(phone))}')"
+        )
 
     url = (
         f"https://{_crm_leads_host()}/api/data/v9.2/"
@@ -502,8 +504,7 @@ def _fetch_crm_leads_web_api_once(
         },
         params={
             "$" + "filter": (
-                f"({phone_clause}) and createdon ge "
-                f"{report_date}T00:00:00Z"
+                f"({phone_clause}) and {_saudi_day_utc_filter(report_date)}"
             ),
             "$" + "orderby": "createdon desc",
             "$" + "top": "100",
@@ -565,97 +566,51 @@ def _fetch_crm_leads_web_api_with_retry(
     return []
 
 
-def _fetch_by_notes(
+# Lead fields that name the agent who handled it, in priority order.
+_LEAD_AGENT_FIELDS = ("modifiedbyname", "new_lastcallcreatedbyname")
+
+
+def same_agent_name(a: Any, b: Any) -> bool:
+    """True when two agent names are the same person, ignoring case, spacing
+    and Arabic letter variants. A shorter multi-word name matches a longer
+    one that contains all its words ("Maha Gamal" ~ "Maha Gamal Ahmed")."""
+    left, right = normalize_arabic_text(str(a or "")).split(), normalize_arabic_text(str(b or "")).split()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    short, long_ = sorted((left, right), key=len)
+    return len(short) >= 2 and set(short) <= set(long_)
+
+
+def select_lead_for_agents(
+    rows: list[dict[str, Any]],
+    agent_names: list[str],
+) -> tuple[dict[str, Any], str | None]:
+    """The first lead (newest first, as every lookup sorts) whose agent fields
+    name one of the chat's agents, with that agent's name; otherwise the
+    newest lead and None.
+    A transferred chat has several agents, and the lead names only the one
+    who recorded it — that is the agent the lead is evaluated against."""
+    for record in rows:
+        for field in _LEAD_AGENT_FIELDS:
+            for agent in agent_names:
+                if same_agent_name(record.get(field), agent):
+                    return record, agent
+    return rows[0], None
+
+
+def fetch_crm_lead(
     phone: str,
     report_date: str,
-) -> list[dict]:
-    """Secondary lookup: search new_notes LIKE for non-Saudi phone variants.
+    agent_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fetch the WhatsApp lead for the chat phone on/after report_date.
 
-    Tries TDS first; falls back to Web API OData filter on new_notes.
+    Among the qualifying leads, the one that names a chat agent (any of
+    *agent_names*) is selected and that agent is returned as ``agent_name``.
     """
-    variants = _notes_phone_variants(phone)
-    if not variants:
-        return []
-
-    logger.info(
-        "CRM Leads new_notes fallback | phone=%s variants=%s report_date=%s",
-        phone,
-        variants,
-        report_date,
-    )
-
-    # --- TDS path ---
-    try:
-        notes_query, notes_params = _load_notes_query(variants)
-        notes_params["Report_Date"] = report_date
-        return _run_crm_leads_query_with_retry(notes_query, params=notes_params)
-    except Exception as tds_exc:
-        logger.warning(
-            "CRM Leads new_notes TDS query failed; trying Web API | error=%s",
-            tds_exc,
-        )
-
-    # --- Web API path ---
-    try:
-        token = _get_crm_leads_access_token()
-        notes_filter = " or ".join(
-            f"contains(new_notes,'{_odata_escape(v)}')"
-            for v in variants
-        )
-        url = (
-            f"https://{_crm_leads_host()}/api/data/v9.2/"
-            f"{_dataverse_leads_entity_set()}"
-        )
-        response = httpx.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "OData-MaxVersion": "4.0",
-                "OData-Version": "4.0",
-                "Prefer": 'odata.include-annotations="OData.Community.Display.V1.FormattedValue"',
-            },
-            params={
-                "$" + "filter": (
-                    f"({notes_filter}) and createdon ge "
-                    f"{report_date}T00:00:00Z"
-                ),
-                "$" + "orderby": "createdon ASC",
-                "$" + "top": "100",
-            },
-            timeout=120.0,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"CRM Leads Web API notes query failed with HTTP {response.status_code}"
-            )
-        records = [
-            _normalize_web_api_lead(item)
-            for item in response.json().get("value", [])
-        ]
-        eligible: list[dict] = []
-        for record in records:
-            source = str(record.get("leadsourcecodename") or "").casefold()
-            status = str(record.get("statuscodename") or "").casefold()
-            created_by = str(record.get("new_lastcallcreatedbyname") or "").casefold()
-            if source and source != "whatsapp":
-                continue
-            if status == "untouched":
-                continue
-            if created_by == "andalusia sharepoint":
-                continue
-            eligible.append(record)
-        return eligible
-    except Exception as web_exc:
-        logger.error(
-            "CRM Leads new_notes Web API fallback also failed | error=%s",
-            web_exc,
-        )
-        return []
-
-
-def fetch_crm_lead(phone: str, report_date: str) -> dict[str, Any]:
-    """Fetch the newest WhatsApp lead for the chat phone on/after report_date."""
+    agent_names = [n for n in (agent_names or []) if n]
     logger.info(
         "CRM Leads lookup starting | phone=%s report_date=%s",
         phone,
@@ -670,9 +625,11 @@ def fetch_crm_lead(phone: str, report_date: str) -> dict[str, Any]:
 
     phone_dict, is_non_saudi = _phone_values(phone)
     params = {**phone_dict, "Report_Date": report_date}
+    if is_non_saudi:
+        params["notes_phone"] = f"%{notes_phone_pattern(phone)}%"
     try:
         rows = _run_crm_leads_query_with_retry(
-            _load_query(), params=params,
+            _load_query(non_saudi=is_non_saudi), params=params,
         )
     except Exception as tds_exc:
         logger.warning(
@@ -692,15 +649,16 @@ def fetch_crm_lead(phone: str, report_date: str) -> dict[str, Any]:
                 ),
             }
 
-    # For non-Saudi numbers the mobilephone lookup used a placeholder and will
-    # return nothing.  Retry using new_notes LIKE search with the real number.
-    if not rows and is_non_saudi:
+    # Non-Saudi: the query already kept only placeholder leads whose
+    # new_notes holds "+<digits>"; re-check in case a path returned others.
+    notes_phone_match: bool | None = None
+    if is_non_saudi:
+        rows = [r for r in rows if notes_contain_phone(r.get("new_notes"), phone)]
+        notes_phone_match = bool(rows)
         logger.info(
-            "CRM Leads mobilephone lookup empty for non-Saudi phone; "
-            "retrying via new_notes | phone=%s",
-            phone,
+            "CRM Leads non-Saudi lookup | phone=%s new_notes LIKE '%%%s%%' leads=%d",
+            phone, notes_phone_pattern(phone), len(rows),
         )
-        rows = _fetch_by_notes(phone, report_date)
 
     if not rows:
         logger.info(
@@ -711,21 +669,36 @@ def fetch_crm_lead(phone: str, report_date: str) -> dict[str, Any]:
         return {
             "status": "not_found",
             "record": None,
-            "message": "No qualifying WhatsApp CRM lead matched the chat phone and report date.",
+            "message": (
+                "No qualifying WhatsApp CRM lead has the patient's non-Saudi number in new_notes."
+                if is_non_saudi
+                else "No qualifying WhatsApp CRM lead matched the chat phone and report date."
+            ),
         }
-    record = rows[0]
+    record, matched_agent = select_lead_for_agents(rows, agent_names)
     logger.info(
         "CRM Leads lookup result | phone=%s report_date=%s status=found "
-        "total_qualifying=%d record=%s",
+        "total_qualifying=%d chat_agents=%s matched_agent=%s record=%s",
         phone,
         report_date,
         len(rows),
+        agent_names,
+        matched_agent,
         json.dumps(record, ensure_ascii=False, default=str),
+    )
+    selection = (
+        f"lead naming chat agent {matched_agent} selected"
+        if matched_agent
+        else "no lead names a chat agent; newest selected"
     )
     return {
         "status": "found",
         "record": record,
-        "message": f"CRM lead found ({len(rows)} qualifying record(s); newest selected).",
+        "agent_name": matched_agent,
+        "chat_agents": agent_names,
+        "non_saudi": is_non_saudi,
+        "notes_phone_match": notes_phone_match,
+        "message": f"CRM lead found ({len(rows)} qualifying record(s); {selection}).",
     }
 
 
@@ -742,10 +715,11 @@ def matched_crm_lead_attributes(
         field = str(check.get("field") or "").strip()
         if not field:
             continue
+        value = lead_clinic_bu(crm_record)[0] if field == "new_clinicbu" else crm_record.get(field)
         matched.append(
             {
                 "field": field,
-                "crm_value": crm_record.get(field, check.get("actual")),
+                "crm_value": value if value not in (None, "") else check.get("actual"),
                 "call_insight": check.get("expected"),
             }
         )
@@ -765,7 +739,7 @@ def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
         normalized_flags.append(
             {
                 "type": "C2B",
-                "severity": "moderate",
+                "severity": "critical",
                 "description": description,
                 "transcript_excerpt": excerpt,
             }
@@ -787,7 +761,7 @@ def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
         normalized_flags.append(
             {
                 "type": "C2B",
-                "severity": "moderate",
+                "severity": "critical",
                 "description": f"CRM lead mismatch in {field}: {reason}",
                 "transcript_excerpt": "N/A",
             }
@@ -797,7 +771,7 @@ def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
         normalized_flags.append(
             {
                 "type": "C2B",
-                "severity": "moderate",
+                "severity": "critical",
                 "description": "CRM lead data does not match the authoritative chat facts.",
                 "transcript_excerpt": "N/A",
             }
@@ -805,6 +779,45 @@ def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
     data["crm_leads_flags"] = normalized_flags
     data["crm_lead_status"] = "violation" if normalized_flags else "match"
     return data
+
+
+def apply_notes_phone_check(
+    evaluation: dict[str, Any],
+    lookup: dict[str, Any],
+    phone: str,
+) -> dict[str, Any]:
+    """For a non-Saudi number, record whether the lead's new_notes holds the
+    patient's mobile number; a missing number is a C2B violation."""
+    if not lookup.get("non_saudi"):
+        return evaluation
+    notes = (lookup.get("record") or {}).get("new_notes")
+    matches = notes_contain_phone(notes, phone)
+    evaluation.setdefault("field_checks", []).append({
+        "field": "new_notes",
+        "expected": phone,
+        "actual": notes,
+        "matches": matches,
+        "reason": (
+            "new_notes contains the patient's non-Saudi mobile number."
+            if matches
+            else "new_notes does not contain the patient's non-Saudi mobile number."
+        ),
+    })
+    if not matches:
+        flags = evaluation.get("crm_leads_flags") or []
+        flags.insert(0, {
+            "type": "C2B",
+            "severity": "critical",
+            "description": (
+                f"CRM lead mismatch in new_notes: the patient's non-Saudi mobile "
+                f"number {phone} is not recorded in new_notes (mobilephone holds "
+                f"the placeholder 0{_PLACEHOLDER_NATIONAL})."
+            ),
+            "transcript_excerpt": "N/A",
+        })
+        evaluation["crm_leads_flags"] = flags[:4]
+        evaluation["crm_lead_status"] = "violation"
+    return evaluation
 
 
 def missing_lead_evaluation(message: str) -> dict[str, Any]:
@@ -818,7 +831,7 @@ def missing_lead_evaluation(message: str) -> dict[str, Any]:
         "crm_leads_flags": [
             {
                 "type": "C2B",
-                "severity": "moderate",
+                "severity": "critical",
                 "description": "CRM lead missing for the chat phone and selected report date.",
                 "transcript_excerpt": "N/A",
             }

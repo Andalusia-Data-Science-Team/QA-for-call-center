@@ -33,6 +33,64 @@
         }
         .header-nav-btn:hover { opacity: .9; transform: translateY(-2px); }
 
+        /* Supervisor link with pending badge — same as agents-dashboard.html */
+        .header-nav-btn.supervisor {
+            display: inline-flex; align-items: center; gap: 6px; margin-left: 8px;
+            background: linear-gradient(135deg, #e53e3e 0%, #c53030 100%);
+        }
+        .pending-badge {
+            display: inline-flex; align-items: center; justify-content: center;
+            background: white; color: #e53e3e;
+            font-size: .72rem; font-weight: 800;
+            border-radius: 50%; min-width: 20px; height: 20px; padding: 0 4px; line-height: 1;
+        }
+        .pending-badge:empty,
+        .pending-badge[data-count="0"] { display: none; }
+
+        /* ── Tabs ── */
+        .tabs {
+            display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap;
+        }
+        .tab-btn {
+            padding: 12px 24px; border-radius: 12px; border: none;
+            background: rgba(255,255,255,.25); color: white;
+            font-weight: 700; font-size: 1rem; cursor: pointer;
+            transition: background .2s, color .2s;
+        }
+        .tab-btn:hover:not(.active) { background: rgba(255,255,255,.4); }
+        .tab-btn.active { background: white; color: #4a3f8f; box-shadow: 0 6px 18px rgba(0,0,0,.15); }
+
+        .removed-tag {
+            display: inline-flex; align-items: center; gap: 5px;
+            padding: 6px 14px; border-radius: 8px;
+            background: #edf2f7; color: #4a5568;
+            font-size: .8rem; font-weight: 700;
+        }
+        .removed-tag.reviewed { background: #c6f6d5; color: #22543d; }
+
+        /* ── QA review comment (QA Reviews tab) ── */
+        .review-box {
+            margin-top: 12px; padding: 12px 14px; border-radius: 10px;
+            background: #f0fff4; border: 1.5px solid #9ae6b4;
+        }
+        .review-box-head {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 8px; flex-wrap: wrap; margin-bottom: 6px;
+        }
+        .review-box-label {
+            color: #22543d; font-size: .74rem; font-weight: 800;
+            text-transform: uppercase; letter-spacing: .4px;
+        }
+        .review-meta { display: flex; gap: 6px; flex-wrap: wrap; }
+        .review-chip {
+            background: white; color: #276749; border: 1px solid #c6f6d5;
+            padding: 2px 9px; border-radius: 10px; font-size: .75rem; font-weight: 600;
+        }
+        .review-comment {
+            color: #1c4532; line-height: 1.6; font-size: .92rem; white-space: pre-wrap;
+            unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere;
+        }
+
         /* ── Generic card ── */
         .card {
             background: white; padding: 25px; border-radius: 15px;
@@ -142,6 +200,100 @@
             margin-top: 8px; font-style: italic; color: #4a5568;
             border-left: 3px solid #cbd5e0; font-size: .9rem;
         }
+
+        /* ── Structured compliance flag (title, labelled fields, transcript) ──
+           Mixed Arabic/English text: every value gets its own direction. */
+        .flag-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 10px; }
+        .flag-title-text { font-weight: 700; color: #2d3748; font-size: .95rem; }
+        .flag-subject {
+            background: #edf2f7; color: #2d3748; padding: 3px 10px;
+            border-radius: 12px; font-size: .85rem; font-weight: 600;
+        }
+        .flag-text {
+            color: #2d3748; line-height: 1.6; font-size: .92rem;
+            unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere;
+        }
+        .flag-fields {
+            display: grid; grid-template-columns: max-content 1fr;
+            gap: 8px 14px; margin: 0 0 4px; align-items: baseline;
+        }
+        .flag-fields dt {
+            color: #718096; font-size: .74rem; font-weight: 700;
+            text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
+        }
+        .flag-fields dd {
+            margin: 0; color: #2d3748; line-height: 1.6; font-size: .92rem;
+            unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere;
+        }
+        .flag-fields dd.flag-crm { font-weight: 700; }
+        .flag-clamp {
+            display: -webkit-box; -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3; overflow: hidden;
+        }
+        .flag-more {
+            background: none; border: none; padding: 0; margin-top: 2px;
+            color: #667eea; font-size: .8rem; font-weight: 700; cursor: pointer;
+        }
+        .flag-excerpt { font-style: normal; display: flex; flex-direction: column; gap: 6px; }
+        .flag-excerpt-label {
+            color: #718096; font-size: .72rem; font-weight: 700;
+            text-transform: uppercase; letter-spacing: .4px;
+        }
+        .flag-line { display: flex; gap: 8px; align-items: baseline; }
+        .flag-line-text { flex: 1; line-height: 1.6; unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere; }
+        .flag-speaker {
+            flex-shrink: 0; padding: 2px 9px; border-radius: 10px;
+            font-size: .72rem; font-weight: 700; font-style: normal;
+        }
+        .flag-speaker-agent   { background: #e9e8fd; color: #4c51bf; }
+        .flag-speaker-patient { background: #e6fffa; color: #234e52; }
+        @media (max-width: 600px) {
+            .flag-fields { grid-template-columns: 1fr; gap: 2px; }
+            .flag-fields dd { margin-bottom: 8px; }
+        }
+
+        /* ── Escalate button — same as agents-dashboard.html ── */
+        .compliance-item.escalated-item { border-color: #fed7d7; background: #fff5f5; }
+        /* QA Reviews tab: the violation the supervisor reviewed */
+        .compliance-item.reviewed-item {
+            border-color: #68d391; background: #f0fff4;
+            box-shadow: 0 0 0 3px rgba(72,187,120,.18);
+        }
+        .reviewed-flag-badge {
+            margin-left: auto; padding: 4px 11px; border-radius: 15px;
+            background: #38a169; color: white; font-size: .78rem; font-weight: 700;
+        }
+        .reviewed-count {
+            background: #c6f6d5; color: #22543d; padding: 3px 12px;
+            border-radius: 12px; font-weight: 700; font-size: .85rem;
+        }
+        .compliance-footer { display: flex; justify-content: flex-end; margin-top: 10px; }
+        .escalate-btn {
+            display: inline-flex; align-items: center; gap: 5px;
+            padding: 6px 14px; border: 1.5px solid #e53e3e; border-radius: 8px;
+            background: white; color: #e53e3e;
+            font-size: .8rem; font-weight: 700; cursor: pointer;
+            transition: background .15s, color .15s, transform .1s;
+        }
+        .escalate-btn:hover:not(.done) { background: #e53e3e; color: white; transform: translateY(-1px); }
+        .escalate-btn.done { border-color: #38a169; color: #38a169; cursor: default; }
+
+        /* ── Toast ── */
+        .toast {
+            position: fixed; bottom: 28px; right: 28px;
+            background: #2d3748; color: white;
+            padding: 14px 20px; border-radius: 10px;
+            font-size: .9rem; font-weight: 600;
+            box-shadow: 0 8px 24px rgba(0,0,0,.3);
+            display: flex; align-items: center; gap: 10px;
+            transform: translateY(80px); opacity: 0;
+            transition: transform .3s ease, opacity .3s ease;
+            z-index: 1000; max-width: 360px;
+        }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.success { border-left: 4px solid #48bb78; }
+        .toast.error   { border-left: 4px solid #f56565; }
+        .toast a { color: #90cdf4; text-decoration: underline; cursor: pointer; white-space: nowrap; }
     </style>
 </head>
 <body>
@@ -151,6 +303,17 @@
         <h1>📋 Call QA Results Dashboard</h1>
         <p>Browse &amp; filter stored QA results from [DWH].[AI].[Call_QA_Results]</p>
         <a href="/qa-dashboard" class="header-nav-btn">👥 Agents QA Dashboard</a>
+        <a href="/qa-supervisor" class="header-nav-btn supervisor" id="supervisorLink">
+            🔍 QA Supervisor
+            <span class="pending-badge" id="pendingBadge"></span>
+        </a>
+    </div>
+
+    <!-- ── Tabs ── -->
+    <div class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="all" role="tab" aria-selected="true">📋 All Results</button>
+        <button class="tab-btn" data-tab="removed" role="tab" aria-selected="false">🗑 Removed Errors</button>
+        <button class="tab-btn" data-tab="reviews" role="tab" aria-selected="false">📝 QA Reviews</button>
     </div>
 
     <!-- ── Filter form ── -->
@@ -190,6 +353,14 @@
                     <option value="D">D</option>
                 </select>
             </div>
+            <div class="form-group">
+                <label for="limit">Max Records</label>
+                <select id="limit">
+                    <option value="200" selected>200</option>
+                    <option value="500">500</option>
+                    <option value="1000">1000</option>
+                </select>
+            </div>
             <button class="run-btn" id="runBtn">▶ Apply Filters</button>
             <button class="clear-btn" id="clearBtn">✖ Clear</button>
         </div>
@@ -205,15 +376,32 @@
             <div class="performance-metrics" id="summaryMetrics"></div>
         </div>
         <div class="card">
-            <div class="card-header"><h2 class="card-title">📞 Call Records</h2></div>
+            <div class="card-header"><h2 class="card-title" id="recordsTitle">📞 Call Records</h2></div>
             <div id="callRecordsList"></div>
         </div>
     </div>
 
 </div>
 
+<!-- ── Toast notification ── -->
+<div class="toast" id="toast"></div>
+
 <script>
 const API_BASE = '';
+
+/* ── Store last results for escalation references ── */
+let _lastResults = [];
+
+/* ── Tabs ──
+   all:     every row not removed by the supervisor
+   removed: rows with Removed_Error = 1
+   reviews: rows with QA_Reviewed = 1 and a QA_Review_Comment */
+const TABS = {
+    all:     { title: '📞 Call Records',  empty: 'No records match the selected filters.',       param: null },
+    removed: { title: '🗑 Removed Errors', empty: 'No removed errors match the selected filters.', param: 'removed_error' },
+    reviews: { title: '📝 QA Reviews',     empty: 'No QA reviews match the selected filters.',     param: 'qa_reviewed' },
+};
+let _activeTab = 'all';
 
 /* ── helpers ── */
 const $ = id => document.getElementById(id);
@@ -221,6 +409,88 @@ const pct = score => score == null ? '—' : Math.round(score * 100) + '%';
 function esc(str) {
     return String(str ?? '')
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── Structured compliance flag ──
+   Doctor-validation flags arrive as one string mixing Arabic and English:
+     "Label — subject / Agent stated: … / CRM value: … / Reason: … / Evidence: …"
+   Split it into a title and labelled rows, and the transcript excerpt into
+   one line per speaker, each with its own text direction. */
+const FLAG_FIELD_SPLIT = /\s+\/\s+(?=(?:Agent stated|CRM value|CRM doctor|Reason|Recommendation|Evidence)\s*:)/;
+const FLAG_SPEAKER_SPLIT = /(?:^|\s+)(Agent|Patient|Customer|Client)\s*:\s*/;
+const FLAG_CLAMP_CHARS = 220;
+
+function parseFlagDescription(desc) {
+    const parts = String(desc ?? '').split(FLAG_FIELD_SPLIT);
+    const head = parts.shift().trim();
+    const fields = parts.map(p => {
+        const i = p.indexOf(':');
+        return { label: p.slice(0, i).trim(), value: p.slice(i + 1).trim() };
+    });
+    const dash = head.indexOf(' — ');
+    if (!fields.length || dash < 0) return { title: head, subject: '', fields };
+    return { title: head.slice(0, dash).trim(), subject: head.slice(dash + 3).trim(), fields };
+}
+
+function flagExcerptLines(text) {
+    const parts = String(text ?? '').trim().split(FLAG_SPEAKER_SPLIT);
+    const lines = [];
+    if (parts[0].trim()) lines.push({ speaker: '', text: parts[0].trim() });
+    for (let i = 1; i < parts.length; i += 2) {
+        const t = (parts[i + 1] || '').trim();
+        if (t) lines.push({ speaker: parts[i], text: t });
+    }
+    return lines;
+}
+
+function toggleFlagClamp(btn) {
+    const el = btn.previousElementSibling;
+    const clamped = el.classList.toggle('flag-clamp');
+    btn.textContent = clamped ? 'Show more' : 'Show less';
+}
+
+function flagValueHTML(value, cls = '') {
+    const long = value.length > FLAG_CLAMP_CHARS;
+    return `<dd class="${cls}"><div dir="auto" class="${long ? 'flag-clamp' : ''}">${esc(value)}</div>${
+        long ? '<button type="button" class="flag-more" onclick="toggleFlagClamp(this)">Show more</button>' : ''}</dd>`;
+}
+
+function flagBodyHTML(f) {
+    const { title, subject, fields } = parseFlagDescription(f.description);
+    const excerpt = String(f.transcript_excerpt ?? '').trim();
+
+    /* Evidence usually repeats the transcript excerpt; show it once, in the
+       transcript box. */
+    const evidence = fields.find(x => x.label === 'Evidence');
+    const shownFields = fields.filter(x => !(x.label === 'Evidence' && (!excerpt || x.value === excerpt)));
+    const transcript = excerpt || evidence?.value || '';
+
+    const titleHTML = fields.length
+        ? `<div class="flag-title">
+               <span class="flag-title-text" dir="auto">${esc(title)}</span>
+               ${subject ? `<span class="flag-subject" dir="auto">${esc(subject)}</span>` : ''}
+           </div>`
+        : `<div class="flag-text" dir="auto" style="margin:4px 0 6px;">${esc(title || '—')}</div>`;
+
+    const fieldsHTML = shownFields.length
+        ? `<dl class="flag-fields">${shownFields.map(x =>
+              `<dt>${esc(x.label)}</dt>${flagValueHTML(x.value, x.label.startsWith('CRM') ? 'flag-crm' : '')}`
+          ).join('')}</dl>`
+        : '';
+
+    const lines = flagExcerptLines(transcript);
+    const transcriptHTML = lines.length
+        ? `<div class="excerpt-box flag-excerpt">
+               <span class="flag-excerpt-label">Transcript</span>
+               ${lines.map(l => `
+               <div class="flag-line">
+                   ${l.speaker ? `<span class="flag-speaker flag-speaker-${l.speaker === 'Agent' ? 'agent' : 'patient'}">${esc(l.speaker)}</span>` : ''}
+                   <span class="flag-line-text" dir="auto">${esc(l.text)}</span>
+               </div>`).join('')}
+           </div>`
+        : '';
+
+    return titleHTML + fieldsHTML + transcriptHTML;
 }
 function statusClass(a) { return 'status-' + (a||'error').toLowerCase().replace(/\s+/g,'_'); }
 function severityClass(s) { return 'severity-' + (s||'minor').toLowerCase(); }
@@ -236,6 +506,152 @@ function showError(msg) {
     el.textContent   = msg || '';
 }
 
+/* ── Toast ── */
+let _toastTimer = null;
+function showToast(html, type = 'success', duration = 4000) {
+    const el = $('toast');
+    el.innerHTML = html;
+    el.className = `toast ${type}`;
+    requestAnimationFrame(() => el.classList.add('show'));
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => el.classList.remove('show'), duration);
+}
+
+/* ── Supervisor escalations ──
+   Same store and record shape as agents-dashboard.html: the QA Supervisor
+   dashboard reads this localStorage key, and POST /escalations marks the
+   matching row in [DWH].[AI].[Call_QA_Results] as escalated. */
+const ESCALATION_KEY = 'qa_escalations';
+
+function readEscalations() {
+    try { return JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]'); }
+    catch (_) { return []; }
+}
+
+function updateSupervisorBadge() {
+    try {
+        const count = readEscalations().filter(e => e.status === 'pending').length;
+        const badge = $('pendingBadge');
+        badge.textContent = count > 0 ? String(count) : '';
+        badge.setAttribute('data-count', count);
+    } catch (_) {}
+}
+
+/* A violation already sent to the supervisor (and not dismissed there) shows
+   as escalated, so reloading this page does not invite a duplicate. */
+function findEscalation(callId, f) {
+    return readEscalations().find(e =>
+        e.call_id === callId &&
+        e.status !== 'dismissed' &&
+        (e.flag?.description || '') === (f.description || '') &&
+        (e.flag?.transcript_excerpt || '') === (f.transcript_excerpt || ''));
+}
+
+/* Stored results keep strengths / improvements as JSON text; the escalation
+   record carries them as lists, as agents-dashboard.html does. */
+function asList(v) {
+    if (Array.isArray(v)) return v;
+    if (typeof v === 'string' && v.trim()) {
+        try { const p = JSON.parse(v); return Array.isArray(p) ? p : [String(p)]; }
+        catch (_) { return [v]; }
+    }
+    return [];
+}
+
+function markEscalated(btn) {
+    btn.classList.add('done');
+    btn.innerHTML = '✓ Escalated';
+    btn.closest('.compliance-item').classList.add('escalated-item');
+}
+
+/* ── Escalate a single violation ── */
+async function escalateViolation(rIdx, fIdx, btn) {
+    if (btn.classList.contains('done')) return;
+
+    const r = _lastResults[rIdx];
+    if (!r) return;
+    const flags = r.compliance_flags || [];
+    const f = flags[fIdx];
+    if (!f) return;
+
+    if (findEscalation(r.call_id || '', f)) {
+        markEscalated(btn);
+        showToast('This violation is already with the QA Supervisor.', 'success');
+        return;
+    }
+
+    const escId = `ESC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,5).toUpperCase()}`;
+
+    const escalation = {
+        id: escId,
+        escalated_at: new Date().toISOString(),
+        /* Call context */
+        call_id:              r.call_id || '',
+        agent_name:           r.agent_name || '',
+        conversation_link:    r.conversation_link || null,
+        call_date:            r.call_date || '',
+        overall_assessment:   r.overall_assessment || '',
+        assessment_reasoning: r.assessment_reasoning || '',
+        /* Performance snapshot */
+        professionalism_score:  r.professionalism_score ?? null,
+        agent_classification:   r.agent_classification || null,
+        profiling_comment:      r.profiling_comment    || null,
+        strengths:              asList(r.strengths),
+        improvements:           asList(r.improvements),
+        /* The single violation escalated */
+        flag: {
+            type:               f.type,
+            severity:           f.severity,
+            description:        f.description,
+            transcript_excerpt: f.transcript_excerpt,
+        },
+        status: 'pending',
+        reviewed_at:  null,
+        review_note:  null,
+    };
+
+    try {
+        const existing = readEscalations();
+        existing.unshift(escalation);          // newest first
+        localStorage.setItem(ESCALATION_KEY, JSON.stringify(existing));
+    } catch (err) {
+        console.error('[escalate] localStorage write failed:', err);
+    }
+
+    try {
+        const res = await fetch(`${API_BASE}/escalations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                call_id: r.call_id,
+                flag_description: f.description,
+                transcript_excerpt: f.transcript_excerpt,
+                conversation_link: r.conversation_link || null,
+                supervisor_name: 'Team Leader',
+                supervisor_email_address: '',
+            }),
+        });
+        if (!res.ok) {
+            const body = await res.json().catch(() => ({ detail: res.statusText }));
+            throw new Error(body.detail || res.statusText);
+        }
+    } catch (err) {
+        console.error('[escalate] DB write failed:', err);
+        updateSupervisorBadge();
+        showToast('⚠️ Escalation saved locally, but the database update failed.', 'error');
+        return;
+    }
+
+    markEscalated(btn);
+    updateSupervisorBadge();
+
+    showToast(
+        `🚨 Violation escalated — <a onclick="window.location.href='/qa-supervisor'">Open Supervisor Dashboard</a>`,
+        'success',
+        5000
+    );
+}
+
 /* ── fetch results with filters ── */
 async function loadResults() {
     showError('');
@@ -247,12 +663,15 @@ async function loadResults() {
     const dateTo    = $('dateTo').value;
     const assessment     = $('assessment').value;
     const classification = $('classification').value;
+    const limit          = $('limit').value;
 
     if (agentName)       params.set('agent_name', agentName);
     if (dateFrom)        params.set('date_from', dateFrom);
     if (dateTo)          params.set('date_to', dateTo);
     if (assessment)      params.set('overall_assessment', assessment);
     if (classification)  params.set('agent_classification', classification);
+    if (limit)           params.set('limit', limit);
+    if (TABS[_activeTab].param) params.set(TABS[_activeTab].param, 'true');
 
     try {
         const res = await fetch(`${API_BASE}/api/qa-results?${params.toString()}`);
@@ -273,6 +692,10 @@ async function loadResults() {
 /* ── render results ── */
 function renderResults(data) {
     const s = data.summary || {};
+    const displayed = data.displayed ?? (data.results || []).length;
+    const truncatedNote = displayed < (s.total ?? 0)
+        ? `<div class="metric-card"><div class="metric-label">📄 Displayed</div><div class="metric-value">${displayed}<div style="font-size:.75rem;font-weight:500;opacity:.85;">of ${s.total ?? 0} matching</div></div></div>`
+        : '';
     $('summaryMetrics').innerHTML = `
         <div class="metric-card"><div class="metric-label">Total Records</div><div class="metric-value">${s.total ?? 0}</div></div>
         <div class="metric-card"><div class="metric-label">✅ Pass</div><div class="metric-value">${s.pass ?? 0}</div></div>
@@ -280,15 +703,49 @@ function renderResults(data) {
         <div class="metric-card"><div class="metric-label">🚨 Escalate</div><div class="metric-value">${s.escalate ?? 0}</div></div>
         <div class="metric-card"><div class="metric-label">⚠ Errors</div><div class="metric-value">${s.errors ?? 0}</div></div>
         <div class="metric-card"><div class="metric-label">📈 Avg Weighted Score</div><div class="metric-value">${s.avg_weighted_score ?? '—'}</div></div>
+        ${truncatedNote}
     `;
 
     const results = data.results || [];
+    _lastResults  = results;        // store for escalation references
+    $('recordsTitle').textContent = TABS[_activeTab].title;
     $('callRecordsList').innerHTML = results.length
         ? results.map((r, i) => callRecordHTML(r, i)).join('')
-        : '<p class="empty-note">No records match the selected filters.</p>';
+        : `<p class="empty-note">${TABS[_activeTab].empty}</p>`;
 
     $('resultsSection').style.display = 'block';
     $('resultsSection').scrollIntoView({ behavior: 'smooth' });
+}
+
+/* A violation the supervisor confirmed with a review comment. */
+function isReviewedFlag(f) {
+    return !!Number(f.qa_reviewed) && String(f.qa_review_comment ?? '').trim() !== '';
+}
+
+/* The supervisor's QA review comment for one violation row. */
+function reviewBoxHTML(f) {
+    const meta = [
+        f.coaching_status ? `<span class="review-chip">Coaching: ${esc(f.coaching_status)}</span>` : '',
+        f.supervisor_name ? `<span class="review-chip">Escalated by: ${esc(f.supervisor_name)}</span>` : '',
+    ].join('');
+    return `
+    <div class="review-box">
+        <div class="review-box-head">
+            <span class="review-box-label">📝 QA Review Comment</span>
+            ${meta ? `<span class="review-meta">${meta}</span>` : ''}
+        </div>
+        <div class="review-comment" dir="auto">${esc(f.qa_review_comment)}</div>
+    </div>`;
+}
+
+function formatArchiveTime(r) {
+    const raw = r.archive_datetime || r.call_date || '';
+    const match = String(raw).match(/^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}:\d{2}))?/);
+    if (!match) return raw;
+    if (match[2] && (r.archive_datetime || match[2] !== '00:00:00')) {
+        return `${match[1]} ${match[2]}`;
+    }
+    return match[1];
 }
 
 function callRecordHTML(r, idx) {
@@ -307,19 +764,40 @@ function callRecordHTML(r, idx) {
 
     const flags = r.compliance_flags || [];
 
+    /* QA Reviews tab: only the reviewed violation(s), highlighted; each
+       keeps its original index for escalation references. */
+    const inReviews = _activeTab === 'reviews';
+    const ordered = flags
+        .map((f, fi) => ({ f, fi, reviewed: inReviews && isReviewedFlag(f) }))
+        .filter(x => !inReviews || x.reviewed);
+    const reviewedCount = ordered.filter(x => x.reviewed).length;
+    const reviewedBadge = reviewedCount
+        ? `<span class="reviewed-count">📝 ${reviewedCount} reviewed</span>`
+        : '';
+
     const conversationLinkHTML = r.conversation_link
         ? `<a href="${esc(r.conversation_link)}" target="_blank" rel="noopener" style="color:#667eea;font-weight:700;text-decoration:none;">🔗 ${esc(r.conversation_link)}</a>`
         : '<span style="color:#a0aec0;font-style:italic;">No conversation link</span>';
 
+    /* Title = Agent Name - Patient Phone - Archive DateTime (was the bare Call ID);
+       the Call ID moves below the conversation link. */
+    const titleParts = [
+        r.agent_name    || '',
+        r.customer_phone_number || r.patient_phone || '',
+        formatArchiveTime(r),
+    ].filter(Boolean).map(esc);
+    const cardTitle = titleParts.length ? titleParts.join(' - ') : (r.call_id || '—');
+
     return `
-    <details class="call-record" ${idx === 0 ? 'open' : ''}>
+    <details class="call-record" ${idx === 0 || inReviews ? 'open' : ''}>
         <summary>
             <span style="display:flex;flex-direction:column;gap:3px;min-width:0;flex:1;">
-                <span class="call-record-id">${esc(r.call_id || '—')}</span>
+                <span class="call-record-id">${esc(cardTitle)}</span>
                 <span>${conversationLinkHTML}</span>
-                <span class="call-record-date">${esc(r.agent_name || '')} · ${esc(r.call_date || '')}</span>
+                <span class="call-record-date">Call ID: ${esc(r.call_id || '—')}</span>
             </span>
             <span style="display:flex; gap:8px; align-items:center;">
+                ${reviewedBadge}
                 ${classificationBadge}
                 <span class="status-badge ${statusClass(r.overall_assessment)}">
                     ${esc((r.overall_assessment||'error').toUpperCase().replace(/_/g,' '))}
@@ -337,15 +815,35 @@ function callRecordHTML(r, idx) {
             </div>
             ${profilingRow}
 
-            ${flags.map(f => `
-            <div class="compliance-item">
+            ${ordered.map(({ f, fi, reviewed }) => {
+                const already = !!findEscalation(r.call_id || '', f);
+                /* Removed and reviewed errors were already handled by the
+                   supervisor — no escalate action on them. */
+                const footer = _activeTab === 'removed'
+                    ? '<span class="removed-tag">🗑 Removed by QA Supervisor</span>'
+                    : reviewed
+                    ? '<span class="removed-tag reviewed">✓ Error confirmed by QA</span>'
+                    : `<button
+                        class="escalate-btn${already ? ' done' : ''}"
+                        onclick="escalateViolation(${idx}, ${fi}, this)"
+                        title="Escalate this violation to the QA Supervisor"
+                    >
+                        ${already ? '✓ Escalated' : '🚨 Escalate to QA'}
+                    </button>`;
+                return `
+            <div class="compliance-item${reviewed ? ' reviewed-item' : already ? ' escalated-item' : ''}" id="ci-${idx}-${fi}">
                 <div class="compliance-header">
                     <span class="type-badge ${typeClass(f.type)}">${esc(f.type)}</span>
                     <span class="severity-badge ${severityClass(f.severity)}">${esc(f.severity)}</span>
+                    ${reviewed ? '<span class="reviewed-flag-badge">📝 Reviewed escalation</span>' : ''}
                 </div>
-                <p>${esc(f.description)}</p>
-                <div class="excerpt-box">${esc(f.transcript_excerpt)}</div>
-            </div>`).join('')}
+                ${flagBodyHTML(f)}
+                ${reviewed ? reviewBoxHTML(f) : ''}
+                <div class="compliance-footer">
+                    ${footer}
+                </div>
+            </div>`;
+            }).join('')}
 
             ${r.escalation_required
                 ? `<div class="excerpt-box" style="border-left-color:#f56565;margin-top:12px;">
@@ -364,12 +862,32 @@ $('clearBtn').addEventListener('click', () => {
     $('dateTo').value = '';
     $('assessment').value = '';
     $('classification').value = '';
+    $('limit').value = '1000';
     loadResults();
+});
+/* ── tab switching reloads with the same filters ── */
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        if (btn.dataset.tab === _activeTab) return;
+        _activeTab = btn.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach(b => {
+            const on = b === btn;
+            b.classList.toggle('active', on);
+            b.setAttribute('aria-selected', on);
+        });
+        loadResults();
+    });
 });
 /* Enter key in agent name triggers search */
 $('agentName').addEventListener('keydown', e => { if (e.key === 'Enter') loadResults(); });
 
+/* ── keep the badge and button states in step with the supervisor tab ── */
+window.addEventListener('storage', e => {
+    if (e.key === ESCALATION_KEY) updateSupervisorBadge();
+});
+
 /* ── initial load (no filters) ── */
+updateSupervisorBadge();
 loadResults();
 </script>
 </body>

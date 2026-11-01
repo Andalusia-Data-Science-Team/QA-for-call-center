@@ -13,6 +13,7 @@ opted in does nothing.
 
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -32,7 +33,7 @@ class AutomationSettings(BaseSettings):
     automation_enabled: bool = True
 
     # ── Budget ───────────────────────────────────────────────────────────────
-    daily_target: int = Field(default=300, ge=1)
+    daily_target: int = Field(default=50, ge=1)
 
     # ── Reporting calendar ───────────────────────────────────────────────────
     # Africa/Cairo: UTC+2 (EET) in winter, UTC+3 (EEST) under DST, which Egypt
@@ -51,12 +52,19 @@ class AutomationSettings(BaseSettings):
 
     # ── Scheduling ───────────────────────────────────────────────────────────
     dispatch_interval_seconds: int = Field(default=600, ge=1)
+    automation_start_date: date | None = None
 
     # ── Sampling policy ──────────────────────────────────────────────────────
     sampling_seed: str = "42"
     sampling_policy_version: str = "v1"
     exclude_adjacent_chats: bool = True
     min_chat_gap_minutes: int = Field(default=0, ge=0)
+
+    # ── Roster ───────────────────────────────────────────────────────────────
+    # The roster is every CM agent who owned and replied in a conversation
+    # closed during this many days before the reporting day. Longer covers
+    # people on leave; shorter drops people who have moved on sooner.
+    roster_lookback_days: int = Field(default=14, ge=1)
 
     # ── Local ledger ─────────────────────────────────────────────────────────
     # We have no DDL rights on DWH, so every table the automation owns lives in

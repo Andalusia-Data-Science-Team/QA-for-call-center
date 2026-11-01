@@ -6,7 +6,7 @@ Fetches package records from [dbo].[cr301_ksaservicedataset]
 via SQL Server (Passcode.json connection).
 
 Public API:
-    fetch_packages(bu="LIVE", force_refresh=False) → list[dict]
+    fetch_packages(bu="AHJ", force_refresh=False) → list[dict]
     get_packages_for_specialty(specialty_en, service_hint, ...)  → list[dict]
     format_package_card(package, lang)             → str
 
@@ -35,9 +35,11 @@ _lock = threading.Lock()
 # BU values that map to a single cr18c_buname code
 _BU_MAP: dict[str, str] = {
     "AHJ": "AHJ", "MKR": "MKR", "LCH": "LCH",
-    "LIVE": "AHJ",  # LIVE is the main AHJ branch
     "SNB": "SNB", "ALW": "ALW", "AKW": "AKW",
-    "HJH": "HJH", "AFW": "AFW", "ADC": "ADC",
+    "HJH": "HJH", "AFW": "AFW",
+    # MKR/ADC/JDC are one branch, resolved app-wide to ADC; its CRM rows
+    # are queried under MKR, as they were before ADC became canonical.
+    "ADC": "MKR", "JDC": "MKR",
 }
 
 
@@ -463,5 +465,5 @@ def format_package_card(package: dict, lang: str = "ar") -> str:
 if __name__ == "__main__":
     # Quick test
     print(_QUERY)
-    fetched = fetch_packages(bu="LIVE", force_refresh=True)
-    print(f"Fetched {len(fetched)} packages for LIVE")
+    fetched = fetch_packages(bu="AHJ", force_refresh=True)
+    print(f"Fetched {len(fetched)} packages for AHJ")

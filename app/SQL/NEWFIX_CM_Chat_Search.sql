@@ -2,6 +2,7 @@ DECLARE @ConversationId UNIQUEIDENTIFIER = :ConversationId ;
 DECLARE @AgentFullName  NVARCHAR(200) = :AgentFullName;
 DECLARE @AgentEmail     NVARCHAR(200) = :AgentEmail;
 DECLARE @FilterDate     DATE = :FilterDate;
+DECLARE @ChatLimit      INT  = :ChatLimit;   -- number of most recent chats to check
 
 
 ;WITH ConvSummary AS
@@ -145,7 +146,7 @@ DECLARE @FilterDate     DATE = :FilterDate;
 
 TopConversations AS
 (
-    SELECT TOP (10) *
+    SELECT TOP (@ChatLimit) *
     FROM ConvSummary
     ORDER BY Start_DateTime DESC
 )
@@ -244,7 +245,7 @@ LEFT JOIN [CM_DWH].[msc_sub_35033_XYLJV].[dbo].[ChannelAccounts] ca
 
 LEFT JOIN [CM_DWH].[msc_sub_35033_XYLJV].[dbo].[Channels] ch
     ON ca.Channel_Id = ch.Id
-
+--WHERE tc.UniqueId = 'EE8BD2E7-01CB-F111-BF5B-000D3AA9DC2F'
 ORDER BY
     tc.Start_DateTime DESC,
     tc.UniqueId,

@@ -8,14 +8,37 @@ import os
 from typing import Any
 
 from app.agent.state import AgentState
+from app.service_hub.crm_leads_validation import lead_bu_code
 from app.services.llm_client import LLMClient
 from app.services.get_patient import (
+    ENVIRONMENTS,
     get_patient,
     get_token_for_env,
     login,
 )
 
 logger = logging.getLogger(__name__)
+
+# MPI environment for each branch, keyed by its LEAD_BU_CODE. MPI has no
+# separate LCH, CHT, AFW, MKR or ADC environment; every code in a branch's
+# equivalence group uses that branch's environment.
+_MPI_ENV_BY_BRANCH: dict[str, str] = {
+    "HJH": "AHJ",   # AHJ / HJH
+    "AFW": "SNB",   # SNB / AFW
+    "ALW": "ALW",   # LCH / CHT / ALW
+    "ADC": "JDC",   # MKR / ADC / JDC
+    "AKW": "AKW",
+}
+
+
+def mpi_env_for_bu(business_unit: str | None) -> str | None:
+    """The MPI environment for a call's business unit ("LCH" → "ALW"), or
+    None when the code belongs to no known branch. A call with no business
+    unit uses AHJ."""
+    code = str(business_unit or "AHJ").strip().upper().removeprefix("BU-")
+    if code == "ERS":
+        return "ERS"
+    return _MPI_ENV_BY_BRANCH.get(lead_bu_code(code) or "")
 
 
 def _trace(_state: AgentState, node: str) -> list[str]:
@@ -57,19 +80,35 @@ async def fetch_patient_profile(state: AgentState) -> dict:
             "node_trace": _trace(state, "fetch_patient_profile"),
         }
     
-    # Map business unit to MPI environment
-    business_unit = getattr(call, "business_unit", None) or "LIVE"
-    env_map = {
-        "BU-AHJ": "AHJ",
-        "LIVE": "AHJ",
-        "BU-SNB": "SNB",
-        "BU-AKW": "AKW",
-        "BU-ALW": "ALW",
-        "BU-ERS": "ERS",
-        "BU-JDC": "JDC",
-    }
-    env = env_map.get(business_unit, "AHJ")
-    
+    # Map business unit to MPI environment (mpi_env_for_bu).
+    business_unit = getattr(call, "business_unit", None) or "AHJ"
+    env = mpi_env_for_bu(business_unit)
+    if env is None:
+        logger.warning(
+            "fetch_patient_profile | call_id=%s — no MPI environment for bu=%s, using AHJ",
+            call.call_id, business_unit,
+        )
+        env = "AHJ"
+
+    # An environment with no configured MPI host (ERS is not deployed) cannot
+    # be queried; report it rather than fail on a missing URL.
+    if env not in ENVIRONMENTS and not (
+        os.getenv(f"MPI_API_URL_{env}") and os.getenv(f"MPI_LOGIN_URL_{env}")
+    ):
+        logger.warning(
+            "fetch_patient_profile | call_id=%s bu=%s env=%s — no MPI host configured",
+            call.call_id, business_unit, env,
+        )
+        return {
+            "patient_profile_result": {
+                "found": False,
+                "profile": None,
+                "error": f"No MPI host configured for environment {env}",
+                "env": env,
+            },
+            "node_trace": _trace(state, "fetch_patient_profile"),
+        }
+
     logger.info(
         "fetch_patient_profile | call_id=%s iqama=%s bu=%s env=%s",
         call.call_id,

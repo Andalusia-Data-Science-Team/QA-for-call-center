@@ -183,7 +183,7 @@ _BU_FUZZY_THRESHOLD = 85  # stricter than location's 80 — a BU misresolution
 
 
 def resolve_business_unit(text: str) -> str | None:
-    """Resolve a canonical application BU code (e.g. "AKW", "LIVE") from free
+    """Resolve a canonical application BU code (e.g. "AKW", "AHJ") from free
     Arabic text via BUSINESS_UNIT_KEYWORD_MAP.
 
     1. Exact normalised-substring match — longest alias wins (so "صحة
@@ -219,22 +219,18 @@ def resolve_business_unit(text: str) -> str | None:
     return None
 
 
-# Bank-validation scope: AFW / AHJ (internally "LIVE" — see below) / AKW / ALW
+# Bank-validation scope: AFW / AHJ / AKW / ALW
 # only. LCH/MKR/SNB remain valid BUs elsewhere in the project (booking,
 # offers, ...) — this restriction is local to bank validation, not a change
 # to BUSINESS_UNIT_KEYWORD_MAP or CallTranscript.business_unit.
-_SUPPORTED_BANK_BUS = {"AFW", "LIVE", "AKW", "ALW"}
+_SUPPORTED_BANK_BUS = {"AFW", "AHJ", "AKW", "ALW"}
 
-# Canonical APP BU code → CRM BU code, only where they differ. Verified
-# against LIVE cr301_bankaccounts data (this session, via a real Dynamics
-# 365 query): real CRM rows use cr301_bu / servhub_bulookupname /
-# cr18c_bunname = "AHJ", never "LIVE" — "LIVE" is this QA system's own
-# application-level label for that branch (BUSINESS_UNIT_KEYWORD_MAP maps
-# "جدة" / "حي الجامعة" / "BU-AHJ" → "LIVE"). AFW/AKW/ALW already match their
-# CRM values identically, so no entry is needed for them — this dict exists
-# so AHJ⇄LIVE is translated in exactly ONE place instead of scattered
-# special-casing throughout the validator.
-_APP_BU_TO_CRM_BU: dict[str, str] = {"LIVE": "AHJ"}
+# Canonical APP BU code → CRM BU code, only where they differ. Real CRM
+# rows (cr301_bankaccounts, doctors) use cr301_bu / servhub_bulookupname /
+# cr18c_bunname = "AHJ"; HJH is the same branch, so it is translated to AHJ
+# here, in ONE place, instead of being special-cased in each validator.
+# Every other app code already matches its CRM value.
+_APP_BU_TO_CRM_BU: dict[str, str] = {"HJH": "AHJ"}
 
 # owningbusinessunitname deliberately excluded from CRM-side BU filtering:
 # verified (live CRM query, this session) to hold a constant tenant-level

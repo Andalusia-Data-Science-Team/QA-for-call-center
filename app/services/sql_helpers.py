@@ -98,7 +98,7 @@ def _call_level_params(
         "Agent_Name":            call.agent_name,
         "Department":            call.department,
         "Channel_Name":          channel_name,
-        "Call_Date":             call.call_date,
+        "Call_Date":             call.archive_datetime or call.call_date,
         "Call_Duration_Seconds": call.call_duration_seconds,
         "Conversation_Link":     call.conversation_link,
         "Overall_Assessment":    result.overall_assessment,
@@ -114,9 +114,10 @@ def _call_level_params(
         "Profiling_Comment":     perf.profiling_comment,
         # Prefer the chat's own metadata (authoritative, from CM retrieval);
         # fall back to the LLM-extracted values when the chat has none.
-        # "LIVE" is a placeholder BU — map it to HJH; anything else stays as-is.
+        # AHJ is stored as HJH (the same branch), as it always has been in
+        # this column; anything else stays as-is.
         "BU": (
-            (lambda bu: "HJH" if bu == "LIVE" else bu)(
+            (lambda bu: "HJH" if bu == "AHJ" else bu)(
                 call.business_unit or result.business_unit
             )
         ),
@@ -147,6 +148,7 @@ def update_escalation_row(
     flag_description: Optional[str] = None,
     transcript_excerpt: Optional[str] = None,
     conversation_link: Optional[str] = None,
+    removed_error: Optional[bool] = None,
 ) -> int:
     """Update the matching QA result row(s) with escalation-review state."""
     engine = _build_engine()
@@ -182,6 +184,8 @@ def update_escalation_row(
             values["Coaching_Status"] = coaching_status
         if conversation_link is not None:
             values["Conversation_Link"] = conversation_link
+        if removed_error is not None:
+            values["Removed_Error"] = 1 if removed_error else 0
 
         if not values:
             return 0
@@ -281,7 +285,8 @@ def insert_qa_result(
                 rows.append({
                     **base,
                     "Compliance_Flag_Type": flag.type,
-                    "Severity":             flag.severity,
+                    # Hardcoded — severity is never produced by the LLM.
+                    "Severity":             "critical",
                     "Violation":            flag.type,
                     "Flag_Description":     flag.description,
                     "Transcript_Excerpt":   flag.transcript_excerpt,

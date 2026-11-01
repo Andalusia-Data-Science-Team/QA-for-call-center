@@ -5,7 +5,7 @@ Fetches active service records from [dbo].[cr301_ksaservicedataset]
 (filtered to active BUs) via SQL Server (Passcode.json connection).
 
 Public API:
-    fetch_services(bu="LIVE", force_refresh=False) → list[dict]
+    fetch_services(bu="AHJ", force_refresh=False) → list[dict]
     get_services_for_specialty(specialty_en, service_hint, ...)  → list[dict]
     format_service_card(service, lang)             → str
 
@@ -40,9 +40,11 @@ _lock = threading.Lock()
 # BU values that map to a single cr18c_buname code
 _BU_MAP: dict[str, str] = {
     "AHJ": "AHJ", "MKR": "MKR", "LCH": "LCH",
-    "LIVE": "AHJ",  # LIVE is the main AHJ branch
     "SNB": "SNB", "ALW": "ALW", "AKW": "AKW",
-    "HJH": "HJH", "AFW": "AFW", "ADC": "ADC",
+    "HJH": "HJH", "AFW": "AFW",
+    # MKR/ADC/JDC are one branch, resolved app-wide to ADC; its CRM rows
+    # are queried under MKR, as they were before ADC became canonical.
+    "ADC": "MKR", "JDC": "MKR",
 }
 
 

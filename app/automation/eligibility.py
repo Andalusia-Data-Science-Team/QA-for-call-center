@@ -1,17 +1,13 @@
 """
-Eligibility and attribution rules — the other unresolved decision, D2.
-
-Kept in one file for the same reason as the roster: the rule is a business
-decision that has not been signed off, and when it is, exactly one function
-should need to change.
+Eligibility and attribution rules.
 
 WHAT THE SQL ALREADY DID
 ────────────────────────
-app/SQL/automation/day_candidates.sql attributes each conversation to the
-human who sent its last non-system message. That is the proposal, not a
-confirmed rule, and it is recorded on every candidate row as
-AttributionRule = 'last_human_message' so a later change is visible in the
-data rather than retroactively implied.
+app/SQL/automation/automation_day_conversations.sql attributes each
+conversation to its inbox owner — the same rule NEWFIX_CM_Chat_Search.sql and
+the manual dashboard use. Every candidate row records
+AttributionRule = 'inbox_owner', so if the rule ever changes the change is
+visible in the data rather than retroactively implied.
 
 WHAT IS DECIDED HERE
 ────────────────────
@@ -32,12 +28,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-ATTRIBUTION_RULE = "last_human_message"
-
-# Minimum human-agent messages for a conversation to be worth evaluating. One
-# is enough to establish the agent handled it; the QA rubric decides whether
-# the handling was adequate, which is not this module's business.
-MIN_HUMAN_MESSAGES = 1
+ATTRIBUTION_RULE = "inbox_owner"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,14 +43,15 @@ def assess(row) -> Eligibility:
 
     The checks, in the order they are applied:
 
-    1. **An attributed human agent.** No resolvable agent email means we cannot
-       say whose work is being evaluated. Quarantined rather than guessed.
+    1. **An attributed agent.** No inbox-owner email means we cannot say whose
+       work is being evaluated. Quarantined rather than guessed.
 
-    2. **A human handling timestamp.** Needed to place the conversation in a
-       reporting day and an interval.
+    2. **A handling timestamp** (the archive time). Needed to place the
+       conversation in a reporting day and an interval.
 
-    3. **At least one human-agent message.** Excludes bot-only and
-       system-only interactions, which have no agent performance to assess.
+    3. **The agent replied at least once.** AgentReplied comes from the same
+       SenderWasOwner test NEWFIX uses for FirstResponse. A closed chat the
+       owner never answered has no agent performance to assess.
 
     4. **A completed conversation.** ArchiveDateTime being set is the signal
        used, because it is unambiguous. The raw State and AnswerState codes
@@ -67,20 +59,19 @@ def assess(row) -> Eligibility:
        been confirmed, and inventing a status code is how a sampler silently
        excludes half a day's traffic.
 
-    A conversation still open when its interval closes is simply not eligible
-    for that interval. It will be picked up by the reconciliation pass once it
-    completes, as a late arrival.
+    Candidates are windowed on ArchiveDateTime, so a conversation reaches the
+    sampler in the interval it closed in and check 4 normally passes; it stays
+    as a guard in case the source ever returns an unarchived row.
     """
     agent_email = _clean(row.get("AgentEmail"))
     if not agent_email:
-        return Eligibility(False, "no_attributable_human_agent")
+        return Eligibility(False, "no_inbox_owner")
 
     if _missing(row.get("HandlingTimeUtc")):
-        return Eligibility(False, "no_human_handling_timestamp")
+        return Eligibility(False, "no_handling_timestamp")
 
-    human_messages = _as_int(row.get("HumanMessageCount"))
-    if human_messages < MIN_HUMAN_MESSAGES:
-        return Eligibility(False, f"only_{human_messages}_human_messages")
+    if _as_int(row.get("AgentReplied")) < 1:
+        return Eligibility(False, "agent_never_replied")
 
     if _missing(row.get("ArchiveDateTimeUtc")):
         return Eligibility(False, "conversation_not_closed")

@@ -125,6 +125,8 @@ Keep the project's `.env`, `app/Passcode.json`, and `app/CM/passcode.json` in
 this checkout. They are available through the bind mount and are excluded from
 the built image. The automation ledger in `data/` and files in `logs/` also
 remain on the host. Changing `.env` requires restarting the affected service.
+The mounted CRM token is read-only; refreshed tokens are saved privately in
+`data/.andalusia_crm_cache.bin` so they persist across container recreations.
 
 ```bash
 docker compose up --build -d api
@@ -143,8 +145,14 @@ Python base image once; later builds reuse Docker's cached layers.
 Supervisor starts both processes when the container starts. Check their state
 or stop and restart only the automation daemon while leaving the API available:
 
+The Compose service defaults to a 50-chat daily target and a reporting start
+date of 2026-10-25. Set `QA_DAILY_TARGET` and `QA_AUTOMATION_START_DATE` in
+`.env` to override those values. The start date leaves earlier ledger jobs
+untouched; the daemon plans, dispatches, and evaluates only reporting dates on
+or after it. Both settings are read when the process starts.
+
 ```bash
-docker compose exec api supervisorctl status
+docker compose exec api supervisorctl stat us
 docker compose exec api supervisorctl stop automation
 docker compose exec api supervisorctl start automation
 ```

@@ -91,18 +91,25 @@
         /* ── Retrieve form ── */
         .retrieve-form {
             display: grid;
-            grid-template-columns: 1fr 1fr auto;
+            grid-template-columns: minmax(200px, 1fr) minmax(145px, .7fr) minmax(270px, 1.3fr) 130px auto;
             gap: 16px; align-items: end;
         }
         .form-group { display: flex; flex-direction: column; gap: 6px; }
         .form-group label { color: #4a5568; font-weight: 600; font-size: .9rem; }
+        .form-group input { min-width: 0; }
         .form-group select,
-        .form-group input[type="date"] {
+        .form-group input[type="date"],
+        .form-group input[type="text"],
+        .form-group input[type="number"] {
             padding: 11px 14px; border: 2px solid #e2e8f0; border-radius: 10px;
             font-size: 1rem; color: #2d3748; background: #f7fafc; cursor: pointer;
         }
         .form-group select:focus,
-        .form-group input[type="date"]:focus { outline: none; border-color: #667eea; }
+        .form-group input[type="date"]:focus,
+        .form-group input[type="text"]:focus,
+        .form-group input[type="number"]:focus { outline: none; border-color: #667eea; }
+        .form-group input:disabled, .form-group select:disabled { opacity: .55; cursor: not-allowed; }
+        .retrieve-hint { grid-column: 1 / -1; color: #718096; font-size: .78rem; }
 
         .run-btn {
             padding: 12px 28px; border-radius: 10px; border: none;
@@ -182,6 +189,57 @@
             background: #f7fafc; padding: 10px; border-radius: 8px;
             margin-top: 8px; font-style: italic; color: #4a5568;
             border-left: 3px solid #cbd5e0; font-size: .9rem;
+        }
+
+        /* ── Structured compliance flag (title, labelled fields, transcript) ──
+           Mixed Arabic/English text: every value gets its own direction. */
+        .flag-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 10px; }
+        .flag-title-text { font-weight: 700; color: #2d3748; font-size: .95rem; }
+        .flag-subject {
+            background: #edf2f7; color: #2d3748; padding: 3px 10px;
+            border-radius: 12px; font-size: .85rem; font-weight: 600;
+        }
+        .flag-text {
+            color: #2d3748; line-height: 1.6; font-size: .92rem;
+            unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere;
+        }
+        .flag-fields {
+            display: grid; grid-template-columns: max-content 1fr;
+            gap: 8px 14px; margin: 0 0 4px; align-items: baseline;
+        }
+        .flag-fields dt {
+            color: #718096; font-size: .74rem; font-weight: 700;
+            text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
+        }
+        .flag-fields dd {
+            margin: 0; color: #2d3748; line-height: 1.6; font-size: .92rem;
+            unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere;
+        }
+        .flag-fields dd.flag-crm { font-weight: 700; }
+        .flag-clamp {
+            display: -webkit-box; -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3; overflow: hidden;
+        }
+        .flag-more {
+            background: none; border: none; padding: 0; margin-top: 2px;
+            color: #667eea; font-size: .8rem; font-weight: 700; cursor: pointer;
+        }
+        .flag-excerpt { font-style: normal; display: flex; flex-direction: column; gap: 6px; }
+        .flag-excerpt-label {
+            color: #718096; font-size: .72rem; font-weight: 700;
+            text-transform: uppercase; letter-spacing: .4px;
+        }
+        .flag-line { display: flex; gap: 8px; align-items: baseline; }
+        .flag-line-text { flex: 1; line-height: 1.6; unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere; }
+        .flag-speaker {
+            flex-shrink: 0; padding: 2px 9px; border-radius: 10px;
+            font-size: .72rem; font-weight: 700; font-style: normal;
+        }
+        .flag-speaker-agent   { background: #e9e8fd; color: #4c51bf; }
+        .flag-speaker-patient { background: #e6fffa; color: #234e52; }
+        @media (max-width: 600px) {
+            .flag-fields { grid-template-columns: 1fr; gap: 2px; }
+            .flag-fields dd { margin-bottom: 8px; }
         }
 
         /* ── Escalate button ── */
@@ -265,6 +323,9 @@
             white-space: nowrap;
         }
 
+        @media (max-width: 1100px) {
+            .retrieve-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
         @media (max-width: 700px) {
             .retrieve-form { grid-template-columns: 1fr; }
         }
@@ -275,7 +336,7 @@
 
     <div class="header">
         <h1>👥 Andalusia Agents QA Dashboard</h1>
-        <p>Select an agent email &amp; date to retrieve and analyse conversations</p>
+        <p>Select an agent email and date, or enter a conversation ID, to retrieve and analyse conversations</p>
         <div class="header-nav">
             <a href="/qa-dashboard" class="header-nav-btn">📞 Call Analysis</a>
             <a href="/qa-supervisor" class="header-nav-btn supervisor" id="supervisorLink">
@@ -301,7 +362,16 @@
                 <label for="filterDate">Date</label>
                 <input type="date" id="filterDate" />
             </div>
+            <div class="form-group">
+                <label for="conversationId">Conversation ID (optional)</label>
+                <input type="text" id="conversationId" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="form-group">
+                <label for="chatLimit">Number of Chats</label>
+                <input type="number" id="chatLimit" min="1" max="100" step="1" value="10" />
+            </div>
             <button class="run-btn" id="runBtn" disabled>▶ Run Analysis</button>
+            <span class="retrieve-hint">Conversation ID searches use an internal chat limit of 1000 and ignore agent and date.</span>
         </div>
 
         <div class="status-msg" id="statusMsg"><span class="spinner"></span> <span id="statusText">Working…</span></div>
@@ -337,6 +407,88 @@ const pct = score => Math.round((score ?? 0) * 100) + '%';
 function esc(str) {
     return String(str ?? '')
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── Structured compliance flag ──
+   Doctor-validation flags arrive as one string mixing Arabic and English:
+     "Label — subject / Agent stated: … / CRM value: … / Reason: … / Evidence: …"
+   Split it into a title and labelled rows, and the transcript excerpt into
+   one line per speaker, each with its own text direction. */
+const FLAG_FIELD_SPLIT = /\s+\/\s+(?=(?:Agent stated|CRM value|CRM doctor|Reason|Recommendation|Evidence)\s*:)/;
+const FLAG_SPEAKER_SPLIT = /(?:^|\s+)(Agent|Patient|Customer|Client)\s*:\s*/;
+const FLAG_CLAMP_CHARS = 220;
+
+function parseFlagDescription(desc) {
+    const parts = String(desc ?? '').split(FLAG_FIELD_SPLIT);
+    const head = parts.shift().trim();
+    const fields = parts.map(p => {
+        const i = p.indexOf(':');
+        return { label: p.slice(0, i).trim(), value: p.slice(i + 1).trim() };
+    });
+    const dash = head.indexOf(' — ');
+    if (!fields.length || dash < 0) return { title: head, subject: '', fields };
+    return { title: head.slice(0, dash).trim(), subject: head.slice(dash + 3).trim(), fields };
+}
+
+function flagExcerptLines(text) {
+    const parts = String(text ?? '').trim().split(FLAG_SPEAKER_SPLIT);
+    const lines = [];
+    if (parts[0].trim()) lines.push({ speaker: '', text: parts[0].trim() });
+    for (let i = 1; i < parts.length; i += 2) {
+        const t = (parts[i + 1] || '').trim();
+        if (t) lines.push({ speaker: parts[i], text: t });
+    }
+    return lines;
+}
+
+function toggleFlagClamp(btn) {
+    const el = btn.previousElementSibling;
+    const clamped = el.classList.toggle('flag-clamp');
+    btn.textContent = clamped ? 'Show more' : 'Show less';
+}
+
+function flagValueHTML(value, cls = '') {
+    const long = value.length > FLAG_CLAMP_CHARS;
+    return `<dd class="${cls}"><div dir="auto" class="${long ? 'flag-clamp' : ''}">${esc(value)}</div>${
+        long ? '<button type="button" class="flag-more" onclick="toggleFlagClamp(this)">Show more</button>' : ''}</dd>`;
+}
+
+function flagBodyHTML(f) {
+    const { title, subject, fields } = parseFlagDescription(f.description);
+    const excerpt = String(f.transcript_excerpt ?? '').trim();
+
+    /* Evidence usually repeats the transcript excerpt; show it once, in the
+       transcript box. */
+    const evidence = fields.find(x => x.label === 'Evidence');
+    const shownFields = fields.filter(x => !(x.label === 'Evidence' && (!excerpt || x.value === excerpt)));
+    const transcript = excerpt || evidence?.value || '';
+
+    const titleHTML = fields.length
+        ? `<div class="flag-title">
+               <span class="flag-title-text" dir="auto">${esc(title)}</span>
+               ${subject ? `<span class="flag-subject" dir="auto">${esc(subject)}</span>` : ''}
+           </div>`
+        : `<div class="flag-text" dir="auto" style="margin:4px 0 6px;">${esc(title || '—')}</div>`;
+
+    const fieldsHTML = shownFields.length
+        ? `<dl class="flag-fields">${shownFields.map(x =>
+              `<dt>${esc(x.label)}</dt>${flagValueHTML(x.value, x.label.startsWith('CRM') ? 'flag-crm' : '')}`
+          ).join('')}</dl>`
+        : '';
+
+    const lines = flagExcerptLines(transcript);
+    const transcriptHTML = lines.length
+        ? `<div class="excerpt-box flag-excerpt">
+               <span class="flag-excerpt-label">Transcript</span>
+               ${lines.map(l => `
+               <div class="flag-line">
+                   ${l.speaker ? `<span class="flag-speaker flag-speaker-${l.speaker === 'Agent' ? 'agent' : 'patient'}">${esc(l.speaker)}</span>` : ''}
+                   <span class="flag-line-text" dir="auto">${esc(l.text)}</span>
+               </div>`).join('')}
+           </div>`
+        : '';
+
+    return titleHTML + fieldsHTML + transcriptHTML;
 }
 function statusClass(a) { return 'status-' + (a||'error').toLowerCase().replace(/\s+/g,'_'); }
 function severityClass(s) { return 'severity-' + (s||'minor').toLowerCase(); }
@@ -462,13 +614,25 @@ async function escalateViolation(rIdx, fIdx, btn) {
     );
 }
 
-/* ── enable Run button only when both fields are filled ── */
+/* ── number of most recent chats to check (1–100), or null when invalid ── */
+function chatLimit() {
+    const n = Number($('chatLimit').value);
+    return Number.isInteger(n) && n >= 1 && n <= 100 ? n : null;
+}
+
+/* ── enable Run button only when every field is valid ── */
 function checkReady() {
-    const ok = $('emailSelect').value && $('filterDate').value;
+    const id = $('conversationId').value.trim();
+    const hasId = id.length > 0;
+    for (const field of ['emailSelect', 'filterDate', 'chatLimit']) $(field).disabled = hasId;
+    const validId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    const ok = hasId ? validId : ($('emailSelect').value && $('filterDate').value && chatLimit() !== null);
     $('runBtn').disabled = !ok;
 }
 $('emailSelect').addEventListener('change', checkReady);
 $('filterDate').addEventListener('change', checkReady);
+$('chatLimit').addEventListener('input', checkReady);
+$('conversationId').addEventListener('input', checkReady);
 
 /* ── set today as default date ── */
 const today = new Date().toISOString().slice(0,10);
@@ -509,15 +673,20 @@ async function loadEmails() {
 $('runBtn').addEventListener('click', async () => {
     const email = $('emailSelect').value;
     const date  = $('filterDate').value;
-    if (!email || !date) return;
+    const limit = chatLimit();
+    const id = $('conversationId').value.trim();
+    if (id ? !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+           : (!email || !date || limit === null)) return;
 
     $('runBtn').disabled = true;
     $('resultsSection').style.display = 'none';
     showError('');
-    showStatus(true, `Retrieving chats for ${email} on ${date}…`);
+    showStatus(true, id ? `Retrieving conversation ${id}…` : `Retrieving up to ${limit} chats for ${email} on ${date}…`);
 
     try {
-        const url = `${API_BASE}/retrieve-and-analyze?agent_email=${encodeURIComponent(email)}&filter_date=${encodeURIComponent(date)}`;
+        const params = id ? new URLSearchParams({ conversation_id: id })
+                          : new URLSearchParams({ agent_email: email, filter_date: date, chat_limit: String(limit) });
+        const url = `${API_BASE}/retrieve-and-analyze?${params}`;
         const res = await fetch(url, { method: 'POST' });
 
         if (!res.ok) {
@@ -611,8 +780,7 @@ function callRecordHTML(r, idx) {
                 <span class="type-badge ${typeClass(f.type)}">${esc(f.type)}</span>
                 <span class="severity-badge ${severityClass(f.severity)}">${esc(f.severity)}</span>
             </div>
-            <p>${esc(f.description)}</p>
-            <div class="excerpt-box">${esc(f.transcript_excerpt)}</div>
+            ${flagBodyHTML(f)}
             <div class="compliance-footer">
                 <button
                     class="escalate-btn"

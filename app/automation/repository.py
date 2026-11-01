@@ -140,7 +140,10 @@ def insert_interval(
     )
 
 
-def due_intervals(conn: sqlite3.Connection, now: Optional[datetime] = None) -> list[sqlite3.Row]:
+def due_intervals(
+    conn: sqlite3.Connection, now: Optional[datetime] = None,
+    *, min_reporting_date: Optional[date] = None,
+) -> list[sqlite3.Row]:
     """
     Every interval whose snapshot cutoff has passed and which is not yet
     terminal, oldest first.
@@ -158,9 +161,12 @@ def due_intervals(conn: sqlite3.Connection, now: Optional[datetime] = None) -> l
          WHERE i.Status IN ('pending', 'snapshotting')
            AND i.SnapshotCutoffUtc <= ?
            AND r.Status IN ('active', 'reconciling')
+           AND (r.ReportingDate >= ? OR ? IS NULL)
          ORDER BY i.SnapshotCutoffUtc, i.AgentEmailAddress
         """,
-        (utc_text(now),),
+        (utc_text(now),
+         min_reporting_date.isoformat() if min_reporting_date else None,
+         min_reporting_date.isoformat() if min_reporting_date else None),
     ).fetchall()
 
 
@@ -216,21 +222,39 @@ def selected_positions(conn: sqlite3.Connection, run_id: str, agent_email: str) 
     }
 
 
-def trailing_positions_from_previous_run(
-    conn: sqlite3.Connection, agent_email: str, previous_date: date
+def midnight_boundary_positions(
+    conn: sqlite3.Connection, agent_email: str, previous_date: date, policy_version: str
 ) -> set[int]:
-    """Selections at the tail of the previous reporting day, for midnight spacing."""
-    return {
-        row[0] for row in conn.execute(
-            """
-            SELECT c.SequencePosition
-              FROM QA_SamplingCandidates c
-              JOIN QA_SamplingRuns r ON r.RunId = c.RunId
-             WHERE c.AgentEmailAddress = ? AND r.ReportingDate = ? AND c.IsSelected = 1
-            """,
-            (agent_email, previous_date.isoformat()),
-        )
-    }
+    """
+    Positions to treat as already taken so spacing holds across midnight.
+
+    Sequence positions are numbered from 1 within each reporting day, so a
+    position from yesterday means nothing today. Merging yesterday's selected
+    positions into today's set — what this used to do — blocked unrelated
+    conversations: on 2026-10-17 an interval with 14 eligible candidates and a
+    quota of 1 selected none, because yesterday's numbers happened to sit next
+    to all 14 of today's.
+
+    The only cross-day fact that matters is whether the agent's LAST
+    conversation yesterday was selected. If it was, today's first conversation
+    directly follows it, so position 0 is returned: under the adjacency rule
+    that blocks today's position 1 and nothing else.
+    """
+    row = conn.execute(
+        """
+        SELECT c.IsSelected
+          FROM QA_SamplingCandidates c
+          JOIN QA_SamplingRuns r ON r.RunId = c.RunId
+         WHERE c.AgentEmailAddress = ?
+           AND r.ReportingDate = ?
+           AND r.SamplingPolicyVersion = ?
+           AND r.Status <> 'abandoned'
+         ORDER BY c.SequencePosition DESC
+         LIMIT 1
+        """,
+        (agent_email, previous_date.isoformat(), policy_version),
+    ).fetchone()
+    return {0} if row is not None and row[0] == 1 else set()
 
 
 def insert_candidates(conn: sqlite3.Connection, rows: Sequence[dict]) -> int:
@@ -319,12 +343,41 @@ def reserve_jobs(
     return reserved, skipped
 
 
+def has_claimable_job(
+    conn: sqlite3.Connection, now: Optional[datetime] = None,
+    *, min_reporting_date: Optional[date] = None,
+) -> bool:
+    """
+    Whether a worker would find anything to claim, answered from the ledger.
+
+    Lets the worker loop skip opening a CM_DWH connection when there is no
+    work. Without it an idle worker connected and disconnected every minute,
+    which is the connect/close loop seen in the daemon's output.
+    """
+    moment = now or datetime.now(UTC)
+    row = conn.execute(
+        """
+        SELECT 1 FROM QA_EvaluationJobs
+         WHERE (ReportingDate >= ? OR ? IS NULL)
+           AND ((Status IN ('pending', 'retry_wait')
+                AND (NextAttemptUtc IS NULL OR NextAttemptUtc <= ?))
+            OR (Status = 'running' AND LeaseExpiresUtc IS NOT NULL AND LeaseExpiresUtc <= ?))
+         LIMIT 1
+        """,
+        (min_reporting_date.isoformat() if min_reporting_date else None,
+         min_reporting_date.isoformat() if min_reporting_date else None,
+         utc_text(moment), utc_text(moment)),
+    ).fetchone()
+    return row is not None
+
+
 def claim_job(
     conn: sqlite3.Connection,
     *,
     owner: str,
     lease_minutes: int,
     now: Optional[datetime] = None,
+    min_reporting_date: Optional[date] = None,
 ) -> Optional[sqlite3.Row]:
     """
     Atomically claim one claimable job, or return None.
@@ -341,11 +394,14 @@ def claim_job(
             """
             SELECT JobId FROM QA_EvaluationJobs
              WHERE Status IN ('pending', 'retry_wait')
+               AND (ReportingDate >= ? OR ? IS NULL)
                AND (NextAttemptUtc IS NULL OR NextAttemptUtc <= ?)
              ORDER BY CreatedAtUtc, JobId
              LIMIT 1
             """,
-            (utc_text(moment),),
+            (min_reporting_date.isoformat() if min_reporting_date else None,
+             min_reporting_date.isoformat() if min_reporting_date else None,
+             utc_text(moment)),
         ).fetchone()
         if row is None:
             return None
@@ -463,7 +519,10 @@ def fail_job(
         return "failed"
 
 
-def recover_expired_leases(conn: sqlite3.Connection, now: Optional[datetime] = None) -> int:
+def recover_expired_leases(
+    conn: sqlite3.Connection, now: Optional[datetime] = None,
+    *, min_reporting_date: Optional[date] = None,
+) -> int:
     """
     Return jobs whose worker died to the claimable pool.
 
@@ -476,8 +535,11 @@ def recover_expired_leases(conn: sqlite3.Connection, now: Optional[datetime] = N
             "UPDATE QA_EvaluationJobs SET Status = 'retry_wait', NextAttemptUtc = ?, "
             "       LeaseOwner = NULL, LeaseExpiresUtc = NULL, "
             "       LastError = 'lease expired; worker presumed dead' "
-            " WHERE Status = 'running' AND LeaseExpiresUtc IS NOT NULL AND LeaseExpiresUtc <= ?",
-            (utc_text(moment), utc_text(moment)),
+            " WHERE Status = 'running' AND LeaseExpiresUtc IS NOT NULL AND LeaseExpiresUtc <= ?"
+            " AND (ReportingDate >= ? OR ? IS NULL)",
+            (utc_text(moment), utc_text(moment),
+             min_reporting_date.isoformat() if min_reporting_date else None,
+             min_reporting_date.isoformat() if min_reporting_date else None),
         )
         recovered = cursor.rowcount
     if recovered:
@@ -655,3 +717,51 @@ def repair_run(conn: sqlite3.Connection, run_id: str) -> dict:
         "run_reopened": reopened,
         "intervals_now_pending": pending,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Re-planning
+# ─────────────────────────────────────────────────────────────────────────────
+
+def abandon_run(conn: sqlite3.Connection, run_id: str) -> None:
+    """
+    Retire a run so the same date can be planned again.
+
+    Used when a day was planned against the wrong roster. The run's jobs are
+    kept — they are moved onto the replacement run by adopt_jobs — so work
+    already reserved or evaluated is neither lost nor repeated.
+    """
+    with transaction(conn):
+        conn.execute(
+            "UPDATE QA_SamplingRuns SET Status = 'abandoned', UpdatedAtUtc = ? WHERE RunId = ?",
+            (utc_text(), run_id),
+        )
+
+
+def reactivate_run(conn: sqlite3.Connection, run_id: str, status: str) -> None:
+    """Undo abandon_run when the replacement plan could not be created."""
+    with transaction(conn):
+        conn.execute(
+            "UPDATE QA_SamplingRuns SET Status = ?, UpdatedAtUtc = ? WHERE RunId = ?",
+            (status, utc_text(), run_id),
+        )
+
+
+def adopt_jobs(conn: sqlite3.Connection, old_run_id: str, new_run_id: str) -> int:
+    """
+    Move an abandoned run's jobs onto its replacement.
+
+    Keeps the daily budget honest: the replacement run's reserved count
+    includes work the old run already reserved, so a re-plan cannot push the
+    day past its target. The one-job-per-conversation index stops those
+    conversations being reserved a second time.
+
+    Candidate rows are deliberately NOT moved. Their sequence positions were
+    numbered under the old plan, and mixing them into the new run's numbering
+    would make the spacing rule compare unrelated positions.
+    """
+    with transaction(conn):
+        return conn.execute(
+            "UPDATE QA_EvaluationJobs SET RunId = ? WHERE RunId = ?",
+            (new_run_id, old_run_id),
+        ).rowcount

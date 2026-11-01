@@ -95,7 +95,7 @@ evaluation_guidance:
 
   scoring_outcomes:
     SUITABLE_OFFER_RECOMMENDED:
-      flag_type: "positive"
+      flag_type: null
       description: "Agent correctly identified and presented the matching offer — no violation."
     UNRELATED_OFFER_RECOMMENDED:
       flag_type: "C2B"

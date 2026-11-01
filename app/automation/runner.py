@@ -2,14 +2,15 @@
 The automation process entrypoint.
 
     python -m app.automation.runner                 # the daemon
-    python -m app.automation.runner plan   --date 2026-10-29
-    python -m app.automation.runner dry-run --date 2026-10-29
+    python -m app.automation.runner plan                 # today in the reporting timezone
     python -m app.automation.runner dispatch
     python -m app.automation.runner work
-    python -m app.automation.runner reconcile --date 2026-10-29
-    python -m app.automation.runner status --date 2026-10-29
-    python -m app.automation.runner backfill --date 2026-10-29
+    python -m app.automation.runner reconcile --date YYYY-MM-DD
+    python -m app.automation.runner status               # today in the reporting timezone
+    python -m app.automation.runner backfill --date YYYY-MM-DD
+    QA_LEDGER_DB_PATH=/tmp/qa-dry-run.sqlite3 python -m app.automation.runner dry-run --date YYYY-MM-DD
     python -m app.automation.runner repair                  # unstick a wedged ledger
+    python -m app.automation.runner replan --date YYYY-MM-DD  # re-plan against the CM roster
 
 Deliberately NOT wired into FastAPI's lifespan. Uvicorn with several workers
 would start one scheduler per worker, and three schedulers planning the same
@@ -38,6 +39,7 @@ from typing import Optional
 
 from app.automation import repository as repo
 from app.automation.config import AutomationSettings, automation_settings
+from app.automation.calendar import reporting_day
 from app.automation.db import open_ledger
 from app.automation.backfill import backfill_run
 from app.automation.dispatcher import dispatch_once
@@ -85,9 +87,48 @@ def _analyzer():
     return QAAgent(llm_client=LLMClient(provider=app_settings.llm_provider, model=app_settings.llm_model))
 
 
-def _roster(dwh_engine) -> list[dict]:
-    """The active agent roster. There is no shift model — see roster.py."""
-    return fetch_active_agents(dwh_engine)
+class _CMSession:
+    """
+    One CM_DWH connection, opened on first use and kept for the life of a loop.
+
+    The loops used to open a fresh connection on every iteration and close it
+    straight after — every 60 seconds for an idle worker — which is the
+    endless "Connected / Database connection closed" output. A dropped
+    connection is still recovered: the query layer reconnects on transient
+    errors, and a loop that fails outright calls reset() so the next iteration
+    starts clean.
+    """
+
+    def __init__(self, settings: AutomationSettings):
+        self._settings = settings
+        self._handler = None
+
+    def handler(self):
+        if self._handler is None:
+            self._handler = _cm_handler(self._settings)
+        return self._handler
+
+    def reset(self) -> None:
+        if self._handler is not None:
+            try:
+                self._handler.close()
+            except Exception:                                      # noqa: BLE001
+                pass  # already gone
+        self._handler = None
+
+    close = reset
+
+
+def _roster(cm_handler, settings: AutomationSettings, reporting_date: date) -> list[dict]:
+    """
+    The CM agents to plan *reporting_date* for — see roster.fetch_active_agents.
+    The look-back ends where that reporting day starts.
+    """
+    day = reporting_day(reporting_date, settings.tz)
+    return fetch_active_agents(
+        cm_handler, day_start_utc=day.start_utc,
+        lookback_days=settings.roster_lookback_days,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,8 +137,12 @@ def _roster(dwh_engine) -> list[dict]:
 
 def cmd_plan(settings: AutomationSettings, reporting_date: date) -> int:
     conn = open_ledger(settings.ledger_db_path)
-    result = plan_day(conn, reporting_date=reporting_date, settings=settings,
-                      agents=_roster(_dwh_engine()))
+    handler = _cm_handler(settings)
+    try:
+        agents = _roster(handler, settings, reporting_date)
+    finally:
+        handler.close()
+    result = plan_day(conn, reporting_date=reporting_date, settings=settings, agents=agents)
     print(json.dumps({
         "run_id": result.run_id, "date": str(result.reporting_date),
         "created": result.created, "agents": result.agent_count,
@@ -159,7 +204,7 @@ def cmd_dry_run(settings: AutomationSettings, reporting_date: date) -> int:
     handler = _cm_handler(settings)
     try:
         plan = plan_day(conn, reporting_date=reporting_date, settings=settings,
-                        agents=_roster(_dwh_engine()))
+                        agents=_roster(handler, settings, reporting_date))
 
         # Dispatch with the clock wound past the end of the day so that every
         # interval is due at once, rather than only those whose cutoff has
@@ -197,6 +242,51 @@ def cmd_dry_run(settings: AutomationSettings, reporting_date: date) -> int:
         "errors": report.errors[:20],
         "note": "NO inference was run. Re-run on a fresh ledger and compare "
                 "selection_fingerprint to prove determinism.",
+    }, indent=2))
+    return 0
+
+
+def cmd_replan(settings: AutomationSettings, reporting_date: date) -> int:
+    """
+    Plan a day again against the current roster, keeping its existing jobs.
+
+    For a day that was planned against the wrong agent list — every run made
+    while the roster came from DWH.AI.Agents. The old run is abandoned, a new
+    plan is made from the CM roster, and the old run's jobs move onto it, so
+    nothing already reserved or evaluated is repeated and the daily budget
+    still counts them.
+    """
+    conn = open_ledger(settings.ledger_db_path)
+    old = repo.get_run(conn, reporting_date, settings.sampling_policy_version)
+
+    handler = _cm_handler(settings)
+    try:
+        agents = _roster(handler, settings, reporting_date)
+    finally:
+        handler.close()
+    if not agents:
+        print(json.dumps({"error": "the CM roster is empty; the existing plan was left untouched"}))
+        return 1
+
+    if old is not None:
+        repo.abandon_run(conn, old["RunId"])
+    try:
+        plan = plan_day(conn, reporting_date=reporting_date, settings=settings, agents=agents)
+    except Exception:
+        if old is not None:
+            repo.reactivate_run(conn, old["RunId"], old["Status"])
+        raise
+
+    moved = repo.adopt_jobs(conn, old["RunId"], plan.run_id) if old is not None else 0
+    print(json.dumps({
+        "date": str(reporting_date),
+        "abandoned_run": old["RunId"] if old is not None else None,
+        "new_run": plan.run_id,
+        "agents": plan.agent_count,
+        "allocated": plan.allocated,
+        "target": plan.target,
+        "jobs_carried_over": moved,
+        "notes": plan.notes,
     }, indent=2))
     return 0
 
@@ -268,34 +358,49 @@ def cmd_status(settings: AutomationSettings, reporting_date: date) -> int:
 
 async def _planner_loop(conn, settings: AutomationSettings) -> None:
     """Plan today (and yesterday, if it was missed) then reconcile closed days."""
-    while not _shutdown.is_set():
-        try:
-            today = datetime.now(settings.tz).date()
-            roster = _roster(_dwh_engine())
-            for day in (today, today - timedelta(days=1)):
-                if repo.get_run(conn, day, settings.sampling_policy_version) is None:
-                    plan_day(conn, reporting_date=day, settings=settings, agents=roster)
+    session = _CMSession(settings)
+    try:
+        while not _shutdown.is_set():
+            try:
+                today = datetime.now(settings.tz).date()
+                # Only touch CM when a day actually needs a plan — the roster
+                # query takes ~30 seconds and is pointless once both exist.
+                for day in (today, today - timedelta(days=1)):
+                    if settings.automation_start_date and day < settings.automation_start_date:
+                        continue
+                    if repo.get_run(conn, day, settings.sampling_policy_version) is None:
+                        agents = _roster(session.handler(), settings, day)
+                        plan_day(conn, reporting_date=day, settings=settings, agents=agents)
 
-            yesterday = today - timedelta(days=1)
-            if day_is_reconcilable(conn, settings, yesterday):
-                reconcile_day(conn, settings, reporting_date=yesterday)
-        except Exception:                                          # noqa: BLE001
-            logger.exception("planner loop iteration failed; continuing")
+                yesterday = today - timedelta(days=1)
+                if (
+                    (not settings.automation_start_date or yesterday >= settings.automation_start_date)
+                    and day_is_reconcilable(conn, settings, yesterday)
+                ):
+                    reconcile_day(conn, settings, reporting_date=yesterday)
+            except Exception:                                      # noqa: BLE001
+                logger.exception("planner loop iteration failed; continuing")
+                session.reset()
 
-        await _sleep_or_shutdown(600)
+            await _sleep_or_shutdown(600)
+    finally:
+        session.close()
 
 
 async def _dispatcher_loop(conn, settings: AutomationSettings) -> None:
-    while not _shutdown.is_set():
-        try:
-            handler = _cm_handler(settings)
+    session = _CMSession(settings)
+    try:
+        while not _shutdown.is_set():
             try:
-                dispatch_once(conn, handler, settings)
-            finally:
-                handler.close()
-        except Exception:                                          # noqa: BLE001
-            logger.exception("dispatcher loop iteration failed; continuing")
-        await _sleep_or_shutdown(settings.dispatch_interval_seconds)
+                # Connect only when an interval is actually due.
+                if repo.due_intervals(conn, min_reporting_date=settings.automation_start_date):
+                    dispatch_once(conn, session.handler(), settings)
+            except Exception:                                      # noqa: BLE001
+                logger.exception("dispatcher loop iteration failed; continuing")
+                session.reset()
+            await _sleep_or_shutdown(settings.dispatch_interval_seconds)
+    finally:
+        session.close()
 
 
 async def _worker_loop(settings: AutomationSettings) -> None:
@@ -305,23 +410,32 @@ async def _worker_loop(settings: AutomationSettings) -> None:
     try:
         analyzer = _analyzer()
         dwh = _dwh_engine()
-        while not _shutdown.is_set():
-            try:
-                handler = _cm_handler(settings)
+        session = _CMSession(settings)
+        try:
+            while not _shutdown.is_set():
                 try:
+                    # Checked in the ledger first, so an idle worker never
+                    # opens a CM connection — previously it connected and
+                    # disconnected every minute with nothing to do.
+                    if not repo.has_claimable_job(
+                        conn, min_reporting_date=settings.automation_start_date,
+                    ):
+                        await _sleep_or_shutdown(60)
+                        continue
                     report = await work_once(
-                        conn, handler, dwh, analyzer, settings,
+                        conn, session.handler(), dwh, analyzer, settings,
                         should_stop=_shutdown.is_set,
                     )
-                finally:
-                    handler.close()
-                # A 402 cannot improve through immediate retries. Keep jobs
-                # available and try again after the provider can be funded.
-                delay = 300 if report.quota_paused else (5 if report.claimed else 60)
-                await _sleep_or_shutdown(delay)
-            except Exception:                                      # noqa: BLE001
-                logger.exception("worker loop iteration failed; continuing")
-                await _sleep_or_shutdown(60)
+                    # A 402 cannot improve through immediate retries. Keep jobs
+                    # available and try again after the provider can be funded.
+                    delay = 300 if report.quota_paused else (5 if report.claimed else 60)
+                    await _sleep_or_shutdown(delay)
+                except Exception:                                  # noqa: BLE001
+                    logger.exception("worker loop iteration failed; continuing")
+                    session.reset()
+                    await _sleep_or_shutdown(60)
+        finally:
+            session.close()
     finally:
         conn.close()
 
@@ -375,7 +489,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "command", nargs="?", default="daemon",
         choices=["daemon", "plan", "dispatch", "work", "reconcile",
-                 "dry-run", "status", "repair", "backfill"],
+                 "dry-run", "status", "repair", "backfill", "replan"],
     )
     parser.add_argument("--date", help="Reporting date, YYYY-MM-DD. Defaults to today in the reporting timezone.")
     args = parser.parse_args(argv)
@@ -403,6 +517,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_repair(settings, date.fromisoformat(args.date) if args.date else None)
     if args.command == "backfill":
         return cmd_backfill(settings, reporting_date)
+    if args.command == "replan":
+        return cmd_replan(settings, reporting_date)
     return 1
 
 

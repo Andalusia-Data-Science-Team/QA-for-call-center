@@ -85,9 +85,7 @@ class FakeCM:
                         ),
                         "StartDateTimeUtc": moment.replace(tzinfo=None) - timedelta(minutes=10),
                         "LastUpdatedUtc": moment.replace(tzinfo=None) + timedelta(minutes=5),
-                        "HumanMessageCount": 4,
-                        "TotalMessageCount": 9,
-                        "WasForwarded": 0,
+                        "AgentReplied": 1,
                         "WebStoreName": "AHJ",
                     })
                 moment += timedelta(minutes=self.cadence)

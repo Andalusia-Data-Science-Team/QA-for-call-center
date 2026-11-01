@@ -17,8 +17,8 @@ PASSCODE_FILE = "/home/ai/Workspace/Rafik/QA_System-main/app/Passcode.json"  # P
 DB_KEY = "CM"  # Key in passcode.json DB_NAMES section
 
 # Fallback configuration (if passcode.json not found)
-DB_SERVER = "ROBINDWH.ROBINHQ.COM"
-DB_NAME = "RHQ_Andalusia_Group"
+DB_SERVER = "CM_DWH"
+DB_NAME = "msc_sub_35033_XYLJV"
 SQL_FILE = "/home/ai/Workspace/Rafik/QA_System-main/app/SQL/CM_users.sql"
 OUTPUT_FILE = f"CM_Users.xlsx"
 

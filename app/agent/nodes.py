@@ -107,6 +107,7 @@ from app.services.text_helpers import (
     split_transcript_turns,
 )
 from app.service_hub.crm_leads_validation import (
+    apply_notes_phone_check,
     fetch_crm_lead,
     missing_lead_evaluation,
     matched_crm_lead_attributes,
@@ -129,12 +130,6 @@ from app.services.get_patient import (
     get_token_for_env,
     build_patient_url,
     login,
-)
-from app.FAQs.faq_validation import (
-    detect_faq_escalation as transcript_has_faq_escalation,
-    lookup_faq_record,
-    missing_faq_evaluation,
-    normalize_faq_evaluation,
 )
 
 logger = logging.getLogger(__name__)
@@ -1064,7 +1059,7 @@ async def fetch_crm_services_for_call(state: AgentState) -> dict:
             call_id, service_hint
         )
     
-    business_unit: str = (getattr(call, "business_unit", None) or "LIVE")
+    business_unit: str = (getattr(call, "business_unit", None) or "AHJ")
 
     # Split service_hint by newlines to handle multiple service names
     # (e.g., when agent mentions multiple services in one conversation)
@@ -1223,7 +1218,7 @@ async def fetch_crm_packages_for_call(state: AgentState) -> dict:
         return {"crm_packages_context": "", "node_trace": _trace(state, "fetch_crm_packages_for_call")}
 
     service_hint: str = (details.get("offer_name") or "").strip()
-    business_unit: str = (getattr(call, "business_unit", None) or "LIVE")
+    business_unit: str = (getattr(call, "business_unit", None) or "AHJ")
 
     logger.info(
         "fetch_crm_packages_for_call | call_id=%s specialty=%r bu=%s hint=%r",
@@ -1326,12 +1321,12 @@ async def infer_offer_evaluation(
 
     Evaluates the agent's offer recommendation behaviour against the four
     possible outcomes:
-      • SUITABLE_OFFER_RECOMMENDED   — positive flag
-      • OFFER_SKIPPED                — C2B moderate flag
-      • UNRELATED_OFFER_RECOMMENDED  — C2B moderate flag
-      • OFFER_MISREPRESENTED         — C2B moderate flag
-      • INCOMPLETE_OFFER_PRESENTATION — NC minor flag
-      • MISSING_OFFER_CONFIRMATION_ASK — NC minor flag
+      • SUITABLE_OFFER_RECOMMENDED   — no flag (pass)
+      • OFFER_SKIPPED                — C2B critical flag
+      • UNRELATED_OFFER_RECOMMENDED  — C2B critical flag
+      • OFFER_MISREPRESENTED         — C2B critical flag
+      • INCOMPLETE_OFFER_PRESENTATION — NC critical flag
+      • MISSING_OFFER_CONFIRMATION_ASK — NC critical flag
       • NO_OFFER_AVAILABLE           — no flag
       • OFFER_NOT_APPLICABLE         — no flag
 
@@ -1394,11 +1389,11 @@ async def infer_service_evaluation(
 
     Evaluates the agent's service recommendation behaviour against possible
     outcomes:
-      • SUITABLE_SERVICE_RECOMMENDED    — positive flag
-      • SERVICE_SKIPPED                 — C2B moderate flag
-      • UNRELATED_SERVICE_RECOMMENDED   — C2B moderate flag
-      • SERVICE_MISREPRESENTED          — C2B moderate flag
-      • INCOMPLETE_SERVICE_PRESENTATION — NC minor flag
+      • SUITABLE_SERVICE_RECOMMENDED    — no flag (pass)
+      • SERVICE_SKIPPED                 — C2B critical flag
+      • UNRELATED_SERVICE_RECOMMENDED   — C2B critical flag
+      • SERVICE_MISREPRESENTED          — C2B critical flag
+      • INCOMPLETE_SERVICE_PRESENTATION — NC critical flag
       • NO_SERVICE_AVAILABLE            — no flag
       • SERVICE_NOT_APPLICABLE          — no flag
 
@@ -1424,23 +1419,12 @@ async def infer_service_evaluation(
 
     outcome = data.get("service_outcome", "SERVICE_NOT_APPLICABLE")
     matched_services = state.get("crm_matched_services") or []
-    if outcome == "SUITABLE_SERVICE_RECOMMENDED" and matched_services:
-        summary = _format_matched_services_summary(matched_services)
-        data["service_reasoning"] = summary
-        flags = list(data.get("service_flags") or [])
-        positive_flag = next((flag for flag in flags if flag.get("type") == "positive"), None)
-        if positive_flag is None:
-            flags.append(
-                {
-                    "type": "positive",
-                    "severity": "positive",
-                    "description": summary,
-                    "transcript_excerpt": "N/A",
-                }
-            )
-        else:
-            positive_flag["description"] = summary
-        data["service_flags"] = flags
+    if outcome == "SUITABLE_SERVICE_RECOMMENDED":
+        # A suitable recommendation is a pass — no flag. The CRM-verified
+        # summary goes into the reasoning only.
+        if matched_services:
+            data["service_reasoning"] = _format_matched_services_summary(matched_services)
+        data["service_flags"] = []
 
     logger.info(
         "infer_service_evaluation | call_id=%s outcome=%s flags=%d",
@@ -1471,11 +1455,11 @@ async def infer_package_evaluation(
 
     Evaluates the agent's package recommendation behaviour against possible
     outcomes:
-      • SUITABLE_PACKAGE_RECOMMENDED    — positive flag
-      • PACKAGE_SKIPPED                 — C2B moderate flag
-      • UNRELATED_PACKAGE_RECOMMENDED   — C2B moderate flag
-      • PACKAGE_MISREPRESENTED          — C2B moderate flag
-      • INCOMPLETE_PACKAGE_PRESENTATION — NC minor flag
+      • SUITABLE_PACKAGE_RECOMMENDED    — no flag (pass)
+      • PACKAGE_SKIPPED                 — C2B critical flag
+      • UNRELATED_PACKAGE_RECOMMENDED   — C2B critical flag
+      • PACKAGE_MISREPRESENTED          — C2B critical flag
+      • INCOMPLETE_PACKAGE_PRESENTATION — NC critical flag
       • NO_PACKAGE_AVAILABLE            — no flag
       • PACKAGE_NOT_APPLICABLE          — no flag
 
@@ -1561,7 +1545,10 @@ async def validate_crm_lead(
 ) -> dict:
     """Fetch and validate the CRM lead associated with the retrieved chat."""
     call = state["call"]
-    lookup = fetch_crm_lead(call.Patient_Phone, call.call_date)
+    # A transferred chat has several agents; the lead is matched to whichever
+    # of them recorded it.
+    chat_agents = list(dict.fromkeys([*getattr(call, "agent_names", []), call.agent_name]))
+    lookup = fetch_crm_lead(call.Patient_Phone, call.call_date, agent_names=chat_agents)
     status = lookup.get("status")
     logger.info(
         "validate_crm_lead | call_id=%s phone=%s report_date=%s crm_lead_status=%s",
@@ -1611,7 +1598,9 @@ async def validate_crm_lead(
     if err:
         return err
 
-    evaluation = normalize_crm_lead_evaluation(data)
+    evaluation = apply_notes_phone_check(
+        normalize_crm_lead_evaluation(data), lookup, call.Patient_Phone,
+    )
     matched_attributes = matched_crm_lead_attributes(
         evaluation,
         lookup.get("record") or {},
@@ -1668,12 +1657,12 @@ async def detect_faq_escalation(state: AgentState) -> dict:
 async def validate_faq_record(
     state: AgentState,
     llm_client: LLMClient,
-    csv_path: Path | None = None,
+    db_key: str = "SERVICE_HUB",
 ) -> dict:
     """Lookup and validate the same-day FAQ record for an escalation claim."""
     call = state["call"]
     lookup = lookup_faq_record(
-        csv_path=csv_path,
+        db_key=db_key,
         patient_phone=call.Patient_Phone,
         call_date=call.call_date,
         agent_name=call.agent_name,
@@ -1690,7 +1679,7 @@ async def validate_faq_record(
     if status == "unavailable":
         return {
             "faq_lookup": lookup,
-            "error": f"validate_faq_record: {lookup.get('message', 'FAQ CSV unavailable.')}",
+            "error": f"validate_faq_record: {lookup.get('message', 'FAQ database unavailable.')}",
             "error_node": "validate_faq_record",
             "node_trace": _trace(state, "validate_faq_record"),
         }
@@ -1751,6 +1740,20 @@ async def validate_faq_record(
 #   into the final overall assessment and classification.
 # ---------------------------------------------------------------------------
 
+def _strip_severity(value: Any) -> Any:
+    """Recursively drop every "severity" key. Severity is hardcoded at
+    persistence time and must never reach the LLM as context."""
+    if isinstance(value, dict):
+        return {k: _strip_severity(v) for k, v in value.items() if k != "severity"}
+    if isinstance(value, list):
+        return [_strip_severity(v) for v in value]
+    return value
+
+
+def _llm_context_json(value: Any) -> str:
+    return json.dumps(_strip_severity(value), ensure_ascii=False, default=str)
+
+
 async def infer_overall_scoring(
     state: AgentState, llm_client: LLMClient
 ) -> dict:
@@ -1763,21 +1766,21 @@ async def infer_overall_scoring(
     call = state["call"]
 
     # Serialise the three sub-results as compact JSON strings for injection
-    behavioral_summary = json.dumps(state.get("behavioral_eval") or {}, ensure_ascii=False)
-    compliance_summary = json.dumps(state.get("compliance_eval") or {}, ensure_ascii=False)    
-    reservation_summary = json.dumps(state.get("reservation_eval") or {}, ensure_ascii=False)
-    script_summary     = json.dumps(state.get("script_eval") or {},     ensure_ascii=False)
-    crm_lead_summary   = json.dumps(state.get("crm_lead_eval") or {},   ensure_ascii=False)
-    faq_summary        = json.dumps(state.get("faq_eval") or {},        ensure_ascii=False)
+    behavioral_summary = _llm_context_json(state.get("behavioral_eval") or {})
+    compliance_summary = _llm_context_json(state.get("compliance_eval") or {})    
+    reservation_summary = _llm_context_json(state.get("reservation_eval") or {})
+    script_summary     = _llm_context_json(state.get("script_eval") or {})
+    crm_lead_summary   = _llm_context_json(state.get("crm_lead_eval") or {})
+    faq_summary        = _llm_context_json(state.get("faq_eval") or {})
     # Include the masked deterministic outcomes in scoring; otherwise these
     # graph nodes would run without being able to influence the final
     # assessment. Bank and location are independent nodes/state keys now.
-    bank_summary       = json.dumps(state.get("bank_validation") or {}, ensure_ascii=False)
-    location_summary   = json.dumps(state.get("location_validation") or {}, ensure_ascii=False)
-    doctor_summary       = json.dumps(state.get("doctor_validation") or {}, ensure_ascii=False)
-    doctor_scope_summary = json.dumps(state.get("doctor_scope_validation") or {}, ensure_ascii=False)
-    coe_summary          = json.dumps(state.get("coe_validation") or {}, ensure_ascii=False)
-    patient_profile_summary = json.dumps(state.get("patient_profile_eval") or {}, ensure_ascii=False)
+    bank_summary       = _llm_context_json(state.get("bank_validation") or {})
+    location_summary   = _llm_context_json(state.get("location_validation") or {})
+    doctor_summary       = _llm_context_json(state.get("doctor_validation") or {})
+    doctor_scope_summary = _llm_context_json(state.get("doctor_scope_validation") or {})
+    coe_summary          = _llm_context_json(state.get("coe_validation") or {})
+    patient_profile_summary = _llm_context_json(state.get("patient_profile_eval") or {})
 
     user_prompt = build_scoring_prompt(
         call,
@@ -1901,7 +1904,7 @@ def _build_doctor_compliance_flags(doctor: dict[str, Any]) -> tuple[list[dict], 
     warning_details per doctor, see _result() in doctor_validation.py).
 
     Genuine field-level violations (failure_details — degree/specialty/
-    fee/etc. mismatches) become detailed C2B "moderate" flags, one per
+    fee/etc. mismatches) become detailed C2B "critical" flags, one per
     failed field, quoting exactly what the Agent said vs the authoritative
     CRM value and the local transcript evidence — replacing the old,
     single generic "N of M recommended doctor(s) failed validation: names."
@@ -1947,7 +1950,7 @@ def _build_doctor_compliance_flags(doctor: dict[str, Any]) -> tuple[list[dict], 
             if excerpt:
                 description += f" / Evidence: {excerpt}"
             c2b_flags.append({
-                "type": "C2B", "severity": "moderate",
+                "type": "C2B", "severity": "critical",
                 "description": description,
                 "transcript_excerpt": excerpt or "Doctor information supplied by agent.",
             })
@@ -1966,7 +1969,7 @@ def _build_doctor_compliance_flags(doctor: dict[str, Any]) -> tuple[list[dict], 
 
     if doctor.get("is_violation") and not c2b_flags:
         c2b_flags.append({
-            "type": "C2B", "severity": "moderate",
+            "type": "C2B", "severity": "critical",
             "description": doctor.get("reason", "Doctor information validation failed."),
             "transcript_excerpt": "Doctor information supplied by agent.",
         })
@@ -2019,14 +2022,14 @@ async def aggregate_results(state: AgentState) -> dict:
     bank_flags = []
     if bank.get("is_violation"):
         bank_flags.append({
-            "type": "C2B", "severity": "moderate",
+            "type": "C2B", "severity": "critical",
             "description": bank.get("reason", "KSA bank-account validation failed."),
             "transcript_excerpt": "Bank information supplied by agent (identifier masked).",
         })
     location_flags = []
     if location.get("is_violation"):
         location_flags.append({
-            "type": "C2B", "severity": "moderate",
+            "type": "C2B", "severity": "critical",
             "description": location.get("reason", "KSA branch/location validation failed."),
             "transcript_excerpt": "Location information supplied by agent.",
         })
@@ -2040,7 +2043,7 @@ async def aggregate_results(state: AgentState) -> dict:
     doctor_flags, doctor_warnings = _build_doctor_compliance_flags(doctor)
     if doctor_scope.get("is_violation"):
         doctor_flags.append({
-            "type": "C2B", "severity": "moderate",
+            "type": "C2B", "severity": "critical",
             "description": doctor_scope.get("reasoning", "The recommended doctor's documented scope does not match the patient's stated need."),
             "transcript_excerpt": "Doctor recommendation given by agent.",
         })
@@ -2051,13 +2054,13 @@ async def aggregate_results(state: AgentState) -> dict:
     coe_flags = []
     if coe.get("coe_match_status") == "fail":
         coe_flags.append({
-            "type": "C2B", "severity": "moderate",
+            "type": "C2B", "severity": "critical",
             "description": coe.get("reason", "The agent recommended a Center of Excellence that does not match the patient's primary complaint."),
             "transcript_excerpt": (coe.get("evidence") or [""])[0] or "COE recommendation given by agent.",
         })
     if coe.get("primary_doctor_status") == "fail":
         coe_flags.append({
-            "type": "C2B", "severity": "moderate",
+            "type": "C2B", "severity": "critical",
             "description": coe.get("reason", "The initial COE booking did not start with an approved primary doctor."),
             "transcript_excerpt": "Initial COE doctor offered by agent.",
         })
@@ -2137,6 +2140,13 @@ async def aggregate_results(state: AgentState) -> dict:
     deduped_flags: list[dict] = []
     for flag in all_flags:
         flag = _normalize_flag_type(flag)
+        # Flags are violations only: drop any positive/no-violation finding.
+        # The prompts no longer ask for severity, so every remaining violation
+        # is stored as critical (the DWH Severity column and dashboards still read it).
+        if flag.get("severity") == "positive":
+            continue
+        if flag.get("severity") != "critical":
+            flag = {**flag, "severity": "critical"}
         excerpt = str(flag.get("transcript_excerpt") or "").strip()
         evidence_key = (
             str(flag.get("description") or "")[:80]
@@ -2941,18 +2951,21 @@ async def verify_appointment_in_db(state: AgentState) -> dict:
         if not passcodes_path.exists():
             raise FileNotFoundError(f"Passcode file not found: {passcodes_path}")
 
-        business_unit: str = (state.get("call").business_unit or "LIVE")
+        business_unit: str = (state.get("call").business_unit or "AHJ")
         print("business_unit",business_unit)
+        # Passcode.json keys the MKR/ADC/JDC branch's HCMS DB as "MKR",
+        # and HJH is the AHJ branch.
+        db_key = {"ADC": "MKR", "JDC": "MKR", "HJH": "AHJ"}.get(business_unit, business_unit)
         with passcodes_path.open("r", encoding="utf-8") as handle:
             db_config = json.load(handle)["DB_NAMES"]
-            if business_unit not in db_config:
+            if db_key not in db_config:
                 logger.warning(
                     "verify_appointment_in_db | call_id=%s — unknown business_unit=%s, "
-                    "falling back to LIVE",
+                    "falling back to AHJ",
                     call_id, business_unit,
                 )
-                business_unit = "LIVE"
-            passcodes = db_config[business_unit]
+                db_key = "AHJ"
+            passcodes = db_config[db_key]
 
         server = passcodes["Server"]
         db_name = passcodes["Database"]
@@ -2987,7 +3000,7 @@ async def verify_appointment_in_db(state: AgentState) -> dict:
 
         bind_params: dict[str, object] = {
             "ReportDate":   appointment_date or None,
-            "Specialty":    specialty_norm,
+            "Specialty":    None,
             "Doctor":       (doctor_pattern.strip().split()[0]) if doctor_pattern else None,
             "PatientPhone": ("0" + patient_phone) if patient_phone else None,
             "PatientName":  patient_pattern,

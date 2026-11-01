@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import unicodedata
 from pathlib import Path
 from typing import Any
 
+import pyodbc
 
-FAQ_CSV_PATH = Path(__file__).with_name("FAQ_latest.csv")
+
+FAQ_SQL_PATH = Path(__file__).resolve().parent.parent / "SQL" / "faq_query.sql"
+FAQ_PASSCODE_PATH = Path(__file__).resolve().parent.parent / "Passcode.json"
 FAQ_REQUIRED_COLUMNS = frozenset(
     {
         "ID",
@@ -20,14 +24,15 @@ FAQ_REQUIRED_COLUMNS = frozenset(
         "Inquiry",
         "Response",
         "AgentName",
-        "AgentEmail",
+        #"AgentEmail",
         "End Call Result",
+        "CST Inquiry / Request Details",
     }
 )
 
 FAQ_RULES = {
-    "C2B_017": ("C2B", "moderate"),
-    "C2B_021": ("C2B", "moderate"),
+    "C2B_017": ("C2B", "critical"),
+    "C2B_021": ("C2B", "critical"),
     "C2C_023": ("C2C", "critical"),
     "C2C_024": ("C2C", "critical"),
 }
@@ -48,10 +53,6 @@ _ARABIC_CHAR_TRANSLATION = str.maketrans(
 )
 
 _RAISE_OR_ESCALATE_TERMS = (
-    "رفع",
-    "تصعيد",
-    "صعد",
-    "تقديم",
     "تم تقديم طلب",
     "تم رفع طلب",
     "تم تقديم الطلب",
@@ -60,45 +61,32 @@ _RAISE_OR_ESCALATE_TERMS = (
     "escalat",
 )
 _SEND_OR_TRANSFER_TERMS = (
-    "ارسل",
-    "حول",
-    "تحويل",
    "تقديم",
     "تم تقديم طلب",
     "تم رفع طلب",
     "تم تقديم الطلب",
-    "submit",
-    "send",
-    "sent",
     "forward",
     "transfer",
 )
 _REQUEST_TERMS = (
-    "طلب",
-    "الطلب",
-    "استفسار",
     "شكوي",
     "بلاغ",
     "تذكره",
     "request",
-    "inquiry",
     "complaint",
     "ticket",
     "case",
 )
 _DESTINATION_TERMS = (
-    "قسم",
-    "جهه",
     "فريق",
     "مختص",
     "معني",
     "مسؤول",
     "اداره",
-    "department",
     "team",
     "concerned",
     "responsible",
-    "speciali",
+    "specialized",
 )
 
 
@@ -128,9 +116,8 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
 
 
 def _agent_message_text(transcript: str) -> str:
-    """Return labelled agent messages, falling back to unlabelled text."""
+    """Return labelled agent messages only."""
     agent_messages: list[str] = []
-    labelled_message_seen = False
     for line in str(transcript or "").splitlines():
         match = re.match(r"^\s*([^:：]+)[:：]\s*(.*)$", line)
         if not match:
@@ -139,22 +126,23 @@ def _agent_message_text(transcript: str) -> str:
         normalized_role = normalize_faq_text(role)
         if normalized_role in {"agent", "user", "csr", "advisor", "الموظف"}:
             agent_messages.append(content)
-        if normalized_role in {
-            "agent", "user", "csr", "advisor", "الموظف",
-            "patient", "relation", "customer", "client", "bot",
-        }:
-            labelled_message_seen = True
-    return "\n".join(agent_messages) if labelled_message_seen else transcript
+    return "\n".join(agent_messages)
 
 
 def detect_faq_escalation(transcript: str) -> bool:
-    """Detect a claim that a request was sent to a responsible department."""
-    text = normalize_faq_text(_agent_message_text(transcript))
+    """Detect a claim that a request was sent to a responsible department.
+    
+    Only checks agent messages to ensure the agent is the one claiming escalation.
+    """
+    agent_text = _agent_message_text(transcript)
+    if not agent_text:
+        return False
+    text = normalize_faq_text(agent_text)
     strong_action = _contains_any(text, _RAISE_OR_ESCALATE_TERMS)
     transfer_action = _contains_any(text, _SEND_OR_TRANSFER_TERMS)
     has_request = _contains_any(text, _REQUEST_TERMS)
     has_destination = _contains_any(text, _DESTINATION_TERMS)
-    return has_destination or (strong_action or (transfer_action and has_request))
+    return strong_action or (transfer_action and has_request)
 
 
 def _normalize_email(value: object) -> str:
@@ -169,65 +157,109 @@ def _numeric_id(value: object) -> tuple[bool, int]:
         return False, -1
 
 
+def _load_db_credentials(db_key: str = "SERVICE_HUB") -> dict[str, str]:
+    """Load database credentials from Passcode.json."""
+    try:
+        with FAQ_PASSCODE_PATH.open("r", encoding="utf-8") as f:
+            passcode = json.load(f)
+        db_config = passcode.get("DB_NAMES", {}).get(db_key)
+        if not db_config:
+            raise ValueError(f"Database key '{db_key}' not found in Passcode.json")
+        return db_config
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"Failed to load database credentials: {exc}") from exc
+
+
+def _get_db_connection(db_key: str = "SERVICE_HUB") -> pyodbc.Connection:
+    """Create a database connection using credentials from Passcode.json."""
+    creds = _load_db_credentials(db_key)
+    connection_string = (
+        f"DRIVER={creds['driver']};"
+        f"SERVER={creds['Server']};"
+        f"DATABASE={creds['Database']};"
+        f"UID={creds['UID']};"
+        f"PWD={creds['PWD']};"
+        "charset=utf8;"
+    )
+    return pyodbc.connect(connection_string)
+
+
 def lookup_faq_record(
     *,
     patient_phone: str,
     call_date: str,
     agent_name: str,
     agent_email: str | None,
-    csv_path: Path | None = None,
+    db_key: str = "SERVICE_HUB",
 ) -> dict[str, Any]:
-    """Return the newest same-day FAQ row for the call and agent identity."""
-    path = Path(csv_path) if csv_path is not None else FAQ_CSV_PATH
+    """Return the newest same-day FAQ row for the call and agent identity.
+    
+    Queries the SQL database instead of reading a CSV file.
+    """
     expected_phone = normalize_faq_phone(patient_phone)
     expected_date = str(call_date or "").strip()
     expected_name = normalize_faq_text(agent_name)
     expected_email = _normalize_email(agent_email)
 
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            reader = csv.DictReader(stream)
-            columns = set(reader.fieldnames or [])
-            missing_columns = sorted(FAQ_REQUIRED_COLUMNS - columns)
-            if missing_columns:
-                return {
-                    "status": "unavailable",
-                    "record": None,
-                    "message": (
-                        "FAQ CSV is missing required columns: "
-                        + ", ".join(missing_columns)
-                    ),
+        # Load SQL query from file
+        query = FAQ_SQL_PATH.read_text(encoding="utf-8")
+        
+        # Get database connection
+        conn = _get_db_connection(db_key)
+        cursor = conn.cursor()
+        
+        # Execute query with parameters (using ? placeholders for pyodbc)
+        cursor.execute(query, expected_phone, expected_phone, expected_date)
+        
+        # Fetch all matching rows
+        columns = [column[0] for column in cursor.description]
+        rows = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        # Check if required columns are present
+        missing_columns = sorted(FAQ_REQUIRED_COLUMNS - set(columns))
+        if missing_columns:
+            return {
+                "status": "unavailable",
+                "record": None,
+                "message": (
+                    "FAQ database query missing required columns: "
+                    + ", ".join(missing_columns)
+                ),
+            }
+        
+        # Convert rows to dictionaries
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            row_dict = dict(zip(columns, row))
+            
+            # Match by agent identity
+            row_email = _normalize_email(row_dict.get("AgentEmail"))
+            row_name = normalize_faq_text(row_dict.get("AgentName"))
+            email_matches = bool(expected_email and row_email == expected_email)
+            name_matches = bool(expected_name and row_name == expected_name)
+            
+            if not email_matches and not name_matches:
+                continue
+            
+            id_is_numeric, numeric_id = _numeric_id(row_dict.get("ID"))
+            candidates.append(
+                {
+                    "record": row_dict,
+                    "identity_rank": 2 if email_matches else 1,
+                    "identity": "email" if email_matches else "name",
+                    "id_is_numeric": id_is_numeric,
+                    "numeric_id": numeric_id,
                 }
-
-            candidates: list[dict[str, Any]] = []
-            for row in reader:
-                if normalize_faq_phone(row.get("mobile_phone")) != expected_phone:
-                    continue
-                if str(row.get("Date") or "").strip() != expected_date:
-                    continue
-
-                row_email = _normalize_email(row.get("AgentEmail"))
-                row_name = normalize_faq_text(row.get("AgentName"))
-                email_matches = bool(expected_email and row_email == expected_email)
-                name_matches = bool(expected_name and row_name == expected_name)
-                if not email_matches and not name_matches:
-                    continue
-
-                id_is_numeric, numeric_id = _numeric_id(row.get("ID"))
-                candidates.append(
-                    {
-                        "record": dict(row),
-                        "identity_rank": 2 if email_matches else 1,
-                        "identity": "email" if email_matches else "name",
-                        "id_is_numeric": id_is_numeric,
-                        "numeric_id": numeric_id,
-                    }
-                )
-    except (OSError, UnicodeError, csv.Error) as exc:
+            )
+    except (OSError, pyodbc.Error, RuntimeError) as exc:
         return {
             "status": "unavailable",
             "record": None,
-            "message": f"FAQ CSV could not be read: {exc}",
+            "message": f"FAQ database query failed: {exc}",
         }
 
     if not candidates:
@@ -266,7 +298,7 @@ def missing_faq_evaluation(message: str) -> dict[str, Any]:
         "faq_flags": [
             {
                 "type": "C2B",
-                "severity": "moderate",
+                "severity": "critical",
                 "description": "C2B_017: FAQ request was not recorded on the call date.",
                 "transcript_excerpt": "N/A",
             }

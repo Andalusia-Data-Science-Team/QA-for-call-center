@@ -111,10 +111,11 @@ SELECT top 100
   WHERE statuscodename != 'Untouched'
   and new_lastcallcreatedbyname != 'Andalusia Sharepoint'
   and mobilephone = :mobile_number
-  and CAST([createdon] AS DATE) = :Report_Date
+  -- createdon is UTC; the report date is the Saudi (UTC+3) calendar day.
+  and CAST(DATEADD(HOUR, 3, [createdon]) AS DATE) = :Report_Date
   --and createdon >= CAST(GETDATE() AS DATE)
   --and new_sourcebusinessunitname != 'ADC'
-  order by createdon asc
+  order by createdon desc
   --where leadsourcecodename = 'Confirmation'
   --and createdon >= CAST(GETDATE() AS DATE)
   --and new_sourcebusinessunitname != 'ADC'

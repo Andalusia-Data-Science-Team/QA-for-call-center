@@ -174,6 +174,11 @@ async def process_job(
         if not rows:
             raise ValueError(f"no transcript rows returned for conversation {conversation_id}")
         call = CallTranscript.from_cm_rows(rows)
+        # NEWFIX returns the owner's address as UserEmailAddress, which
+        # from_cm_rows does not read, so agent_email would be empty. Stamp the
+        # sampled agent's address exactly as /retrieve-and-analyze does — it is
+        # the Agent_Email_Address insert_qa_result persists.
+        call.agent_email = job["AgentEmailAddress"]
     except Exception as exc:                                       # noqa: BLE001
         from app.services.evaluation_service import classify_failure
         status = repo.fail_job(
@@ -303,13 +308,18 @@ async def work_once(
 ) -> WorkerReport:
     """Drain claimable jobs, pausing after quota exhaustion or shutdown."""
     report = WorkerReport()
-    report.recovered += repo.recover_expired_leases(conn)
+    report.recovered += repo.recover_expired_leases(
+        conn, min_reporting_date=settings.automation_start_date,
+    )
     owner = worker_identity()
 
     while True:
         if report.quota_paused or (should_stop is not None and should_stop()):
             break
-        job = repo.claim_job(conn, owner=owner, lease_minutes=settings.lease_duration_minutes)
+        job = repo.claim_job(
+            conn, owner=owner, lease_minutes=settings.lease_duration_minutes,
+            min_reporting_date=settings.automation_start_date,
+        )
         if job is None:
             break
         report.claimed += 1

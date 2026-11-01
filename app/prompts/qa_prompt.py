@@ -38,16 +38,16 @@ Your task is to evaluate agent-patient call transcripts and produce a structured
 ## CORE PRINCIPLES
 1. EVIDENCE-BASED: Base every finding strictly on observable transcript content. Quote directly; never speculate.
 2. PATIENT SAFETY FIRST: Inaccurate medical/appointment/medication information is a patient safety risk — flag it.
-3. PROPORTIONATE: Distinguish critical violations from minor imperfections using the severity tiers below.
+3. PROPORTIONATE: Distinguish critical violations from minor imperfections using the definitions below.
 4. DEFINED SCOPE: Mention only the most critical severe violations. Report 0 to 4 violations at maximum. Do NOT over-evaluate.
 5. DEVELOPMENTAL: Balance corrective feedback with recognition of positive agent behaviors.
 6. STRUCTURED OUTPUT: Return ONLY a valid JSON object matching the schema provided. No prose, no markdown fences.
 
-## SEVERITY TIER DEFINITIONS  (apply strictly)
+## CRITICAL VIOLATION DEFINITION  (apply strictly)
 - critical   → Direct patient safety risk: wrong medication name/dose, wrong doctor, dangerous misinformation,
                explicit patient aggression ignored, or a vulnerable patient actively harmed.
                A callback promise, a hold, or an unresolved prior inquiry is NEVER critical on its own.
-- positive   → Agent exceeded expectations or demonstrated exemplary behavior.
+
 
 ## WHAT IS NOT A VIOLATION
 - Promising a callback within a stated time window (30 min, 1 hour, etc.) is standard practice — NOT a violation
@@ -61,8 +61,16 @@ Your task is to evaluate agent-patient call transcripts and produce a structured
 ## ASSESSMENT DECISION RULES
 - overall_assessment = "escalate"     → dangerous misinformation, explicit aggression, or vulnerable patient harmed.
 - overall_assessment = "needs_review" → One or more C2C/C2B violations observed but no escalation trigger.
-- overall_assessment = "pass"         → No significant violations; include at least one positive compliance_flag.
+- overall_assessment = "pass"         → No significant violations;
 - escalation_required must be true if and only if overall_assessment = "escalate".
+
+## FLAG OUTPUT RULES  (apply to every flag list in every response)
+- Flags are for VIOLATIONS ONLY. Never return a positive, informational, or "met" flag —
+  correct agent behavior is recorded in strengths/reasoning, never as a flag.
+- Every flag's "type" must be exactly one of: C2Com | C2C | C2B | NC.
+- When no violation is found, return an EMPTY flag list [] — that call is evaluated as "pass".
+- The absence of positive flags is NEVER a violation and must never lower a score, the
+  overall_assessment, or the Agent Classification. Do not raise a flag just to fill the list.
 
 ## EDGE CASES
 - Short transcript (< 100 words): note in assessment_reasoning; score conservatively at 0.5 for unobservable dimensions.
@@ -92,7 +100,7 @@ Focus exclusively on: tone, professionalism, empathy, active listening, prohibit
 Do NOT evaluate compliance pillars, script adherence, or scoring weights here.
 If there is no response from the patient agent can use the script to greet and close the call. 
 
-## SEVERITY REMINDER
+## CRITICAL VIOLATION REMINDER
 - critical   → patient safety risk ONLY (wrong drug, wrong dose, aggression ignored).
 - NOT a violation: callback promises, hold times, prior team failures reported by the patient.
 
@@ -124,15 +132,17 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "professionalism_score": <0.0–1.0>,
   "behavioral_flags": [
     {{
-      "type": "<C2C | C2B | NC>",
-      "severity": "<critical | positive>",
-      "description": "<1-2 sentences citing the specific behavioral standard violated or met>",
+      "type": "<C2Com | C2C | C2B | NC>",
+      "description": "<1-2 sentences citing the specific behavioral standard violated>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
   ],
   "strengths": ["<observed positive behavior 1>", "<observed positive behavior 2>"],
   "improvements": ["<behavioral improvement 1>", "<behavioral improvement 2>"]
 }}
+
+IMPORTANT: behavioral_flags lists violations only — never a positive flag. Put positive behavior
+in strengths. If no violation exists, behavioral_flags must be an EMPTY LIST [].
 """
 
 
@@ -152,11 +162,9 @@ Evaluate the call below against the official COMPLIANCE PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
 
-## SEVERITY REMINDER — apply before flagging anything as critical
+## CRITICAL VIOLATION REMINDER — apply before flagging anything as critical
 - critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
                dangerous medical misinformation given as fact.
-- moderate   → process failure without safety risk.
-- minor      → small deviation, negligible impact.
 - NOT a violation: a callback promise within a stated window, a patient citing a prior unresolved inquiry,
   the agent deferring a medication availability check to a specialist or pharmacy team.
 
@@ -212,12 +220,14 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
-      "severity": "<critical | positive>",
       "description": "<1-2 sentences referencing the exact pillar name and id>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
   ]
 }}
+
+IMPORTANT: compliance_flags lists violations only — never a positive flag.
+If no violation exists, compliance_flags must be an EMPTY LIST [].
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +254,7 @@ Do NOT flag a wrong doctor, wrong specialty, wrong appointment assignment, or `C
 transcript in that case. The only exception is the explicit ineligible-patient rule below.
 if APPOINTMENT VERIFICATION is not found raise a critical C2C flag
 
-## SEVERITY REMINDER — apply before flagging anything as critical
+## CRITICAL VIOLATION REMINDER — apply before flagging anything as critical
 - critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
                dangerous medical misinformation given as fact, or ineligibile reservation based on eligibility check
 - NOT a violation: a callback promise within a stated window, a patient citing a prior unresolved inquiry,
@@ -307,12 +317,14 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "reservation_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
-      "severity": "<critical | positive>",
       "description": "<1-2 sentences referencing the exact pillar name>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
   ]
 }}
+
+IMPORTANT: reservation_flags lists violations only — never a positive flag.
+If no violation exists, reservation_flags must be an EMPTY LIST [].
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -357,13 +369,15 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "accuracy_score": <0.0–1.0>,
   "script_flags": [
     {{
-      "type": "<C2C | NC>",
-      "severity": "<critical | positive>",
-      "description": "<1-2 sentences — state which script element was used/missed>",
+      "type": "<C2Com | C2C | C2B | NC>",
+      "description": "<1-2 sentences — state which script element was missed>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
   ]
 }}
+
+IMPORTANT: script_flags lists missed script elements only — never a positive flag for a script
+element that was used. If no violation exists, script_flags must be an EMPTY LIST [].
 """
 
 
@@ -428,12 +442,18 @@ evaluated in three separate passes. Your job is to:
   8. Assign Agent Classification based on the violation counts below.
   9. Assign Profiling Comment ONLY if there is a clear performance issue — otherwise omit it (null).
   10. if there is a misrepresented or said any incorrect information about offer, service, package flag the conversations as needs review and mention the misrepresented offer, service, package in the assessment_reasoning.
+  11. When merging compliance_flags, keep violations only — drop any positive, informational, or
+      "met" flag from the sub-evaluations. If no violation remains, compliance_flags is [] and
+      overall_assessment is "pass" (Agent Classification A). The absence of positive flags is
+      never a violation and must not lower any score or the overall_assessment.
 
 Agent Classification criteria:
 A  -> No C2C, C2B, C2Com or NC violations
 B  -> Less than 2 NC violations
 C  -> 1 Critical violation  OR  more than 2 NC violations
 D  -> More than 1 Critical violation
+Count by flag TYPE: a C2Com, C2C, or C2B flag is a Critical violation
+(Critical to Compliance / Client / Business); an NC flag is a Non-Critical (NC) violation.
 
 Profiling Comment options (use ONLY one of these exact strings, or null if none applies):
 "Poor Knowledge" | "Poor System" | "Poor Process" | "Poor Report" |
@@ -788,7 +808,6 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
-      "severity": "<critical | positive>",
       "description": "<1-2 sentences — reference the pillar name if a violation>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -812,7 +831,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 #          CRM promotional offer for the patient's specialty?
 #
 #   Four possible outcomes (one must be chosen):
-#     SUITABLE_OFFER_RECOMMENDED   — agent did the right thing (positive flag)
+#     SUITABLE_OFFER_RECOMMENDED   — agent did the right thing (no flag — pass)
 #     OFFER_SKIPPED                — offer existed but agent did not mention it (C2B)
 #     UNRELATED_OFFER_RECOMMENDED  — agent mentioned an irrelevant offer (C2B)
 #     NO_OFFER_AVAILABLE           — no active offer for this specialty (no flag)
@@ -877,16 +896,16 @@ offer to the patient during the call below.
 
 
 ## OUTCOME DEFINITIONS
-- SUITABLE_OFFER_RECOMMENDED   : Agent identified and correctly presented a matching offer → positive flag.
+- SUITABLE_OFFER_RECOMMENDED   : Agent identified and correctly presented a matching offer → no flag (pass).
 - OFFER_SKIPPED                : A relevant offer existed (visible in CRM context or inferable) but the
-                                 agent never mentioned it → C2B flag (moderate).
+                                 agent never mentioned it → C2B flag .
 - UNRELATED_OFFER_RECOMMENDED  : Agent presented an offer that does not match the patient's specialty,
-                                 service request, or gender → C2B flag (moderate).
+                                 service request, or gender → C2B flag .
 - OFFER_MISREPRESENTED         : Agent stated incorrect price, discount percentage, expiry date, or
-                                 specialty for an offer → C2B flag (moderate).
+                                 specialty for an offer → C2B flag.
 - INCOMPLETE_OFFER_PRESENTATION: Agent mentioned the offer correctly but omitted price or expiry date → NC flag (minor).
 - MISSING_OFFER_CONFIRMATION_ASK: Agent presented the offer but did not ask the patient whether they
-                                  want to proceed with it → NC flag (minor).
+                                  want to proceed with it → NC flag.
 - NO_OFFER_AVAILABLE           : No active CRM offer exists for this specialty → no flag, no penalisation.
 - OFFER_NOT_APPLICABLE         : Call is a complaint, emergency, admin, or follow-up with no booking
                                  intent → no flag, no penalisation.
@@ -927,8 +946,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "offer_reasoning": "<2-3 sentences citing specific transcript evidence for your choice>",
   "offer_flags": [
     {{
-      "type": "<C2B | NC | positive>",
-      "severity": "<critical | positive>",
+      "type": "<C2Com | C2C | C2B | NC>",
       "description": "<1-2 sentences referencing the exact pillar name and outcome>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A' when no mention in transcript>"
     }}
@@ -936,7 +954,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 }}
 
 IMPORTANT: offer_flags must be an EMPTY LIST [] when the outcome is
-NO_OFFER_AVAILABLE or OFFER_NOT_APPLICABLE.
+SUITABLE_OFFER_RECOMMENDED, NO_OFFER_AVAILABLE or OFFER_NOT_APPLICABLE.
+Never return a positive flag — offer_flags lists violations only.
 """
 
 
@@ -991,7 +1010,7 @@ services to the patient during the call below.
 5. If there is a service fetched right from the CRM, do not say the service is not in the CRM list. only mention any wrong information mentioned in the fetched service
 
 ## OUTCOME DEFINITIONS
-- SUITABLE_SERVICE_RECOMMENDED    : Agent correctly identified and presented a matching service → positive flag.
+- SUITABLE_SERVICE_RECOMMENDED    : Agent correctly identified and presented a matching service → no flag (pass).
                                     ONLY use this when the service name mentioned by the agent matches a service 
                                     in the AVAILABLE CRM SERVICES list (check both cr301_service and cr301_servicear fields).
                                     The match must be exact or semantically equivalent (e.g., "Dental Cleaning" ≈ "تنظيف الأسنان").
@@ -1049,8 +1068,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "service_reasoning": "<1-2 concise sentences citing transcript evidence.>",
   "service_flags": [
     {{
-      "type": "<C2B | NC | positive>",
-      "severity": "<critical | positive>",
+      "type": "<C2Com | C2C | C2B | NC>",
       "description": "<1-2 concise sentences; do not use raw line breaks.>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
     }}
@@ -1058,7 +1076,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 }}
 
 IMPORTANT: service_flags must be an EMPTY LIST [] when the outcome is
-NO_SERVICE_AVAILABLE or SERVICE_NOT_APPLICABLE.
+SUITABLE_SERVICE_RECOMMENDED, NO_SERVICE_AVAILABLE or SERVICE_NOT_APPLICABLE.
+Never return a positive flag — service_flags lists violations only.
 """
 
 
@@ -1114,7 +1133,7 @@ packages to the patient during the call below.
 
 
 ## OUTCOME DEFINITIONS
-- SUITABLE_PACKAGE_RECOMMENDED    : Agent correctly identified and presented a matching package → positive flag.
+- SUITABLE_PACKAGE_RECOMMENDED    : Agent correctly identified and presented a matching package → no flag (pass).
                                     ONLY use this when the package name mentioned by the agent matches a package 
                                     in the AVAILABLE CRM PACKAGES list (check both cr301_service and cr301_servicear fields).
                                     The match must be exact or semantically equivalent (e.g., "Dental Package" ≈ "باقة الأسنان").
@@ -1174,16 +1193,16 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
                         that the package mentioned by the agent does not appear in the CRM list.>",
   "package_flags": [
     {{
-      "type": "<C2B | NC | positive>",
-      "severity": "<critical | positive>",
-      "description": "<1-2 sentences. If positive flag, state the CRM package name and code that matched.>",
+      "type": "<C2Com | C2C | C2B | NC>",
+      "description": "<1-2 sentences referencing the exact outcome and the violation.>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
     }}
   ]
 }}
 
 IMPORTANT: package_flags must be an EMPTY LIST [] when the outcome is
-NO_PACKAGE_AVAILABLE or PACKAGE_NOT_APPLICABLE.
+SUITABLE_PACKAGE_RECOMMENDED, NO_PACKAGE_AVAILABLE or PACKAGE_NOT_APPLICABLE.
+Never return a positive flag — package_flags lists violations only.
 """
 
 
@@ -1724,7 +1743,9 @@ Agent Classification is calculated based on the following criteria:
 A	-> No C2C,C2B,C2COM and NC violation Per Transaction	
 B	-> Less than 2 NC violations Per Transaction	
 C	-> 1 Critical Per Transaction	More than 2 NC violations Per Transaction
-D	-> More than 1 Critical Per Transaction	
+D	-> More than 1 Critical Per Transaction
+Count by flag TYPE: a C2Com, C2C, or C2B flag is a Critical violation
+(Critical to Compliance / Client / Business); an NC flag is a Non-Critical (NC) violation.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -1771,7 +1792,6 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
-      "severity": "<critical | moderate | minor | positive>",
       "description": "<1-2 sentences — reference the pillar name if a violation>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -1916,7 +1936,7 @@ Transcript:
 {transcript}
 """
 
-from app.service_hub.crm_leads_validation import _BU_EQUIVALENCE_GROUPS
+from app.service_hub.crm_leads_validation import LEAD_BU_CODE, lead_bu_code, lead_clinic_bu
 
 def build_crm_lead_validation_prompt(
     call: CallTranscript,
@@ -1928,19 +1948,40 @@ def build_crm_lead_validation_prompt(
     """Build the focused semantic comparison prompt for one fetched CRM lead."""
     details = appointment_details or {}
     verification = appointment_verification or {}
-    crm_record = lookup.get("record") or {}
+    # Both business units go to the model as one code per branch, so the
+    # comparison is code-to-code (LEAD_BU_CODE).
+    # An empty new_clinicbu falls back to new_sourcebusinessunitname.
+    crm_record = dict(lookup.get("record") or {})
+    clinic_bu, clinic_bu_field = lead_clinic_bu(crm_record)
+    crm_record["new_clinicbu"] = lead_bu_code(clinic_bu) or clinic_bu
+    if clinic_bu_field != "new_clinicbu":
+        crm_record["new_clinicbu_source"] = clinic_bu_field
+    chat_bu = lead_bu_code(call.business_unit) or call.business_unit or "unknown"
+    # The chat agent the lead names (a transferred chat has several); when no
+    # lead names one, modifiedbyname may match any of the chat's agents.
+    lead_agent = lookup.get("agent_name") or call.agent_name
+    chat_agents = ", ".join(lookup.get("chat_agents") or [call.agent_name])
+    bu_mapping = ", ".join(
+        f"{'/'.join(sorted(k for k, v in LEAD_BU_CODE.items() if v == code))} → {code}"
+        for code in dict.fromkeys(LEAD_BU_CODE.values())
+    )
     return f"""\
 Validate the fetched Dynamics CRM lead against the authoritative chat facts.
 This is a focused CRM data-quality check. Do not evaluate tone, scripts, offers,
 or any compliance topic unrelated to the CRM lead.
 
 VALIDATION RULES
-1. modifiedbyname must identify the same agent as the chat agent. Allow harmless
-   ordering, title, Arabic/English transliteration, spacing, and case differences.
-2. new_clinicbu must match the chat business unit. Treat known code
-   and full-name representations as equivalent. Known input mappings include
-   MKR=BU-MKR, LCH=BU-LCH, SNB=BU-SNB, ALW=BU-ALW, AKW=BU-AKW, and LIVE=BU-AHJ.
-   also there is equivalent BU groupings: {json.dumps(_BU_EQUIVALENCE_GROUPS, ensure_ascii=False, default=str)}.
+1. modifiedbyname must identify the same agent as the chat agent ("Agent"
+   below). When the chat was transferred, "Chat agents" lists everyone who
+   handled it, and modifiedbyname matching any of them is a match. Allow
+   harmless ordering, title, Arabic/English transliteration, spacing, and case
+   differences.
+2. new_clinicbu must match the chat business unit. Both are already given as
+   one code per branch ({bu_mapping}): the same code is a match and different
+   codes are a mismatch. If new_clinicbu is a full branch name rather than a
+   code, judge which of those branches it names. When new_clinicbu_source is
+   present, the lead's new_clinicbu was empty and the value comes from that
+   field; evaluate it the same way.
 3. When the objective is booking, new_doctor must match the extracted/verified
    doctor and new_reservationdate must match the appointment date. The supplied
    Booking intent boolean is a broad routing hint that may include appointment
@@ -1949,18 +1990,25 @@ VALIDATION RULES
 4. Classify the objective as exactly one of: reschedule, booking, inquiry. Minor
    wording differences are acceptable; contradictory or unrelated descriptions are not.
 5. new_lastcallresult must match the final outcome actually reached in the chat
-   (for example booked, rescheduled, inquiry answered, callback/pending, patient
-   declined, or disconnected). Do not confuse the requested objective with outcome.
+   (for example booked, rescheduled, inquiry only[01], Not interested [02] (when the patient did not respond), Will call us again [03],
+   "Waiting List" when the agent stated that the doctor will not accept waiting list but patient insists to come,
+   "Overbooked" when the agent stated that the booking is on waiting list)
+   . Do not confuse the requested objective with outcome.
 6. A CRM field required for an applicable check but null/blank is a mismatch.
-7. Return one field_check per field. Every mismatch must produce a C2B/moderate
+7. Return one field_check per field. Every mismatch must produce a C2B
    flag. Use a concise transcript excerpt supporting the expected value, or "N/A"
    when the expectation comes only from authoritative metadata/database evidence.
 8. Return no positive flags. Limit crm_leads_flags to the first 4 mismatches.
+9. A mobilephone of 0555555550 is the placeholder for a non-Saudi number; the
+   patient's real number is in new_notes and is checked separately. Do not
+   flag mobilephone or new_notes.
 
 AUTHORITATIVE CHAT FACTS
 Call ID: {call.call_id}
-Agent: {call.agent_name}
-Business unit: {call.business_unit or "unknown"}
+Agent: {lead_agent}
+Chat agents: {chat_agents}
+Patient phone: {getattr(call, "Patient_Phone", None) or "unknown"}
+Business unit: {chat_bu}
 Report date: {call.call_date}
 Booking intent: {is_booking_intent}
 Extracted appointment details: {json.dumps(details, ensure_ascii=False, default=str)}
@@ -1989,8 +2037,7 @@ Return ONLY valid JSON with this shape:
   ],
   "crm_leads_flags": [
     {{
-      "type": "C2B",
-      "severity": "moderate",
+      "type": "<C2Com | C2C | C2B | NC>",
       "description": "CRM lead mismatch: <field and concise reason>",
       "transcript_excerpt": "<verbatim excerpt or N/A>"
     }}
@@ -2036,10 +2083,15 @@ VALIDATION RULES
    Allow harmless spelling, spacing, Arabic/English transliteration, and word
    order differences. If no patient/client name is stated, do not invent one or
    flag the CSV name solely because it cannot be verified.
-3. Check BU against the call business unit. Treat LIVE and AHJ as equivalent.
+3. Check BU against the call business unit. Treat HJH and AHJ as equivalent.
    Other business-unit codes must describe the same unit.
-4. Check Inquiry semantically against every customer inquiry in the transcript.
-   Do not require exact wording.
+4. Check Inquiry (FAQ title/summary) and "CST Inquiry / Request Details" (full inquiry 
+   description) semantically against every customer inquiry in the transcript.
+   The Inquiry field contains a brief title of the customer's request, while 
+   "CST Inquiry / Request Details" contains the detailed description of what the 
+   customer inquired about. Both should accurately reflect the customer's questions 
+   and concerns from the transcript. Do not require exact wording, but ensure semantic 
+   alignment with the conversation.
 5. Check whether Response is present or blank and whether its content agrees with
    what the agent communicated. A blank response can be correct while a request
    is genuinely awaiting the responsible department.
@@ -2054,9 +2106,9 @@ VALIDATION RULES
    was not performed. A missing same-day record is handled outside this prompt
    by the deterministic C2B_017 rule.
 9. Return one field_check for each of AgentName, AgentEmail, mobile_phone, Date,
-   CustomerName, BU, Inquiry, Response, and End Call Result. Do not return
-   positive flags and do not create rules outside C2B_017, C2B_021, C2C_023,
-   and C2C_024.
+   CustomerName, BU, Inquiry, "CST Inquiry / Request Details", Response, and 
+   End Call Result. Do not return positive flags and do not create rules outside 
+   C2B_017, C2B_021, C2C_023, and C2C_024.
 
 Return ONLY valid JSON with this shape:
 {{
@@ -2201,8 +2253,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   ],
   "compliance_flags": [
     {{
-      "type": "C2C",
-      "severity": "critical",
+      "type": "<C2Com | C2C | C2B | NC>",
       "description": "<C2C_021 | C2C_023 | C2C_028>: <1-2 sentences explaining the violation>",
       "transcript_excerpt": "<verbatim excerpt showing the failure>"
     }}
@@ -2215,4 +2266,5 @@ IMPORTANT:
 - validation_status = "profile_updates_not_acknowledged" when patient mentioned updates but agent didn't acknowledge
 - validation_status = "pass" when all checks passed
 - compliance_flags must be EMPTY [] when validation_status = "pass"
+- compliance_flags lists violations only — never a positive flag
 """

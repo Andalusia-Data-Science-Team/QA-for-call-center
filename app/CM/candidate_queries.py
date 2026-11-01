@@ -10,11 +10,16 @@ inputs that is survivable. For a list of selected conversation ids it is not:
 the value count varies per call, and a text-substituted identifier list is
 both injection-prone and silently wrong if any id is NULL or oddly typed.
 
-Transcript IDs pass to the driver as `?` parameters. Candidate discovery runs
-through OPENQUERY on the remote server, which cannot bind parameters: it
-inserts only validated Python datetime values formatted as UTC SQL literals.
-The transcript query builds only the number of placeholder marks from
-`len(ids)`, never SQL text from the IDs themselves.
+All three automation queries are derived from NEWFIX_CM_Chat_Search.sql, the
+query the manual dashboard uses, and live in app/SQL/automation/:
+
+    automation_active_agents.sql      the roster: CM inbox owners
+    automation_day_conversations.sql  candidates: one row per conversation
+    automation_chat_by_ids.sql        transcripts: NEWFIX, selected by id
+
+Every value reaches the driver as a bound `?` parameter. The only SQL text
+built at runtime is the number of placeholder marks for an id list, derived
+from `len(ids)` and never from the ids themselves.
 
 The existing handler is reused for connection management only — it already
 handles credentials, retry on transient TCP failures and reconnection.
@@ -25,7 +30,6 @@ READ ONLY. Nothing in this module writes to, or alters, anything in CM_DWH.
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -36,8 +40,8 @@ logger = logging.getLogger(__name__)
 
 _SQL_DIR = Path(__file__).resolve().parent.parent / "SQL" / "automation"
 
-# SQL Server's hard ceiling is 2100 parameters per statement. transcripts_by_ids
-# binds each id twice (once per CTE), so the safe ceiling is ~1000 ids. We chunk
+# SQL Server's hard ceiling is 2100 parameters per statement and
+# automation_chat_by_ids binds each id once. We chunk
 # far below that: a chunk is also the unit of work held in memory as a DataFrame
 # of full message content, and 200 conversations of chat is already sizeable.
 MAX_IDS_PER_QUERY = 200
@@ -146,21 +150,20 @@ def fetch_day_candidates(
     window_end_utc: datetime,
 ) -> pd.DataFrame:
     """
-    Every conversation whose last human-agent message falls in
-    ``[window_start_utc, window_end_utc)``, with its attributed agent.
+    Every conversation closed in ``[window_start_utc, window_end_utc)``, with
+    its agent — the inbox owner, as NEWFIX attributes it.
 
     One query covers the whole roster for the window, rather than one query per
     agent per interval: the dispatcher runs every ten minutes and a per-agent
     fan-out would multiply that by the roster size for no extra information.
 
-    Bounds must be timezone-aware. OPENQUERY cannot bind parameters, so their
-    UTC datetime values are formatted into fixed-format SQL literals. Only
-    Python datetime values reach this formatter; no caller text is copied.
-    Running the complete query on CM_DWH avoids local linked-server joins,
-    which timed out and dropped the connection in production.
+    Bounds must be tz-aware. They are sent as naive UTC because CM_DWH stores
+    naive datetimes holding UTC. All predicates in the SQL are direct column
+    comparisons on Conversations, so the linked server filters first; measured
+    at about 8 seconds per 2-hour window.
 
-    Returns an empty, correctly-shaped DataFrame when nothing matches, so
-    callers never have to special-case None.
+    Returns an empty frame when nothing matches, so callers never have to
+    special-case None.
     """
     for name, value in (("window_start_utc", window_start_utc), ("window_end_utc", window_end_utc)):
         if not isinstance(value, datetime) or value.tzinfo is None:
@@ -168,30 +171,8 @@ def fetch_day_candidates(
     if window_end_utc <= window_start_utc:
         raise ValueError(f"Empty window: {window_start_utc} -> {window_end_utc}")
 
-    # Keep one copy of the selection logic in day_candidates.sql. Strip its
-    # comments and the linked-server prefix, then execute that SQL remotely.
-    # The four placeholders are exactly the two interval bounds used twice.
-    remote_sql = re.sub(r"/\*.*?\*/", "", _read_sql("day_candidates.sql"), flags=re.DOTALL)
-    if remote_sql.count("?") != 4:
-        raise ValueError("day_candidates.sql must contain exactly four time bounds")
-    remote_sql = remote_sql.replace("[CM_DWH].[msc_sub_35033_XYLJV].[dbo].", "[msc_sub_35033_XYLJV].[dbo].")
-    if "[CM_DWH]." in remote_sql:
-        raise ValueError("day_candidates.sql contains an unexpected linked-server reference")
-
-    def utc_literal(value: datetime) -> str:
-        timestamp = value.astimezone(timezone.utc).replace(tzinfo=None)
-        return f"'{timestamp.isoformat(timespec='microseconds')}'"
-
-    literals = iter((
-        utc_literal(window_start_utc), utc_literal(window_end_utc),
-        utc_literal(window_start_utc), utc_literal(window_end_utc),
-    ))
-    remote_sql = re.sub(r"\?", lambda _match: next(literals), remote_sql).strip()
-    if len(remote_sql.encode("utf-8")) > 8000:
-        raise ValueError("Candidate query exceeds OPENQUERY's 8 KB limit")
-    sql = "SELECT * FROM OPENQUERY([CM_DWH], '" + remote_sql.replace("'", "''") + "')"
-
-    df = _execute(handler, sql, ())
+    params = (_naive_utc(window_start_utc), _naive_utc(window_end_utc))
+    df = _execute(handler, _read_sql("automation_day_conversations.sql"), params)
     logger.info(
         "fetch_day_candidates | %s -> %s | %d conversations, %d distinct agents",
         window_start_utc.isoformat(),
@@ -200,6 +181,32 @@ def fetch_day_candidates(
         df["AgentEmail"].nunique() if not df.empty else 0,
     )
     return df
+
+
+def fetch_cm_roster(
+    handler,
+    lookback_start_utc: datetime,
+    lookback_end_utc: datetime,
+) -> pd.DataFrame:
+    """
+    The agents who handled chats in CM during the look-back window.
+
+    Columns are Agent_Email_Address, Agent_Name, Agent_id and
+    ConversationCount — the first three use DWH.AI.Agents' names so the
+    planner's roster helpers work unchanged.
+    """
+    for name, value in (("lookback_start_utc", lookback_start_utc), ("lookback_end_utc", lookback_end_utc)):
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError(f"{name} must be tz-aware UTC, got naive {value!r}")
+    if lookback_end_utc <= lookback_start_utc:
+        raise ValueError(f"Empty look-back: {lookback_start_utc} -> {lookback_end_utc}")
+
+    params = (_naive_utc(lookback_start_utc), _naive_utc(lookback_end_utc))
+    return _execute(handler, _read_sql("automation_active_agents.sql"), params)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def fetch_transcripts_by_ids(
@@ -231,18 +238,31 @@ def fetch_transcripts_by_ids(
             len(ids) - len(unique_ids),
         )
 
-    template = _read_sql("transcripts_by_ids.sql")
+    template = _read_sql("automation_chat_by_ids.sql")
     frames: list[pd.DataFrame] = []
 
     for start in range(0, len(unique_ids), chunk_size):
         chunk = unique_ids[start:start + chunk_size]
         placeholders = ", ".join("?" for _ in chunk)       # count only, never values
         sql = template.replace("{id_placeholders}", placeholders)
-        # The template binds the id list twice: once in Targeted, once in
-        # DedupedMessages. Order matters and must match the SQL's own order.
-        frames.append(_execute(handler, sql, chunk + chunk))
+        frames.append(_execute(handler, sql, chunk))
 
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    if not df.empty:
+        # NEWFIX selects tc.* and then tc.WebStoreName again, so the result has
+        # two WebStoreName columns. A duplicated label makes df[col] return a
+        # DataFrame instead of a Series and breaks row sanitising.
+        df = df.loc[:, ~df.columns.duplicated()]
+        # NEWFIX's joins can repeat a message; keep one row per message.
+        if "MessageId" in df.columns:
+            before = len(df)
+            df = df.drop_duplicates(subset=["UniqueId", "MessageId"], keep="first")
+            if len(df) != before:
+                logger.info(
+                    "fetch_transcripts_by_ids | removed %d duplicated message row(s)",
+                    before - len(df),
+                )
 
     # SQL Server returns GUIDs in uppercase on some driver paths while the
     # sampler stores canonical lowercase IDs. Compare IDs case-insensitively.

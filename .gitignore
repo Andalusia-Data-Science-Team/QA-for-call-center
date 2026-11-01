@@ -32,3 +32,6 @@ passcode.json
 data/qa_automation.sqlite3
 data/qa_automation.sqlite3-wal
 data/qa_automation.sqlite3-shm
+# CRM token caches contain refresh tokens and must stay out of Git.
+data/.andalusia_crm_cache.bin
+data/.andalusia_crm_cache.*

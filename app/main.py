@@ -7,6 +7,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
+from uuid import UUID
  
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query, Form, status
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
@@ -200,15 +201,46 @@ async def review_escalation(payload: dict):
 @app.post("/escalations/dismiss")
 async def dismiss_escalation(payload: dict):
     call_id = payload.get("call_id")
+    flag_description = payload.get("flag_description")
+    transcript_excerpt = payload.get("transcript_excerpt")
     if not call_id:
         raise HTTPException(status_code=400, detail="call_id is required")
  
+    # The flag fields pin the update to the removed violation's own row
+    # (the table holds one row per compliance flag).
     try:
         updated = update_escalation_row(
             call_id,
             qa_reviewed=True,
             qa_review_comment=None,
             coaching_status=None,
+            flag_description=flag_description,
+            transcript_excerpt=transcript_excerpt,
+            removed_error=True,
+        )
+    except DatabaseWritePermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if updated == 0:
+        raise HTTPException(status_code=404, detail="No QA result row found to update")
+    return {"ok": True, "updated": updated}
+ 
+ 
+@app.post("/escalations/reopen")
+async def reopen_escalation(payload: dict):
+    """Undo a supervisor's "Remove Error": clear Removed_Error on the
+    violation's row. Removing it again sets the flag back to 1."""
+    call_id = payload.get("call_id")
+    flag_description = payload.get("flag_description")
+    transcript_excerpt = payload.get("transcript_excerpt")
+    if not call_id:
+        raise HTTPException(status_code=400, detail="call_id is required")
+ 
+    try:
+        updated = update_escalation_row(
+            call_id,
+            flag_description=flag_description,
+            transcript_excerpt=transcript_excerpt,
+            removed_error=False,
         )
     except DatabaseWritePermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -253,11 +285,21 @@ async def list_agent_emails(
  
 @app.post("/retrieve-and-analyze", response_model=BatchQAAnalysisResult)
 async def retrieve_and_analyze(
-    agent_email: str = Query(..., description="Agent email address"),
-    filter_date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    agent_email: Optional[str] = Query(None, description="Agent email address"),
+    filter_date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format"),
+    chat_limit:  int = Query(10, ge=1, le=100, description="Number of most recent chats to check"),
+    conversation_id: Optional[UUID] = Query(None, description="Conversation ID; searches independently of agent and date"),
     json_file:   str = Query(default="passcode.json"),
     db_key:      str = Query(default="CM"),
 ):
+    if conversation_id is None and (not agent_email or not filter_date):
+        raise HTTPException(status_code=422, detail="Agent email and date are required unless a conversation ID is supplied.")
+
+    # An ID lookup must not be constrained by the dashboard's prefilled date.
+    search_email = None if conversation_id else agent_email
+    search_date = None if conversation_id else filter_date
+    effective_limit = 1000 if conversation_id else chat_limit
+
     import asyncio, sys
     sys.path.insert(0, str(CM_DIR))
     from CM_DB_Handler import CMDatabaseHandler
@@ -269,15 +311,17 @@ async def retrieve_and_analyze(
     if not json_path.exists():
         raise HTTPException(status_code=500, detail=f"Credentials file not found: {json_path}")
  
-    logger.info("retrieve-and-analyze | agent=%s date=%s", agent_email, filter_date)
+    logger.info("retrieve-and-analyze | agent=%s date=%s conversation=%s chats=%d", search_email, search_date, conversation_id, effective_limit)
  
     handler = CMDatabaseHandler(json_file=str(json_path), db_key=db_key)
     try:
         df = retrieve_chats_by_agent_email(
-            agent_email=agent_email,
-            filter_date=filter_date,
+            agent_email=search_email,
+            filter_date=search_date,
             db_handler=handler,
             sql_file=str(SQL_DIR / "NEWFIX_CM_Chat_Search.sql"),
+            chat_limit=effective_limit,
+            conversation_id=str(conversation_id) if conversation_id else None,
         )
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -288,7 +332,8 @@ async def retrieve_and_analyze(
     if df is None or df.empty:
         raise HTTPException(
             status_code=404,
-            detail=f"No chats found for {agent_email} on {filter_date}.",
+            detail=(f"No chat found for conversation {conversation_id}." if conversation_id
+                    else f"No chats found for {agent_email} on {filter_date}."),
         )
  
     logger.info(
@@ -301,11 +346,15 @@ async def retrieve_and_analyze(
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Transcript conversion failed: {exc}")
 
-    # Stamp the search email (the agent email selected in the dashboard)
-    # onto every call — it is the authoritative Agent_Email_Address that
-    # gets persisted by insert_qa_result via call.agent_email.
+    # Direct ID lookup has no selected agent, so use the conversation owner.
+    owner_email = None
+    if conversation_id and "UserEmailAddress" in df.columns:
+        owner_emails = df["UserEmailAddress"].dropna().astype(str).str.strip()
+        owner_email = next((email for email in owner_emails if email), None)
+
+    # The chosen email remains authoritative for ordinary agent/date searches.
     for c in batch.calls:
-        c.agent_email = agent_email
+        c.agent_email = (owner_email or c.agent_email) if conversation_id else agent_email
  
     logger.info("retrieve-and-analyze | %d calls passed validation", len(batch.calls))
  
@@ -518,6 +567,8 @@ async def get_qa_results(
     date_to:              Optional[str] = Query(None, description="Call date to (YYYY-MM-DD)"),
     overall_assessment:   Optional[str] = Query(None, description="pass | needs_review | escalate | error"),
     agent_classification: Optional[str] = Query(None, description="A | B | C | D"),
+    removed_error:        bool = Query(False, description="true: only rows a QA supervisor removed (Removed_Error = 1); false: exclude them"),
+    qa_reviewed:          bool = Query(False, description="true: only rows QA reviewed with a comment (QA_Reviewed = 1)"),
     limit: int = Query(200, ge=1, le=1000),
 ):
     """
@@ -566,6 +617,15 @@ async def get_qa_results(
     if agent_classification:
         clauses.append("Agent_Classification = :agent_classification")
         bind["agent_classification"] = agent_classification
+    # Removed errors appear only on their own tab; NULL counts as not removed.
+    if removed_error:
+        clauses.append("Removed_Error = 1")
+    else:
+        clauses.append("COALESCE(Removed_Error, 0) = 0")
+    # Only the reviewed violation rows themselves — not the call's others.
+    if qa_reviewed:
+        clauses.append("QA_Reviewed = 1")
+        clauses.append("NULLIF(LTRIM(RTRIM(QA_Review_Comment)), '') IS NOT NULL")
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -622,23 +682,48 @@ async def get_qa_results(
             "violation":          r.get("violation"),
             "description":        r.get("flag_description"),
             "transcript_excerpt": r.get("transcript_excerpt"),
+            # Review state is per violation row, not per call.
+            "escalated":          r.get("escalated"),
+            "qa_reviewed":        r.get("qa_reviewed"),
+            "qa_review_comment":  r.get("qa_review_comment"),
+            "coaching_status":    r.get("coaching_status"),
+            "supervisor_name":    r.get("supervisor_name"),
         }
         # only add rows that actually carry a flag
         if flag["type"] or flag["description"]:
             calls[cid]["compliance_flags"].append(flag)
 
-    results = [calls[cid] for cid in order][:limit]
+    # Summary reflects EVERY matching call, not just the displayed page —
+    # the record list is truncated to `limit` below, but the metrics must
+    # not silently drop the rest (the SQL already fetched all matching rows).
+    all_calls = [calls[cid] for cid in order]
 
     def count(a):
-        return sum(1 for r in results if r.get("overall_assessment") == a)
+        return sum(1 for r in all_calls if r.get("overall_assessment") == a)
 
-    weighted = [r["weighted_score"] for r in results if r.get("weighted_score") is not None]
+    weighted = [r["weighted_score"] for r in all_calls if r.get("weighted_score") is not None]
     summary = {
-        "total":             len(results),
+        "total":             len(all_calls),
         "pass":              count("pass"),
         "needs_review":      count("needs_review"),
         "escalate":          count("escalate"),
         "errors":            count("error"),
         "avg_weighted_score": round(sum(weighted) / len(weighted), 2) if weighted else None,
     }
-    return {"results": results, "summary": summary}
+
+    # Only the record LIST is capped by `limit` (default 200, max 1000).
+    results = all_calls[:limit]
+    if results and db_names.get("CM"):
+        from app.services.cm_archive_times import lookup_archive_datetimes
+
+        try:
+            archive_times = lookup_archive_datetimes(
+                [r.get("call_id") for r in results], db_names["CM"]
+            )
+            for result in results:
+                result["archive_datetime"] = archive_times.get(
+                    str(result.get("call_id") or "").upper()
+                )
+        except Exception as exc:
+            logger.warning("get_qa_results: CM archive timestamp lookup failed: %s", exc)
+    return {"results": results, "summary": summary, "displayed": len(results)}

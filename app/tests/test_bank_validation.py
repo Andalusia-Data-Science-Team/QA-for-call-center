@@ -9,7 +9,7 @@ from app.service_hub.bank_validation import (
 
 # Fixtures mirror the real cr301_bankaccounts shape verified against a LIVE
 # CRM query this session: cr301_bu / servhub_bulookupname / cr18c_bunname
-# use short codes (AHJ, not LIVE); owningbusinessunitname is a constant
+# use short codes (AHJ, not HJH); owningbusinessunitname is a constant
 # ("ERS") on every row and is never used for BU filtering.
 BANK_AKW = {
     "cr301_bu": "AKW", "servhub_bulookupname": "AKW", "cr18c_bunname": "AKW", "owningbusinessunitname": "ERS",
@@ -23,7 +23,7 @@ BANK_ALW = {
     "cr301_accountnumber": "20000004551", "cr301_accountowner": "Arabian Andalusia CO",
     "statecodename": "Active",
 }
-# AHJ / LIVE — two accounts at different banks (a BU is a LIST of eligible
+# AHJ — two accounts at different banks (a BU is a LIST of eligible
 # accounts, never assumed to be exactly one).
 BANK_AHJ_ALAHLI = {
     "cr301_bu": "AHJ", "servhub_bulookupname": "AHJ", "cr18c_bunname": "AHJ", "owningbusinessunitname": "ERS",
@@ -62,14 +62,14 @@ def test_bu_detection_alw():
     assert resolve_business_unit("BU-ALW") == "ALW"
 
 
-def test_bu_detection_ahj_resolves_to_live():
-    """Per BUSINESS_UNIT_KEYWORD_MAP's own convention, AHJ's app-level
-    canonical value is "LIVE" — the CRM's own value is "AHJ" (verified via a
-    live query); the validator bridges the two via _APP_BU_TO_CRM_BU, not by
-    forcing "AHJ" as the canonical app value."""
-    assert resolve_business_unit("جدة") == "LIVE"
-    assert resolve_business_unit("حي الجامعة") == "LIVE"
-    assert resolve_business_unit("BU-AHJ") == "LIVE"
+def test_bu_detection_ahj_group_resolves_to_ahj():
+    """AHJ is the app-level code and the CRM's own value; HJH is the same
+    branch and resolves to AHJ too."""
+    assert resolve_business_unit("جدة") == "AHJ"
+    assert resolve_business_unit("حي الجامعة") == "AHJ"
+    assert resolve_business_unit("BU-AHJ") == "AHJ"
+    assert resolve_business_unit("HJH") == "AHJ"
+    assert is_supported_bank_bu("AHJ")
 
 
 def test_bu_detection_typo_tolerance_via_fuzzy_fallback():
@@ -89,6 +89,42 @@ def test_bu_detection_afw_explicit_forms():
     assert resolve_business_unit("BU-AFW") == "AFW"
     assert resolve_business_unit("AFW") == "AFW"
     assert is_supported_bank_bu("AFW")
+
+
+def test_bu_keyword_map_has_no_duplicate_keys():
+    """A repeated key in the dict literal silently drops the earlier entry."""
+    import ast
+    import collections
+    from pathlib import Path
+    import app.models.input as input_module
+
+    tree = ast.parse(Path(input_module.__file__).read_text(encoding="utf-8"))
+    node = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "") == "BUSINESS_UNIT_KEYWORD_MAP"
+    )
+    counts = collections.Counter(k.value for k in node.value.keys)
+    assert {k: c for k, c in counts.items() if c > 1} == {}
+
+
+def test_bu_equivalent_codes_resolve_to_one_code():
+    """LCH/CHT/ALW are one branch, and so are MKR/ADC/JDC."""
+    for code in ("ALW", "LCH", "CHT", "BU-ALW", "BU-LCH"):
+        assert resolve_business_unit(code) == "ALW", code
+    for code in ("ADC", "JDC", "MKR", "BU-MKR", "BU-ADC", "المكرونة"):
+        assert resolve_business_unit(code) == "ADC", code
+
+
+def test_bu_jeddah_hospital_alias_resolves_to_ahj():
+    assert resolve_business_unit("مستشفى اندلسية جدة") == "AHJ"
+
+
+def test_transcript_bu_detection_agrees_with_resolve_business_unit():
+    """Longest alias wins in both resolvers — not dict insertion order."""
+    text = "Agent: بمركزنا المتخصص في صحة المرأة بالأمير سلطان"
+    assert call(text).business_unit == resolve_business_unit(text) == "ALW"
+    text = "Agent: عيادات أندلسية-السنابل في جدة"
+    assert call(text).business_unit == resolve_business_unit(text) == "SNB"
 
 
 # ── Bank-validation scope ───────────────────────────────────────────────────
@@ -232,7 +268,7 @@ def test_requested_bank_data_no_answer_at_all():
     assert result["is_violation"] is True
 
 
-# ── Multiple Accounts (AHJ / LIVE has two) ──────────────────────────────────
+# ── Multiple Accounts (AHJ has two) ────────────────────────────────────────
 
 def test_multiple_accounts_exact_iban_resolves():
     result = validate_ksa_bank_information(

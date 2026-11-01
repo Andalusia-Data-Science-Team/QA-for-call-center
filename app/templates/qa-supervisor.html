@@ -211,6 +211,57 @@
             font-size: .87rem;
         }
 
+        /* ── Structured compliance flag (title, labelled fields, transcript) ──
+           Mixed Arabic/English text: every value gets its own direction. */
+        .flag-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 10px; }
+        .flag-title-text { font-weight: 700; color: #2d3748; font-size: .95rem; }
+        .flag-subject {
+            background: #edf2f7; color: #2d3748; padding: 3px 10px;
+            border-radius: 12px; font-size: .85rem; font-weight: 600;
+        }
+        .flag-text {
+            color: #2d3748; line-height: 1.6; font-size: .92rem;
+            unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere;
+        }
+        .flag-fields {
+            display: grid; grid-template-columns: max-content 1fr;
+            gap: 8px 14px; margin: 0 0 4px; align-items: baseline;
+        }
+        .flag-fields dt {
+            color: #718096; font-size: .74rem; font-weight: 700;
+            text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
+        }
+        .flag-fields dd {
+            margin: 0; color: #2d3748; line-height: 1.6; font-size: .92rem;
+            unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere;
+        }
+        .flag-fields dd.flag-crm { font-weight: 700; }
+        .flag-clamp {
+            display: -webkit-box; -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3; overflow: hidden;
+        }
+        .flag-more {
+            background: none; border: none; padding: 0; margin-top: 2px;
+            color: #667eea; font-size: .8rem; font-weight: 700; cursor: pointer;
+        }
+        .flag-excerpt { font-style: normal; display: flex; flex-direction: column; gap: 6px; }
+        .flag-excerpt-label {
+            color: #718096; font-size: .72rem; font-weight: 700;
+            text-transform: uppercase; letter-spacing: .4px;
+        }
+        .flag-line { display: flex; gap: 8px; align-items: baseline; }
+        .flag-line-text { flex: 1; line-height: 1.6; unicode-bidi: plaintext; text-align: start; overflow-wrap: anywhere; }
+        .flag-speaker {
+            flex-shrink: 0; padding: 2px 9px; border-radius: 10px;
+            font-size: .72rem; font-weight: 700; font-style: normal;
+        }
+        .flag-speaker-agent   { background: #e9e8fd; color: #4c51bf; }
+        .flag-speaker-patient { background: #e6fffa; color: #234e52; }
+        @media (max-width: 600px) {
+            .flag-fields { grid-template-columns: 1fr; gap: 2px; }
+            .flag-fields dd { margin-bottom: 8px; }
+        }
+
         /* Performance mini */
         .perf-row {
             display: flex;
@@ -422,6 +473,88 @@ function esc(s) {
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+/* ── Structured compliance flag ──
+   Doctor-validation flags arrive as one string mixing Arabic and English:
+     "Label — subject / Agent stated: … / CRM value: … / Reason: … / Evidence: …"
+   Split it into a title and labelled rows, and the transcript excerpt into
+   one line per speaker, each with its own text direction. */
+const FLAG_FIELD_SPLIT = /\s+\/\s+(?=(?:Agent stated|CRM value|CRM doctor|Reason|Recommendation|Evidence)\s*:)/;
+const FLAG_SPEAKER_SPLIT = /(?:^|\s+)(Agent|Patient|Customer|Client)\s*:\s*/;
+const FLAG_CLAMP_CHARS = 220;
+
+function parseFlagDescription(desc) {
+    const parts = String(desc ?? '').split(FLAG_FIELD_SPLIT);
+    const head = parts.shift().trim();
+    const fields = parts.map(p => {
+        const i = p.indexOf(':');
+        return { label: p.slice(0, i).trim(), value: p.slice(i + 1).trim() };
+    });
+    const dash = head.indexOf(' — ');
+    if (!fields.length || dash < 0) return { title: head, subject: '', fields };
+    return { title: head.slice(0, dash).trim(), subject: head.slice(dash + 3).trim(), fields };
+}
+
+function flagExcerptLines(text) {
+    const parts = String(text ?? '').trim().split(FLAG_SPEAKER_SPLIT);
+    const lines = [];
+    if (parts[0].trim()) lines.push({ speaker: '', text: parts[0].trim() });
+    for (let i = 1; i < parts.length; i += 2) {
+        const t = (parts[i + 1] || '').trim();
+        if (t) lines.push({ speaker: parts[i], text: t });
+    }
+    return lines;
+}
+
+function toggleFlagClamp(btn) {
+    const el = btn.previousElementSibling;
+    const clamped = el.classList.toggle('flag-clamp');
+    btn.textContent = clamped ? 'Show more' : 'Show less';
+}
+
+function flagValueHTML(value, cls = '') {
+    const long = value.length > FLAG_CLAMP_CHARS;
+    return `<dd class="${cls}"><div dir="auto" class="${long ? 'flag-clamp' : ''}">${esc(value)}</div>${
+        long ? '<button type="button" class="flag-more" onclick="toggleFlagClamp(this)">Show more</button>' : ''}</dd>`;
+}
+
+function flagBodyHTML(f) {
+    const { title, subject, fields } = parseFlagDescription(f.description);
+    const excerpt = String(f.transcript_excerpt ?? '').trim();
+
+    /* Evidence usually repeats the transcript excerpt; show it once, in the
+       transcript box. */
+    const evidence = fields.find(x => x.label === 'Evidence');
+    const shownFields = fields.filter(x => !(x.label === 'Evidence' && (!excerpt || x.value === excerpt)));
+    const transcript = excerpt || evidence?.value || '';
+
+    const titleHTML = fields.length
+        ? `<div class="flag-title">
+               <span class="flag-title-text" dir="auto">${esc(title)}</span>
+               ${subject ? `<span class="flag-subject" dir="auto">${esc(subject)}</span>` : ''}
+           </div>`
+        : `<div class="flag-text" dir="auto" style="margin:4px 0 6px;">${esc(title || '—')}</div>`;
+
+    const fieldsHTML = shownFields.length
+        ? `<dl class="flag-fields">${shownFields.map(x =>
+              `<dt>${esc(x.label)}</dt>${flagValueHTML(x.value, x.label.startsWith('CRM') ? 'flag-crm' : '')}`
+          ).join('')}</dl>`
+        : '';
+
+    const lines = flagExcerptLines(transcript);
+    const transcriptHTML = lines.length
+        ? `<div class="excerpt-box flag-excerpt">
+               <span class="flag-excerpt-label">Transcript</span>
+               ${lines.map(l => `
+               <div class="flag-line">
+                   ${l.speaker ? `<span class="flag-speaker flag-speaker-${l.speaker === 'Agent' ? 'agent' : 'patient'}">${esc(l.speaker)}</span>` : ''}
+                   <span class="flag-line-text" dir="auto">${esc(l.text)}</span>
+               </div>`).join('')}
+           </div>`
+        : '';
+
+    return titleHTML + fieldsHTML + transcriptHTML;
+}
+
 /* ── Format timestamp ── */
 function fmtTs(iso) {
     if (!iso) return '';
@@ -532,8 +665,8 @@ function cardHTML(e) {
     let actionBtns = '';
     if (e.status === 'pending') {
         actionBtns = `
-            <button class="action-btn btn-dismiss" onclick="dismissItem('${esc(e.id)}')">Dismiss</button>
-            <button class="action-btn btn-review"  onclick="toggleNoteArea('${esc(e.id)}')">✓ Mark as Reviewed</button>`;
+            <button class="action-btn btn-dismiss" onclick="dismissItem('${esc(e.id)}')">Remove Error</button>
+            <button class="action-btn btn-review"  onclick="toggleNoteArea('${esc(e.id)}')">✓ Error is valid</button>`;
     } else if (e.status === 'reviewed') {
         actionBtns = `
             <button class="action-btn btn-reopen" onclick="reopenItem('${esc(e.id)}')">↩ Reopen</button>`;
@@ -599,10 +732,7 @@ function cardHTML(e) {
                     <span class="v-badge ${typeBadgeClass(f.type)}">${esc(f.type || '—')}</span>
                     <span class="v-badge ${sevBadgeClass(f.severity)}">${esc(f.severity || '—')}</span>
                 </div>
-                <div class="violation-desc">${esc(f.description || '—')}</div>
-                ${f.transcript_excerpt
-                    ? `<div class="excerpt-box">${esc(f.transcript_excerpt)}</div>`
-                    : ''}
+                ${flagBodyHTML(f)}
             </div>
 
             <!-- Supervisor note (visible after clicking Mark Reviewed) -->
@@ -674,9 +804,22 @@ async function confirmReview(id) {
         reviewed_at: new Date().toISOString(),
         review_note: note || null,
     });
+    
+    // Update the button text to show review confirmation
+    const card = document.getElementById(`card-${id}`);
+    if (card) {
+        const reviewBtn = card.querySelector('.btn-review');
+        if (reviewBtn) {
+            reviewBtn.textContent = '✅reviewed';
+            reviewBtn.disabled = true;
+            reviewBtn.style.opacity = '0.7';
+            reviewBtn.style.cursor = 'default';
+        }
+    }
+    
     refreshStats(items);
     render();
-    toast('✅ Marked as reviewed', 'ok');
+    toast('Review', 'ok');
 }
 
 async function dismissItem(id) {
@@ -684,10 +827,16 @@ async function dismissItem(id) {
     if (!item) return;
 
     try {
+        /* The flag fields identify this violation's own row, which the
+           server marks Removed_Error = 1. */
         const res = await fetch('/escalations/dismiss', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ call_id: item.call_id }),
+            body: JSON.stringify({
+                call_id:            item.call_id,
+                flag_description:   item.flag?.description ?? '',
+                transcript_excerpt: item.flag?.transcript_excerpt ?? '',
+            }),
         });
         if (!res.ok) {
             const message = await readErrorMessage(res);
@@ -708,7 +857,34 @@ async function dismissItem(id) {
     toast('⬜ Escalation dismissed', 'info');
 }
 
-function reopenItem(id) {
+async function reopenItem(id) {
+    const item = loadAll().find(e => e.id === id);
+    if (!item) return;
+
+    /* Reopening a removed error clears Removed_Error on its row, so it
+       leaves the Removed Errors tab until it is removed again. */
+    if (item.status === 'dismissed') {
+        try {
+            const res = await fetch('/escalations/reopen', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    call_id:            item.call_id,
+                    flag_description:   item.flag?.description ?? '',
+                    transcript_excerpt: item.flag?.transcript_excerpt ?? '',
+                }),
+            });
+            if (!res.ok) {
+                const message = await readErrorMessage(res);
+                throw new Error(message);
+            }
+        } catch (err) {
+            console.error('reopen failed', err);
+            toast(`⚠ ${err.message || 'Reopen update failed'}`, 'info');
+            return;
+        }
+    }
+
     const items = patchItem(id, {
         status:      'pending',
         reviewed_at: null,

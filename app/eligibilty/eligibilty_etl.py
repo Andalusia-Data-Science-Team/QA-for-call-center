@@ -81,7 +81,7 @@ def eligibility_etl_pipeline():
             )
             query = query_path.read_text()
             current_time = datetime.now()
-            engine = get_conn_engine(db_names["LIVE"], logger)
+            engine = get_conn_engine(db_names["AHJ"], logger)
 
             try:
                 with engine.connect() as conn:
@@ -209,7 +209,7 @@ def eligibility_etl_pipeline():
             tqdm.pandas(desc="API Requests")
             df["eligibility_response"] = df.progress_apply(
                 lambda row: send_json_to_api(
-                    create_json_payload(row, source="LIVE")
+                    create_json_payload(row, source="AHJ")
                 ),
                 axis=1,
             )

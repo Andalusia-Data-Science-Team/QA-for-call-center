@@ -133,8 +133,9 @@ class CriteriaLoader:
         pb = data.get("prohibited_behaviors", {})
         if pb:
             lines.append("\n## Prohibited Behaviors")
-            for severity_label, items in pb.items():
-                lines.append(f"  [{severity_label.replace('_', ' ').title()}]")
+            # Severity group labels are not shown to the LLM — severity is
+            # hardcoded at persistence time.
+            for items in pb.values():
                 lines.append(_list_bullets(items, prefix="    – "))
 
         # Red flag phrases

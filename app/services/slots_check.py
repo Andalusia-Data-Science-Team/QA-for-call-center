@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def load_passcodes(filepath="Passcode.json"):
     with open(filepath, "r") as f:
         data = json.load(f)
-    return data["DB_NAMES"]["LIVE"]
+    return data["DB_NAMES"]["AHJ"]
 
 
 def get_conn_engine(passcodes, logger=None):

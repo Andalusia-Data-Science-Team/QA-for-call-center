@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,6 +26,32 @@ class LogParser:
         self.overall_consumption_file = self.logs_dir / "overall_consumption.log"
         self.node_output_file = self.logs_dir / "node_output.log"
 
+    def _log_file_chain(self, file_path: Path) -> List[Path]:
+        """Return a log file plus its rotated siblings, oldest rotation first.
+
+        RotatingFileHandler renames ``name.log`` → ``name.log.1`` (and .1 →
+        .2, ...) when it hits maxBytes, so history lives in the numbered
+        siblings. Parsing only the current file silently "erased" every
+        rotated entry from the dashboard — the data stayed on disk but was
+        never read. Oldest-first ordering lets later (newer) entries win the
+        per-call latest-run comparisons in parse_all_logs.
+        """
+        chain: List[Path] = []
+        for index in range(settings.TOKEN_USAGE_LOG_BACKUP_COUNT, 0, -1):
+            rotated = file_path.with_name(f"{file_path.name}.{index}")
+            if rotated.exists():
+                chain.append(rotated)
+        if file_path.exists():
+            chain.append(file_path)
+        return chain
+
+    def _parse_jsonl_chain(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Parse a JSONL file together with all its rotated siblings."""
+        entries: List[Dict[str, Any]] = []
+        for path in self._log_file_chain(file_path):
+            entries.extend(self._parse_jsonl(path))
+        return entries
+
     def parse_all_logs(self) -> Dict[str, Any]:
         """Return the latest successful evaluation for every evaluated chat.
 
@@ -32,7 +60,7 @@ class LogParser:
         completed evaluation when their records are absent or incomplete.
         """
         calls: Dict[str, Dict[str, Any]] = {}
-        node_outputs = self._parse_jsonl(self.node_output_file)
+        node_outputs = self._parse_jsonl_chain(self.node_output_file)
 
         # A successful aggregate record means the chat was evaluated, even if
         # no consumption data was emitted for that run.
@@ -61,7 +89,7 @@ class LogParser:
         # Consumption enriches evaluation details but never controls whether a
         # completed evaluation is visible. Keep its newest run per chat.
         latest_consumption_timestamp: Dict[str, str] = {}
-        for entry in self._parse_jsonl(self.node_consumption_file):
+        for entry in self._parse_jsonl_chain(self.node_consumption_file):
             call_id = entry.get("call_id")
             if call_id not in calls:
                 continue
@@ -74,7 +102,7 @@ class LogParser:
                 calls[call_id]["node_consumption"].append(entry)
 
         latest_overall_timestamp: Dict[str, str] = {}
-        for entry in self._parse_jsonl(self.overall_consumption_file):
+        for entry in self._parse_jsonl_chain(self.overall_consumption_file):
             call_id = entry.get("call_id")
             if call_id not in calls:
                 continue
@@ -128,23 +156,24 @@ class LogParser:
 
         for call_data in all_calls.values():
             # Filter by call_id
-            if call_id and call_id.lower() not in call_data.get("call_id", "").lower():
+            if call_id and call_id.lower() not in (call_data.get("call_id") or "").lower():
                 continue
 
-            # Filter by agent_name
-            agent_name_value = call_data.get("agent_name", "")
-            
+            # Filter by agent_name — the key can exist with a None value
+            # (older evaluations carried no agent name), so coerce to "".
+            agent_name_value = call_data.get("agent_name") or ""
+
             if agent_name:
                 if agent_name.lower() not in agent_name_value.lower():
                     continue
-            
+
             # Filter by agent_email
-            evaluation = call_data.get("evaluation", {})
-            agent_email_in_eval = evaluation.get("agent_email_address", "")
-            
+            evaluation = call_data.get("evaluation") or {}
+            agent_email_in_eval = evaluation.get("agent_email_address") or ""
+
             if agent_email:
                 email_lower = agent_email.lower()
-                if (email_lower not in agent_name_value.lower() and 
+                if (email_lower not in agent_name_value.lower() and
                     email_lower not in agent_email_in_eval.lower()):
                     continue
 

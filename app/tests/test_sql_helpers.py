@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 from sqlalchemy.exc import ProgrammingError
 
@@ -13,6 +15,7 @@ def test_call_level_params_maps_new_schema_fields():
         agent_email="agent@example.com",
         Patient_Phone="966500000000",
         call_date="2026-07-15",
+        archive_datetime=datetime(2026, 7, 15, 13, 42, 9),
         call_duration_seconds=120,
         department="Scheduling",
         transcript="Hello world",
@@ -50,6 +53,7 @@ def test_call_level_params_maps_new_schema_fields():
     )
 
     assert payload["Agent_Classification"] == "C"
+    assert payload["Call_Date"] == datetime(2026, 7, 15, 13, 42, 9)
     assert payload["Profiling_Comment"] == "Poor Process"
     assert payload["BU"] == "LCH"
     assert payload["Agent_Email_Address"] == "agent@example.com"

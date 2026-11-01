@@ -1,6 +1,9 @@
 """Tests for app.agent.nodes.aggregate_results' flag-merging/normalisation
 logic — specifically the "positive" type/severity mix-up regression.
 
+Flags are violations only: a positive/no-violation finding from any source
+is dropped during aggregation, and every remaining flag is critical.
+
 Real regression: call 57C946E6-1F85-F111-B337-000D3AA9D4A7 crashed
 aggregate_results' Pydantic validation with
     compliance_flags.0.type: Input should be 'C2C', 'C2B', 'C2Com' or 'NC'
@@ -82,15 +85,12 @@ def test_positive_type_from_behavioral_flags_no_longer_crashes_aggregation():
     result = asyncio.run(aggregate_results(state))
     assert "error" not in result
     assert result["result"] is not None
-    flags = result["parsed_data"]["compliance_flags"]
-    assert len(flags) == 1
-    assert flags[0]["type"] == "NC"
-    assert flags[0]["severity"] == "positive"
+    assert result["parsed_data"]["compliance_flags"] == []
 
 
-def test_positive_type_from_compliance_reservation_script_scoring_all_normalize():
+def test_positive_type_from_compliance_reservation_script_scoring_all_dropped():
     """Every focused-evaluation flag list can independently carry a
-    'positive'-typed flag — none of them may bypass normalisation."""
+    'positive'-typed flag — none of them may reach the final flags."""
     positive_flag = {
         "type": "positive", "severity": "critical",
         "description": "d", "transcript_excerpt": "e",
@@ -105,15 +105,12 @@ def test_positive_type_from_compliance_reservation_script_scoring_all_normalize(
     }
     result = asyncio.run(aggregate_results(state))
     assert "error" not in result
-    flags = result["parsed_data"]["compliance_flags"]
-    assert len(flags) == 4
-    assert all(f["type"] == "NC" and f["severity"] == "positive" for f in flags)
+    assert result["parsed_data"]["compliance_flags"] == []
 
 
-def test_positive_type_from_offer_flags_still_normalizes():
-    """Regression guard for the ORIGINAL (narrower) fix this generalises —
-    the offer node's own 'positive' type must keep working exactly as
-    before."""
+def test_positive_type_from_offer_flags_is_dropped():
+    """A suitable offer is a pass — the offer node's 'positive' flag must
+    not crash aggregation and must not be reported."""
     state = {
         "call": call(),
         "offer_eval": {"offer_flags": [{
@@ -126,9 +123,7 @@ def test_positive_type_from_offer_flags_still_normalizes():
     }
     result = asyncio.run(aggregate_results(state))
     assert "error" not in result
-    flags = result["parsed_data"]["compliance_flags"]
-    assert flags[0]["type"] == "NC"
-    assert flags[0]["severity"] == "positive"
+    assert result["parsed_data"]["compliance_flags"] == []
 
 
 def test_valid_flag_types_are_unaffected_by_normalization():
@@ -146,3 +141,46 @@ def test_valid_flag_types_are_unaffected_by_normalization():
     flags = result["parsed_data"]["compliance_flags"]
     assert flags[0]["type"] == "C2Com"
     assert flags[0]["severity"] == "critical"
+
+
+def test_positive_severity_dropped_and_other_severities_become_critical():
+    state = {
+        "call": call(),
+        "compliance_eval": {"compliance_flags": [
+            {"type": "NC", "severity": "positive", "description": "good", "transcript_excerpt": "a"},
+            {"type": "C2B", "severity": "moderate", "description": "d", "transcript_excerpt": "b"},
+            {"type": "NC", "severity": "minor", "description": "d", "transcript_excerpt": "c"},
+        ]},
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    assert "error" not in result
+    flags = result["parsed_data"]["compliance_flags"]
+    assert [(f["type"], f["severity"]) for f in flags] == [("C2B", "critical"), ("NC", "critical")]
+
+
+def test_flag_without_severity_is_stored_as_critical():
+    """The prompts only ask for the flag type — a missing severity must
+    still validate and be stored as critical."""
+    state = {
+        "call": call(),
+        "compliance_eval": {"compliance_flags": [
+            {"type": "NC", "description": "d", "transcript_excerpt": "e"},
+        ]},
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    assert "error" not in result
+    flags = result["parsed_data"]["compliance_flags"]
+    assert [(f["type"], f["severity"]) for f in flags] == [("NC", "critical")]
+
+
+def test_scoring_llm_context_never_contains_severity():
+    from app.agent.nodes import _llm_context_json
+    payload = {"crm_leads_flags": [{"type": "C2B", "severity": "critical", "description": "d"}],
+               "nested": {"severity": "x", "items": [{"severity": "y", "keep": 1}]}}
+    out = _llm_context_json(payload)
+    assert "severity" not in out
+    assert '"keep": 1' in out

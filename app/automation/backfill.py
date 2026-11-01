@@ -150,8 +150,8 @@ def _take(
         return 0
 
     taken = repo.selected_positions(conn, run_id, agent)
-    taken |= repo.trailing_positions_from_previous_run(
-        conn, agent, reporting_date - timedelta(days=1)
+    taken |= repo.midnight_boundary_positions(
+        conn, agent, reporting_date - timedelta(days=1), policy_version
     )
 
     outcome = select_nonconsecutive(

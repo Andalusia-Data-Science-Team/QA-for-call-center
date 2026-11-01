@@ -87,6 +87,36 @@ def test_a_running_job_cannot_be_claimed_twice(ledger, job):
     assert repo.claim_job(ledger, owner="w2", lease_minutes=10) is None
 
 
+def test_start_date_keeps_older_jobs_out_of_the_worker_queue(ledger, job):
+    ledger.execute(
+        "UPDATE QA_EvaluationJobs SET ReportingDate = '2026-10-24' WHERE JobId = ?",
+        (job,),
+    )
+    cutoff = date(2026, 10, 25)
+
+    assert repo.has_claimable_job(ledger, min_reporting_date=cutoff) is False
+    assert repo.claim_job(ledger, owner="w1", lease_minutes=10,
+                          min_reporting_date=cutoff) is None
+    assert ledger.execute("SELECT Status FROM QA_EvaluationJobs WHERE JobId = ?", (job,)).fetchone()[0] == "pending"
+
+    ledger.execute(
+        "UPDATE QA_EvaluationJobs SET ReportingDate = '2026-10-25' WHERE JobId = ?",
+        (job,),
+    )
+    assert repo.has_claimable_job(ledger, min_reporting_date=cutoff) is True
+    assert repo.claim_job(ledger, owner="w1", lease_minutes=10,
+                          min_reporting_date=cutoff)["JobId"] == job
+
+
+def test_worker_respects_configured_start_date(ledger, job):
+    settings = AutomationSettings(automation_start_date=date(2026, 10, 30))
+
+    report = asyncio.run(work_once(ledger, None, None, None, settings))
+
+    assert report.claimed == 0
+    assert ledger.execute("SELECT Status FROM QA_EvaluationJobs WHERE JobId = ?", (job,)).fetchone()[0] == "pending"
+
+
 def test_expired_lease_returns_the_job_to_the_queue(ledger, job):
     first = repo.claim_job(ledger, owner="w1", lease_minutes=10)
     later = datetime.now(UTC) + timedelta(minutes=30)
@@ -486,3 +516,38 @@ def test_work_once_pauses_after_credit_exhaustion(ledger, job, monkeypatch):
     assert ledger.execute(
         "SELECT COUNT(*) FROM QA_EvaluationJobs WHERE Status='pending'"
     ).fetchone()[0] == 1
+
+
+def test_worker_stamps_the_sampled_agents_email_on_the_transcript(ledger, job, monkeypatch):
+    """
+    NEWFIX returns the owner's address as UserEmailAddress, which from_cm_rows
+    does not read. Without the stamp, Agent_Email_Address would be persisted
+    empty; /retrieve-and-analyze stamps it the same way.
+    """
+    from app.automation import worker
+
+    seen = {}
+
+    class CapturingAnalyzer:
+        llm_client = type("c", (), {"model": "m"})()
+
+        async def analyze(self, call, *, job_id=None):
+            seen["agent_email"] = call.agent_email
+            raise RuntimeError("stop after capture")
+
+    monkeypatch.setattr(worker, "_current_max_version", lambda engine, call_id: 0)
+    monkeypatch.setattr(
+        "app.CM.candidate_queries.fetch_transcripts_by_ids", lambda handler, ids: _fake_frame(),
+    )
+    monkeypatch.setattr(
+        "app.CM.candidate_queries.rows_for_conversation", lambda frame, cid: _fake_rows(),
+    )
+    monkeypatch.setattr(
+        "app.models.input.CallTranscript.from_cm_rows", classmethod(lambda cls, rows: _fake_call()),
+    )
+
+    claimed = repo.claim_job(ledger, owner="w1", lease_minutes=10)
+    asyncio.run(process_job(ledger, object(), object(), CapturingAnalyzer(), claimed,
+                            _settings(), worker.WorkerReport()))
+
+    assert seen["agent_email"] == "agent@x.net"

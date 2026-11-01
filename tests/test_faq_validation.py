@@ -260,7 +260,7 @@ def test_faq_prompt_contains_call_record_fields_and_existing_rules():
         call_date="2026-09-14",
         call_duration_seconds=120,
         department="Helpdesk",
-        business_unit="LIVE",
+        business_unit="AHJ",
         transcript=(
             "Patient: أنا عبد الرحمن وأستفسر عن التقرير الطبي\n"
             "Agent: تم رفع الطلب للقسم المختص"
@@ -306,7 +306,7 @@ def make_call(transcript="Agent: تم رفع الطلب للقسم المختص"
         call_date="2026-09-14",
         call_duration_seconds=120,
         department="Helpdesk",
-        business_unit="LIVE",
+        business_unit="AHJ",
         transcript=transcript,
     )
 

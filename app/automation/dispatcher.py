@@ -57,7 +57,9 @@ def dispatch_once(
     moment = now or datetime.now(UTC)
     report = DispatchReport()
 
-    due = repo.due_intervals(conn, moment)
+    due = repo.due_intervals(
+        conn, moment, min_reporting_date=settings.automation_start_date,
+    )
     if not due:
         logger.debug("dispatch | nothing due at %s", moment.isoformat())
         return report
@@ -253,8 +255,8 @@ def _process_interval(conn, interval, window_df, settings, report, moment) -> No
         # Spacing must hold across intervals and across midnight, so the
         # already-selected set spans this run and the tail of the previous day.
         taken = repo.selected_positions(conn, run_id, agent)
-        taken |= repo.trailing_positions_from_previous_run(
-            conn, agent, reporting_date - timedelta(days=1)
+        taken |= repo.midnight_boundary_positions(
+            conn, agent, reporting_date - timedelta(days=1), interval["SamplingPolicyVersion"]
         )
 
         outcome = select_nonconsecutive(

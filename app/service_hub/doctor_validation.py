@@ -53,8 +53,9 @@ from app.services.text_helpers import normalize_arabic_text, split_transcript_by
 # rather than defining a second one here — see canonical_doctor_bu()'s
 # docstring below and app.service_hub.bank_validation's own comment beside
 # _APP_BU_TO_CRM_BU for the full rationale (verified against real Dynamics
-# 365 data: CRM rows use "AHJ", never the app-level "LIVE" label).
+# 365 data: CRM rows use "AHJ", never its "HJH" alias).
 from app.service_hub.bank_validation import _APP_BU_TO_CRM_BU, resolve_business_unit
+from app.service_hub.crm_leads_validation import normalize_business_unit
 # Reuse the project's single canonical Arabic/English specialty-alias
 # table rather than a second, duplicate copy of it — see
 # _resolve_specialty_category's docstring below.
@@ -123,7 +124,7 @@ def is_supported_doctor_bu(bu: str | None) -> bool:
 
 
 def canonical_doctor_bu(bu: str | None) -> str | None:
-    """Translate an application-level business-unit code (e.g. "LIVE") to
+    """Translate an application-level business-unit code (e.g. "HJH") to
     the CRM business-unit code doctor records actually carry (e.g. "AHJ"),
     BEFORE any BU-scoped filtering/comparison happens. Reuses
     app.service_hub.bank_validation._APP_BU_TO_CRM_BU — the project's one
@@ -187,12 +188,18 @@ def _match_doctor_business_unit(claimed_bu: Any, record: dict[str, Any]) -> str 
     claim reports a single, deterministic field), or None when there is no
     match at all (including when claimed_bu is empty/None). A disagreement
     between the doctor's own two CRM fields is, by itself, never a reason
-    to fail a claim that matches ONE of them."""
+    to fail a claim that matches ONE of them.
+
+    Codes in the same business-unit equivalence group
+    (crm_leads_validation.LEAD_BU_CODE, e.g. MKR/ADC/JDC) are the
+    same branch and always match each other."""
     claimed_norm = _normalize_bu(claimed_bu)
     if not claimed_norm:
         return None
+    claimed_group = normalize_business_unit(claimed_norm)
     for field_name in ("cr301_businessunitname", "cr18c_buname"):
-        if _normalize_bu(record.get(field_name)) == claimed_norm:
+        record_bu = _normalize_bu(record.get(field_name))
+        if record_bu and normalize_business_unit(record_bu) == claimed_group:
             return field_name
     return None
 
@@ -4426,7 +4433,7 @@ def validate_doctor_information(
     # already resolved correctly.
     #
     # canonical_doctor_bu() runs FIRST: the conversation's own business_unit
-    # may carry an application-level alias (e.g. "LIVE") that never
+    # may carry an application-level alias (e.g. "HJH") that never
     # literally appears on a CRM doctor row (cr18c_buname="AHJ" there) —
     # comparing the raw alias against CRM would silently find zero BU-
     # scoped candidates and fall through to the unscoped authoritative

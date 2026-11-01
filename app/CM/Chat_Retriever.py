@@ -30,10 +30,12 @@ def get_db_handler(json_file: str = "passcode.json", db_key: str = "CM") -> CMDa
 
 
 def retrieve_chats_by_agent_email(
-    agent_email: str,
-    filter_date: str,
+    agent_email: Optional[str],
+    filter_date: Optional[str],
     db_handler: Optional[CMDatabaseHandler] = None,
     sql_file: str = "../SQL/CM_Chat_Search.sql",
+    chat_limit: int = 10,
+    conversation_id: Optional[str] = None,
 ):
     handler = db_handler or get_db_handler()
     if not handler.connect():
@@ -43,10 +45,11 @@ def retrieve_chats_by_agent_email(
         chats = handler.execute_query_from_file(
             sql_file,
             params={
-                "ConversationId": None,
+                "ConversationId": conversation_id,
                 "AgentFullName": None,
                 "AgentEmail": agent_email,
                 "FilterDate": filter_date,
+                "ChatLimit": int(chat_limit),
             },
         )
         return chats

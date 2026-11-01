@@ -45,7 +45,7 @@ class EligibilityService:
             )
         query = query_path.read_text()
 
-        engine = get_conn_engine(self.db_names["LIVE"], logger)
+        engine = get_conn_engine(self.db_names["AHJ"], logger)
 
         try:
             with engine.connect() as conn:
@@ -87,7 +87,7 @@ class EligibilityService:
 
         return create_json_payload(
             row=row,
-            source="LIVE"
+            source="AHJ"
         )
 
     def call_eligibility_api(self, payload: dict) -> dict:
