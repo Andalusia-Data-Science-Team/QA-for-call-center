@@ -606,10 +606,10 @@ async def get_qa_results(
         clauses.append("Agent_Name LIKE :agent_name")
         bind["agent_name"] = f"%{agent_name}%"
     if date_from:
-        clauses.append("CAST(Created_at AS DATE) >= :date_from")
+        clauses.append("CAST(Call_Date AS DATE) >= :date_from")
         bind["date_from"] = date_from
     if date_to:
-        clauses.append("CAST(Created_at AS DATE) <= :date_to")
+        clauses.append("CAST(Call_Date AS DATE) <= :date_to")
         bind["date_to"] = date_to
     if overall_assessment:
         clauses.append("Overall_Assessment = :overall_assessment")
