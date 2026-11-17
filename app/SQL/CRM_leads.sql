@@ -103,6 +103,7 @@ SELECT top 100
       ,[new_bookingphonenumber] ---------------------
 	  ,[new_district]
 	  ,[new_lastcallresult]
+      ,[new_inquiryonlyreason]
       ,[new_lastcallcreatedby]
 	  ,[new_lastcallcreatedbyname]
       ,[new_lastphone]

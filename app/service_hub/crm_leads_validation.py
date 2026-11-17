@@ -17,6 +17,7 @@ import httpx
 
 from app.config import settings
 from app.models.input import CallTranscript
+from app.services.regulation_catalog import regulation_items
 from app.services.text_helpers import normalize_arabic_text
 
 
@@ -448,6 +449,7 @@ def _normalize_web_api_lead(record: dict[str, Any]) -> dict[str, Any]:
     )
     normalized["new_doctor"] = _display_value(record, "new_doctor")
     normalized["new_lastcallresult"] = _display_value(record, "new_lastcallresult")
+    normalized["new_inquiryonlyreason"] = _display_value(record, "new_inquiryonlyreason")
     normalized["new_lastcallcreatedbyname"] = (
         record.get("new_lastcallcreatedbyname")
         or _display_value(record, "new_lastcallcreatedby")
@@ -726,9 +728,30 @@ def matched_crm_lead_attributes(
     return matched
 
 
+def _crm_policy_labels(field: str = "") -> dict[str, str]:
+    """Use an existing C2B item for every CRM lead data mismatch."""
+    item_id = (
+        "C2B_017"
+        if field.casefold() in {"new_lastcallresult", "new_inquiryonlyreason"}
+        else "C2B_021"
+    )
+    item = next(
+        (item for item in regulation_items() if item["id"] == item_id and item["type"] == "C2B"),
+        None,
+    )
+    if item is None:
+        raise LookupError(f"CRM lead policy item {item_id} is missing")
+    return {"attribute": item["attribute"], "comment": item["comment"]}
+
+
 def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
     """Enforce the public flag contract regardless of model formatting drift."""
     normalized_flags: list[dict[str, str]] = []
+    mismatched_fields = [
+        str(check.get("field") or "").strip()
+        for check in data.get("field_checks") or []
+        if isinstance(check, dict) and check.get("matches") is False
+    ]
     for raw_flag in data.get("crm_leads_flags") or []:
         if not isinstance(raw_flag, dict):
             continue
@@ -736,10 +759,21 @@ def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
             raw_flag.get("description") or "CRM lead data does not match the chat."
         ).strip()
         excerpt = str(raw_flag.get("transcript_excerpt") or "N/A").strip()
+        field = str(raw_flag.get("field") or "").strip()
+        if not field:
+            field = next(
+                (name for name in mismatched_fields if name and name.casefold() in description.casefold()),
+                "",
+            )
+        if not field and len(mismatched_fields) == 1:
+            field = mismatched_fields[0]
+        if not field and "new_lastcallresult" in description.casefold():
+            field = "new_lastcallresult"
         normalized_flags.append(
             {
                 "type": "C2B",
                 "severity": "critical",
+                **_crm_policy_labels(field),
                 "description": description,
                 "transcript_excerpt": excerpt,
             }
@@ -762,6 +796,7 @@ def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
             {
                 "type": "C2B",
                 "severity": "critical",
+                **_crm_policy_labels(field),
                 "description": f"CRM lead mismatch in {field}: {reason}",
                 "transcript_excerpt": "N/A",
             }
@@ -772,6 +807,7 @@ def normalize_crm_lead_evaluation(data: dict[str, Any]) -> dict[str, Any]:
             {
                 "type": "C2B",
                 "severity": "critical",
+                **_crm_policy_labels(),
                 "description": "CRM lead data does not match the authoritative chat facts.",
                 "transcript_excerpt": "N/A",
             }
@@ -808,6 +844,7 @@ def apply_notes_phone_check(
         flags.insert(0, {
             "type": "C2B",
             "severity": "critical",
+            **_crm_policy_labels("new_notes"),
             "description": (
                 f"CRM lead mismatch in new_notes: the patient's non-Saudi mobile "
                 f"number {phone} is not recorded in new_notes (mobilephone holds "
@@ -832,6 +869,7 @@ def missing_lead_evaluation(message: str) -> dict[str, Any]:
             {
                 "type": "C2B",
                 "severity": "critical",
+                **_crm_policy_labels(),
                 "description": "CRM lead missing for the chat phone and selected report date.",
                 "transcript_excerpt": "N/A",
             }

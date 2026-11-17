@@ -46,6 +46,17 @@ def base_scoring_eval() -> dict:
     }
 
 
+def test_aggregate_result_exposes_detected_business_unit():
+    state = {
+        "call": call().model_copy(update={"business_unit": "SNB"}),
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+    result = asyncio.run(aggregate_results(state))
+    assert result["parsed_data"]["business_unit"] == "SNB"
+    assert result["result"].business_unit == "SNB"
+
+
 # ── _normalize_flag_type (pure function) ────────────────────────────────────
 
 def test_normalize_flag_type_maps_positive_type_to_nc_with_positive_severity():
@@ -131,6 +142,8 @@ def test_valid_flag_types_are_unaffected_by_normalization():
         "call": call(),
         "compliance_eval": {"compliance_flags": [{
             "type": "C2Com", "severity": "critical",
+            "attribute": "Misleading the Privacy Policy",
+            "comment": "Released customer personal data",
             "description": "d", "transcript_excerpt": "e",
         }]},
         "scoring_eval": base_scoring_eval(),
@@ -148,8 +161,12 @@ def test_positive_severity_dropped_and_other_severities_become_critical():
         "call": call(),
         "compliance_eval": {"compliance_flags": [
             {"type": "NC", "severity": "positive", "description": "good", "transcript_excerpt": "a"},
-            {"type": "C2B", "severity": "moderate", "description": "d", "transcript_excerpt": "b"},
-            {"type": "NC", "severity": "minor", "description": "d", "transcript_excerpt": "c"},
+            {"type": "C2B", "severity": "moderate",
+             "attribute": "Intentionally waste Call time", "comment": "Used Hold with no need/Reason",
+             "description": "d", "transcript_excerpt": "b"},
+            {"type": "NC", "severity": "minor",
+             "attribute": "Voice tone", "comment": "Unclear Voice Tone",
+             "description": "d", "transcript_excerpt": "c"},
         ]},
         "scoring_eval": base_scoring_eval(),
         "node_trace": [],
@@ -166,7 +183,8 @@ def test_flag_without_severity_is_stored_as_critical():
     state = {
         "call": call(),
         "compliance_eval": {"compliance_flags": [
-            {"type": "NC", "description": "d", "transcript_excerpt": "e"},
+            {"type": "NC", "attribute": "Voice tone", "comment": "Unclear Voice Tone",
+             "description": "d", "transcript_excerpt": "e"},
         ]},
         "scoring_eval": base_scoring_eval(),
         "node_trace": [],
@@ -175,6 +193,66 @@ def test_flag_without_severity_is_stored_as_critical():
     assert "error" not in result
     flags = result["parsed_data"]["compliance_flags"]
     assert [(f["type"], f["severity"]) for f in flags] == [("NC", "critical")]
+
+
+def test_same_policy_item_from_behavioral_and_compliance_is_one_flag():
+    chat = CallTranscript(
+        call_id="chat-missing-name", agent_name="Agent", Patient_Phone="501234567",
+        call_date="2026-11-14", call_duration_seconds=120, department="Approval",
+        transcript=("Patient: مرحبا\nAgent: ممكن رقم الهويه ؟\n"
+                    "Patient: 1234567890\nAgent: تم تأكيد الحجز باسم عادل"),
+    )
+    state = {
+        "call": chat,
+        "behavioral_eval": {"behavioral_flags": [{
+            "type": "NC", "attribute": "Professional Personalization",
+            "comment": "Didn’t ask for customer name",
+            "description": "Asked for ID but never asked for the patient's name.",
+            "transcript_excerpt": "ممكن رقم الهويه ؟",
+        }]},
+        "compliance_eval": {"compliance_flags": [{
+            "type": "NC", "attribute": "Professional Personalization",
+            "comment": "Didn’t ask for customer name",
+            "description": "NC_001: No agent requested the patient's name.",
+            "transcript_excerpt": "تم تأكيد الحجز باسم عادل",
+        }]},
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+
+    result = asyncio.run(aggregate_results(state))["result"]
+
+    assert len(result.compliance_flags) == 1
+    assert result.compliance_flags[0].comment == "Didn’t ask for customer name"
+    assert result.compliance_flags[0].transcript_excerpt == "ممكن رقم الهويه ؟"
+    assert result.agent_performance.agent_classification == "B"
+    assert result.overall_assessment == "needs_review"
+
+
+def test_distinct_policy_items_with_same_evidence_remain_separate():
+    state = {
+        "call": call(),
+        "behavioral_eval": {"behavioral_flags": [{
+            "type": "NC", "attribute": "Professional Personalization",
+            "comment": "Didn’t ask for customer name",
+            "description": "NC_001: Name was not requested.",
+            "transcript_excerpt": "Agent: hello",
+        }]},
+        "compliance_eval": {"compliance_flags": [{
+            "type": "NC", "attribute": "Voice tone", "comment": "Unclear Voice Tone",
+            "description": "The response was difficult to hear.",
+            "transcript_excerpt": "Agent: hello",
+        }]},
+        "scoring_eval": base_scoring_eval(),
+        "node_trace": [],
+    }
+
+    result = asyncio.run(aggregate_results(state))["result"]
+
+    assert {(flag.attribute, flag.comment) for flag in result.compliance_flags} == {
+        ("Professional Personalization", "Didn’t ask for customer name"),
+        ("Voice tone", "Unclear Voice Tone"),
+    }
 
 
 def test_scoring_llm_context_never_contains_severity():

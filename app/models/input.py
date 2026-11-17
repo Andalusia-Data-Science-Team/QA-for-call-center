@@ -213,6 +213,21 @@ class CallTranscript(BaseModel):
 
     @model_validator(mode="after")
     def detect_business_unit(self) -> "CallTranscript":
+        # A confirmed appointment identifies the destination branch more
+        # reliably than the initial menu selection or CM Tag1. CM agents also
+        # write the branch with spaces inside parentheses ("بفرع ( سنابل )").
+        for message in re.findall(
+            r"(?ms)^Agent:\s*(.*?)(?=^(?:Agent|Patient):|\Z)",
+            self.transcript,
+        ):
+            agent_text = normalize_arabic_text(message)
+            if re.search(
+                r"\b(?:موعدك|تم\s+(?:تاكيد\s+)?حجز\w*)\b"
+                r"[^\n.!؟?]{0,250}\bب?فرع\s*\(?\s*(?:ال)?سنابل\b",
+                agent_text,
+            ):
+                self.business_unit = "SNB"
+                return self
         if self.business_unit is not None:
             return self
         # The patient's explicit BU selection takes precedence over branch

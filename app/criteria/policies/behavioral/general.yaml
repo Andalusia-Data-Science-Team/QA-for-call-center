@@ -10,6 +10,7 @@ script_compliance:
     must_include:
       - "مرحبا بك في مستشفيات أندلسية"
       - "أهلاً وسهلاً بك"
+      - "أهلاً أستاذ/أستاذة (الاسم)"
       - "Hello, Andalusia Hospitals"
       - "Good morning/afternoon"
     preferred_phrases:

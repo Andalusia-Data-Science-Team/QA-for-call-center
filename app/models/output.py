@@ -20,6 +20,8 @@ ProfilingComment = Literal[
 class ComplianceFlag(BaseModel):
     type: FlagType
     severity: Severity
+    attribute: Optional[str] = None
+    comment: Optional[str] = None
     description: str = Field(..., description="1–2 sentences describing the finding.")
     transcript_excerpt: str = Field(..., description="Verbatim excerpt from the transcript.")
 
@@ -130,3 +132,4 @@ class QAAnalysisResult(BaseModel):
 class BatchQAAnalysisResult(BaseModel):
     results: list[QAAnalysisResult]
     summary: dict
+    call_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)

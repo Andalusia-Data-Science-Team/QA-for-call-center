@@ -25,6 +25,7 @@ logs/*.log*
 Passcode.json
 passcode.json
 *.csv
+*.xlsx
 *.ipynb
 *.iqy
 # Local automation ledger (SQLite). Contains the selection audit trail —

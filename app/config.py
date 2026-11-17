@@ -50,7 +50,10 @@ class Settings(BaseSettings):
     )
     NODE_OUTPUT_LOG_PATH: str = os.getenv("NODE_OUTPUT_LOG_PATH", "logs/node_output.log")
     TOKEN_USAGE_LOG_MAX_BYTES: int = max(1024, int(os.getenv("TOKEN_USAGE_LOG_MAX_BYTES", "10485760")))
-    TOKEN_USAGE_LOG_BACKUP_COUNT: int = max(1, int(os.getenv("TOKEN_USAGE_LOG_BACKUP_COUNT", "5")))
+    # Keep enough rotated JSONL history for the logs dashboard to cover
+    # thousands of evaluations instead of silently counting only the latest
+    # few log files. The parser and RotatingFileHandlers share this setting.
+    TOKEN_USAGE_LOG_BACKUP_COUNT: int = max(50, int(os.getenv("TOKEN_USAGE_LOG_BACKUP_COUNT", "50")))
     llm_timeout_seconds: float = 60.0
 
      

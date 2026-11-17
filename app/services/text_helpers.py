@@ -96,11 +96,11 @@ _ARABIC_CHAR_MAP: dict[str, str] = {
 _DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED\u0640]")
 
 
-# Regex that strips Arabic doctor-name prefixes such as:
-#   "د "  "د."  "د/"  "د\"  "دكتور "  "دكتورة "  "Dr."  "Dr "
-# followed by optional whitespace, before the actual name.
+# Strip a doctor title before the name, including compact forms such as
+# "د/محمد" and "د.محمد". A bare "د" must be followed by whitespace so a
+# name such as "داليا" is not changed.
 _DR_PREFIX_RE = re.compile(
-    r"^(?:دكتور[ة]?|د(?:\s*[./\\\-])?)\s+",
+    r"^(?:دكتور[ة]?\s+|د\s*[./\\\-]\s*|د\s+)(?:\(\s*)?",
     re.IGNORECASE,
 )
 

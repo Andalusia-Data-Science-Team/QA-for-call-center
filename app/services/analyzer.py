@@ -9,7 +9,9 @@ from pydantic import ValidationError
 from app.models.input import CallTranscript
 from app.models.output import QAAnalysisResult
 from app.prompts.qa_prompt import SYSTEM_PROMPT, build_user_prompt
+from app.services.criteria_loader import CriteriaLoader
 from app.services.llm_client import LLMClient, LLMError
+from app.services.regulation_catalog import matched_regulation_flags, policy_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,7 @@ class CallAnalyzer:
         Full analysis pipeline for a single call transcript.
         Returns a validated QAAnalysisResult.
         """
-        user_prompt = build_user_prompt(call)
+        user_prompt = build_user_prompt(call, compliance_pillars=CriteriaLoader().compliance_pillars())
 
         # Log the outgoing prompt at DEBUG level (avoids log spam in production)
         logger.debug(
@@ -80,6 +82,8 @@ class CallAnalyzer:
 
         # Always trust the call_id from the request, not from the LLM
         data["call_id"] = call_id
+        if isinstance(data.get("compliance_flags"), list):
+            data["compliance_flags"] = matched_regulation_flags(data["compliance_flags"])
 
         try:
             result = QAAnalysisResult.model_validate(data)
@@ -106,6 +110,23 @@ class CallAnalyzer:
                 call_id,
             )
             result = result.model_copy(update={"escalation_required": True})
+
+        assessment, escalated, classification = policy_outcome(
+            [flag.model_dump() for flag in result.compliance_flags],
+            result.overall_assessment,
+            result.escalation_required,
+        )
+        result = result.model_copy(update={
+            "overall_assessment": assessment,
+            "escalation_required": escalated,
+            "escalation_reason": result.escalation_reason if escalated else None,
+            "agent_performance": result.agent_performance.model_copy(update={
+                "agent_classification": classification,
+                "profiling_comment": (
+                    result.agent_performance.profiling_comment if result.compliance_flags else None
+                ),
+            }),
+        })
 
         return result
 

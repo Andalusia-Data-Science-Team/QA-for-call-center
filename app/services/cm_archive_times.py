@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import urllib.parse
 from typing import Sequence
+from uuid import UUID
 
 from sqlalchemy import bindparam, create_engine, text
 
@@ -22,7 +23,16 @@ def _make_engine(creds: dict):
 
 def lookup_archive_datetimes(call_ids: Sequence[str], creds: dict) -> dict[str, str]:
     """Return CM's UTC+3 ArchiveDateTime by conversation id, to the second."""
-    ids = list(dict.fromkeys(str(call_id).upper() for call_id in call_ids if call_id))
+    ids = []
+    for call_id in call_ids:
+        if not call_id:
+            continue
+        try:
+            ids.append(str(UUID(str(call_id))).upper())
+        except ValueError:
+            # QA results can include named test calls; CM.UniqueId only accepts UUIDs.
+            continue
+    ids = list(dict.fromkeys(ids))
     if not ids:
         return {}
 

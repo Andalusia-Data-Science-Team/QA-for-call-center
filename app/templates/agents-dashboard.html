@@ -120,6 +120,13 @@
         }
         .run-btn:hover:not(:disabled) { opacity: .9; transform: translateY(-2px); }
         .run-btn:disabled { opacity: .5; cursor: not-allowed; }
+        .export-btn {
+            padding: 11px 20px; border-radius: 10px; border: none;
+            background: #276749; color: white; font-weight: 700; font-size: .95rem;
+            cursor: pointer;
+        }
+        .export-btn:hover:not(:disabled) { background: #22543d; }
+        .export-btn:disabled { opacity: .55; cursor: not-allowed; }
 
         /* ── Status / error ── */
         .status-msg  { margin-top: 14px; text-align: center; font-weight: 600; color: #667eea; display: none; }
@@ -174,11 +181,7 @@
             background: #fff5f5;
         }
         .compliance-header { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
-        .severity-badge { padding: 4px 11px; border-radius: 15px; font-size: .78rem; font-weight: 600; }
-        .severity-critical { background: #fed7d7; color: #742a2a; }
-        .severity-moderate { background: #fef5e7; color: #b7791f; }
-        .severity-minor    { background: #fef9c3; color: #92400e; }
-        .severity-positive { background: #d4edda; color: #155724; }
+        .policy-label { padding: 4px 10px; border-radius: 12px; background: #edf2f7; color: #2d3748; font-size: .78rem; line-height: 1.45; max-width: 100%; overflow-wrap: anywhere; }
         .type-badge  { padding: 4px 11px; border-radius: 15px; font-size: .78rem; font-weight: 600; }
         .type-c2c    { background: #f3e5f5; color: #4a148c; }
         .type-c2b    { background: #e8f5e9; color: #1b5e20; }
@@ -385,7 +388,10 @@
             <div class="performance-metrics" id="summaryMetrics"></div>
         </div>
         <div class="card">
-            <div class="card-header"><h2 class="card-title">📞 Call Records</h2></div>
+            <div class="card-header">
+                <h2 class="card-title">📞 Call Records</h2>
+                <button class="export-btn" id="exportBtn" type="button" disabled>Export as Sheet</button>
+            </div>
             <div id="callRecordsList"></div>
         </div>
     </div>
@@ -395,6 +401,7 @@
 <!-- ── Toast notification ── -->
 <div class="toast" id="toast"></div>
 
+<script type="application/json" id="regulationPairs">{{ regulation_pairs | tojson }}</script>
 <script>
 const API_BASE = '';
 
@@ -404,6 +411,13 @@ let _lastResults = [];
 /* ── helpers ── */
 const $ = id => document.getElementById(id);
 const pct = score => Math.round((score ?? 0) * 100) + '%';
+function formatDuration(seconds) {
+    if (seconds == null || seconds === '') return '—';
+    const total = Number(seconds);
+    if (!Number.isFinite(total) || total < 0) return '—';
+    const whole = Math.floor(total);
+    return `${String(Math.floor(whole / 60)).padStart(2, '0')}:${String(whole % 60).padStart(2, '0')}`;
+}
 function esc(str) {
     return String(str ?? '')
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -453,6 +467,13 @@ function flagValueHTML(value, cls = '') {
         long ? '<button type="button" class="flag-more" onclick="toggleFlagClamp(this)">Show more</button>' : ''}</dd>`;
 }
 
+function policyLabelsHTML(f) {
+    return [['Attribute', f.attribute], ['Comment', f.comment]]
+        .filter(([, value]) => value != null && String(value).trim())
+        .map(([label, value]) => `<span class="policy-label"><strong>${label}:</strong> ${esc(String(value))}</span>`)
+        .join('');
+}
+
 function flagBodyHTML(f) {
     const { title, subject, fields } = parseFlagDescription(f.description);
     const excerpt = String(f.transcript_excerpt ?? '').trim();
@@ -491,7 +512,6 @@ function flagBodyHTML(f) {
     return titleHTML + fieldsHTML + transcriptHTML;
 }
 function statusClass(a) { return 'status-' + (a||'error').toLowerCase().replace(/\s+/g,'_'); }
-function severityClass(s) { return 'severity-' + (s||'minor').toLowerCase(); }
 function typeClass(t)     { return 'type-'     + (t||'nc').toLowerCase(); }
 
 function showStatus(on, text='Working…') {
@@ -515,13 +535,52 @@ function showToast(html, type = 'success', duration = 4000) {
     _toastTimer = setTimeout(() => el.classList.remove('show'), duration);
 }
 
+async function exportSessionResults() {
+    if (!_lastResults.length) return;
+    const button = $('exportBtn');
+    button.disabled = true;
+    try {
+        const response = await fetch(`${API_BASE}/api/qa-results/export`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(_lastResults),
+        });
+        if (!response.ok) {
+            const body = await response.json().catch(() => ({ detail: response.statusText }));
+            throw new Error(body.detail || response.statusText);
+        }
+        const url = URL.createObjectURL(await response.blob());
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'customer-care-agent-session.xlsx';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+    } catch (err) {
+        showToast('Export failed: ' + esc(err.message), 'error');
+        console.error('[exportSessionResults]', err);
+    } finally {
+        button.disabled = !_lastResults.length;
+    }
+}
+
+$('exportBtn').addEventListener('click', exportSessionResults);
+
 /* ── Supervisor badge ── */
 const ESCALATION_KEY = 'qa_escalations';
+const REGULATION_PAIRS = new Set(JSON.parse(document.getElementById('regulationPairs').textContent)
+    .map(([type, attribute, comment]) => JSON.stringify([type, attribute, comment])));
+
+function matchesRegulation(flag) {
+    return !!flag && REGULATION_PAIRS.has(JSON.stringify([flag.type, flag.attribute, flag.comment]));
+}
 
 function updateSupervisorBadge() {
     try {
         const all    = JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]');
-        const count  = all.filter(e => e.status === 'pending').length;
+        const count  = Array.isArray(all)
+            ? all.filter(e => e.status === 'pending' && matchesRegulation(e.flag)).length : 0;
         const badge  = $('pendingBadge');
         badge.textContent = count > 0 ? String(count) : '';
         badge.setAttribute('data-count', count);
@@ -561,6 +620,8 @@ async function escalateViolation(rIdx, fIdx, btn) {
         flag: {
             type:               f.type,
             severity:           f.severity,
+            attribute:          f.attribute,
+            comment:            f.comment,
             description:        f.description,
             transcript_excerpt: f.transcript_excerpt,
         },
@@ -583,6 +644,9 @@ async function escalateViolation(rIdx, fIdx, btn) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 call_id: r.call_id,
+                flag_type: f.type,
+                attribute: f.attribute,
+                comment: f.comment,
                 flag_description: f.description,
                 transcript_excerpt: f.transcript_excerpt,
                 conversation_link: r.conversation_link || null,
@@ -592,6 +656,13 @@ async function escalateViolation(rIdx, fIdx, btn) {
         });
         if (!res.ok) {
             const body = await res.json().catch(() => ({ detail: res.statusText }));
+            if (res.status === 400 || res.status === 404) {
+                const current = JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]');
+                localStorage.setItem(ESCALATION_KEY, JSON.stringify(current.filter(e => e.id !== escId)));
+                updateSupervisorBadge();
+                showToast('⚠️ Escalation rejected: ' + (body.detail || res.statusText), 'error');
+                return;
+            }
             throw new Error(body.detail || res.statusText);
         }
     } catch (err) {
@@ -714,8 +785,13 @@ updateSupervisorBadge();
 
 /* ── render results ── */
 function renderResults(data) {
-    const results = data.results || [];
+    const metadata = data.call_metadata || {};
+    const results = (data.results || []).map(result => ({
+        ...result,
+        ...(metadata[result.call_id] || {}),
+    }));
     _lastResults  = results;        // store for escalation references
+    $('exportBtn').disabled = !results.length;
 
     const s = data.summary || {};
     $('summaryMetrics').innerHTML = `
@@ -778,7 +854,7 @@ function callRecordHTML(r, idx) {
         <div class="compliance-item" id="ci-${idx}-${fi}">
             <div class="compliance-header">
                 <span class="type-badge ${typeClass(f.type)}">${esc(f.type)}</span>
-                <span class="severity-badge ${severityClass(f.severity)}">${esc(f.severity)}</span>
+                ${policyLabelsHTML(f)}
             </div>
             ${flagBodyHTML(f)}
             <div class="compliance-footer">
@@ -811,6 +887,7 @@ function callRecordHTML(r, idx) {
 
             <div class="mini-scores">
                 <div class="mini-score">Professionalism: <b>${pct(perf.professionalism_score)}</b></div>
+                <div class="mini-score">Duration: <b>${formatDuration(r.call_duration_seconds)}</b></div>
                 ${profilingRow}
             </div>
 

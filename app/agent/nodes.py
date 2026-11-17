@@ -41,7 +41,7 @@ from arabic_reshaper import reshape
 from app.agent.state import AgentState
 from app.config import settings
 from app.models.input import CallTranscript
-from app.models.output import QAAnalysisResult
+from app.models.output import ComplianceFlag, QAAnalysisResult
 from app.prompts.qa_prompt import (
     SYSTEM_PROMPT,
     APPOINTMENT_EXTRACTION_PROMPT,
@@ -61,6 +61,7 @@ from app.prompts.qa_prompt import (
     build_faq_validation_prompt,
 )
 from app.services.criteria_loader import CriteriaLoader
+from app.services.regulation_catalog import deduplicate_regulation_flags, matched_regulation_flags, policy_outcome
 from app.services.llm_client import LLMClient
 from app.services.sql_helpers import insert_qa_result
 from app.service_hub.bank_validation import bank_validation_needed, validate_ksa_bank_information, detect_bank_signals
@@ -513,7 +514,8 @@ async def _focused_llm_call(
 
 # ---------------------------------------------------------------------------
 # Node A – infer_behavioral_evaluation
-#   Focused LLM call: professionalism, tone, empathy, red flags.
+#   Focused LLM call: behavior-relevant compliance criteria, with extra focus
+#   on personalization, call control, hold protocol, and greeting/closing.
 #   Runs in PARALLEL with infer_compliance_evaluation & infer_script_matching.
 # ---------------------------------------------------------------------------
 
@@ -530,6 +532,7 @@ async def infer_behavioral_evaluation(
     user_prompt = build_behavioral_prompt(
         call,
         behavioral_criteria=state.get("behavioral_criteria", ""),
+        regulation_catalog=state.get("compliance_pillars", ""),
     )
     logger.debug(
         "infer_behavioral_evaluation | call_id=%s prompt_len=%d",
@@ -1504,6 +1507,34 @@ async def infer_package_evaluation(
 #   Runs in PARALLEL with infer_behavioral_evaluation & infer_compliance_evaluation.
 # ---------------------------------------------------------------------------
 
+_MOBILE_CONFIRMATION_SCRIPT = "رقم الموبايل حضرتك المسجل على الملف هو نفس الرقم اللي بتكلمني منه تمام ؟"
+
+
+def _normalize_script_policy_flag(flag: dict) -> dict:
+    """Map a missed DCC mobile-confirmation step to its regulation item."""
+    if (
+        flag.get("attribute") == "If Customer Need Booking / Accept The Offer"
+        and " ".join(str(flag.get("comment") or "").split())
+        == " ".join(_MOBILE_CONFIRMATION_SCRIPT.split())
+    ):
+        return {
+            **flag,
+            "type": "C2B",
+            "attribute": "Displays positive company image",
+            "comment": "Didn't Commit to call script",
+        }
+    return flag
+
+
+def normalize_script_evaluation(data: dict) -> dict:
+    """Preserve missed script steps as policy-backed violation findings."""
+    result = dict(data)
+    result["script_flags"] = [
+        _normalize_script_policy_flag(flag)
+        for flag in (data.get("script_flags") or [])
+    ]
+    return result
+
 async def infer_script_matching(
     state: AgentState, llm_client: LLMClient
 ) -> dict:
@@ -1512,10 +1543,11 @@ async def infer_script_matching(
     Produces: accuracy_score, script_flags.
     Result stored in state["script_eval"].
     """
-    """ call = state["call"]
+    call = state["call"]
     user_prompt = build_script_prompt(
         call,
         script_templates=state.get("script_templates", ""),
+        regulation_catalog=state.get("compliance_pillars", ""),
     )
     logger.debug(
         "infer_script_matching | call_id=%s prompt_len=%d",
@@ -1528,11 +1560,13 @@ async def infer_script_matching(
     if err:
         return err
 
+    data = normalize_script_evaluation(data)
+
     return {
         "script_eval": data,
         "usage_list": [data.pop("_usage", {})],
         "node_trace": _trace(state, "infer_script_matching"),
-    } """
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1598,6 +1632,58 @@ async def validate_crm_lead(
     if err:
         return err
 
+    usage_list = [data.pop("_usage", {})]
+    crm_record = lookup.get("record") or {}
+    inquiry_only = str(crm_record.get("new_lastcallresult") or "").strip().casefold().startswith("inquiry only")
+
+    def has_inquiry_reason_check(response: dict) -> bool:
+        return any(
+            isinstance(check, dict)
+            and str(check.get("field") or "").strip().casefold() == "new_inquiryonlyreason"
+            and isinstance(check.get("matches"), bool)
+            for check in response.get("field_checks") or []
+        )
+
+    if inquiry_only and not has_inquiry_reason_check(data):
+        logger.warning(
+            "validate_crm_lead | call_id=%s missing new_inquiryonlyreason check; retrying",
+            call.call_id,
+        )
+        data, err = await _focused_llm_call(
+            "validate_crm_lead", call.call_id,
+            user_prompt + (
+                "\n\nYour previous response omitted the required new_inquiryonlyreason "
+                "field_check. Regenerate the complete JSON response. Compare the "
+                "recorded reason with the patient's primary inquiry and include "
+                "new_inquiryonlyreason in field_checks with matches true or false."
+            ),
+            llm_client, state, max_tokens=settings.CRM_LEADS_LLM_MAX_TOKENS,
+        )
+        if err:
+            return err
+        usage_list.append(data.pop("_usage", {}))
+        if not has_inquiry_reason_check(data):
+            logger.error(
+                "validate_crm_lead | call_id=%s missing new_inquiryonlyreason check after retry",
+                call.call_id,
+            )
+            return {
+                "error": "CRM lead evaluation omitted required new_inquiryonlyreason field_check.",
+                "error_node": "validate_crm_lead",
+                "usage_list": usage_list,
+                "node_trace": _trace(state, "validate_crm_lead"),
+            }
+
+    if inquiry_only and not str(crm_record.get("new_inquiryonlyreason") or "").strip():
+        for check in data.get("field_checks") or []:
+            if isinstance(check, dict) and str(check.get("field") or "").strip().casefold() == "new_inquiryonlyreason":
+                check.update({
+                    "matches": False,
+                    "actual": crm_record.get("new_inquiryonlyreason"),
+                    "reason": "new_inquiryonlyreason is required when new_lastcallresult is Inquiry only.",
+                })
+                break
+
     evaluation = apply_notes_phone_check(
         normalize_crm_lead_evaluation(data), lookup, call.Patient_Phone,
     )
@@ -1618,7 +1704,7 @@ async def validate_crm_lead(
     return {
         "crm_lead_lookup": lookup,
         "crm_lead_eval": evaluation,
-        "usage_list": [data.pop("_usage", {})],
+        "usage_list": usage_list,
         "node_trace": _trace(state, "validate_crm_lead"),
     }
 
@@ -2005,7 +2091,7 @@ async def aggregate_results(state: AgentState) -> dict:
     crm_lead    = state.get("crm_lead_eval")    or {}
     faq         = state.get("faq_eval")         or {}
     package     = state.get("package_eval")     or {}
-    script      = state.get("script_eval")      or {}
+    script      = normalize_script_evaluation(state.get("script_eval") or {})
     scoring     = state.get("scoring_eval")     or {}
     bank        = state.get("bank_validation") or {}
     location    = state.get("location_validation") or {}
@@ -2013,7 +2099,10 @@ async def aggregate_results(state: AgentState) -> dict:
     doctor_scope  = state.get("doctor_scope_validation") or {}
     coe           = state.get("coe_validation") or {}
 
-    _offer_flags: list[dict] = offer.get("offer_flags", [])
+    _offer_flags: list[dict] = [
+        {**flag, "outcome": offer.get("offer_outcome")}
+        for flag in offer.get("offer_flags", [])
+    ]
 
     # Persist masked C2B findings through the existing DWH flag path. Both
     # comparisons were already completed deterministically — bank and
@@ -2125,19 +2214,13 @@ async def aggregate_results(state: AgentState) -> dict:
         + coe_flags
         + patient_profile_flags
         + script.get("script_flags", [])
-        + scoring.get("compliance_flags", [])
+        + [_normalize_script_policy_flag(flag) for flag in scoring.get("compliance_flags", [])]
     )
 
     all_flags = _filter_unsubstantiated_reservation_flags(all_flags, state)
 
-    # Keep distinct metadata findings when no transcript excerpt is available. — every flag is
-    # normalised (see _normalize_flag_type) BEFORE the dedup key is built,
-    # so a "positive"-typed flag from ANY source (not just the offer node)
-    # is corrected before it ever reaches Pydantic validation below, and so
-    # two flags that only differ by this mix-up still dedup against a
-    # genuinely equivalent already-normalised "NC" flag from another source.
-    seen: set[tuple] = set()
-    deduped_flags: list[dict] = []
+    # Normalize every violation before the shared policy-item deduplication.
+    normalized_flags: list[dict] = []
     for flag in all_flags:
         flag = _normalize_flag_type(flag)
         # Flags are violations only: drop any positive/no-violation finding.
@@ -2147,23 +2230,40 @@ async def aggregate_results(state: AgentState) -> dict:
             continue
         if flag.get("severity") != "critical":
             flag = {**flag, "severity": "critical"}
-        excerpt = str(flag.get("transcript_excerpt") or "").strip()
-        evidence_key = (
-            str(flag.get("description") or "")[:80]
-            if not excerpt or excerpt.upper() == "N/A"
-            else excerpt[:80]
-        )
-        key = (flag.get("type"), evidence_key)
-        if key not in seen:
-            seen.add(key)
-            deduped_flags.append(flag)
+        normalized_flags.append(flag)
+    deduped_flags = deduplicate_regulation_flags(normalized_flags)
+
+    # The same C2C policy item can be raised by the general compliance node
+    # and by the MPI profile check. Keep one card, but retain the profile's
+    # field names when the earlier general flag wins policy-item deduplication.
+    for profile_flag in matched_regulation_flags(patient_profile_flags):
+        if (profile_flag.get("type") != "C2C"
+                or profile_flag.get("comment")
+                != "Described Inaccurate, Incomplete Information-None Medical"):
+            continue
+        profile_description = str(profile_flag.get("description") or "").strip()
+        for flag in deduped_flags:
+            if (flag.get("type"), flag.get("attribute"), flag.get("comment")) != (
+                profile_flag.get("type"), profile_flag.get("attribute"), profile_flag.get("comment")
+            ):
+                continue
+            if profile_description and profile_description not in str(flag.get("description") or ""):
+                flag["description"] = (str(flag.get("description") or "").strip()
+                                       + " " + profile_description).strip()
+            break
 
     scoring_perf: dict = scoring.get("agent_performance", {})
+    policy_assessment, policy_escalation, policy_classification = policy_outcome(
+        deduped_flags,
+        scoring.get("overall_assessment", "needs_review"),
+        scoring.get("escalation_required", False),
+    )
 
     merged: dict = {
         "call_id":              call_id,
         "agent_name":           state["call"].agent_name,
-        "overall_assessment":   scoring.get("overall_assessment", "needs_review"),
+        "business_unit":        state["call"].business_unit,
+        "overall_assessment":   policy_assessment,
         "assessment_reasoning": scoring.get("assessment_reasoning", ""),
         "compliance_flags":     deduped_flags,
         # Non-punitive doctor quality notices from _build_doctor_compliance_flags.
@@ -2180,23 +2280,20 @@ async def aggregate_results(state: AgentState) -> dict:
             ),
             # Agent Classification — required, from scoring node
             "Agent Classification": (
-                scoring_perf.get("Agent Classification")
-                or scoring.get("Agent Classification")
-                or "D"
+                policy_classification
             ),
             # Profiling Comment — optional, null when absent
             "Profiling Comment": (
-                scoring_perf.get("Profiling Comment")
-                or scoring.get("Profiling Comment")
-                or None
+                (scoring_perf.get("Profiling Comment")
+                 or scoring.get("Profiling Comment")) if deduped_flags else None
             ),
             # strengths & improvements — prefer behavioral node
             "strengths":    behavioral.get("strengths",    scoring_perf.get("strengths",    [])),
             "improvements": behavioral.get("improvements", scoring_perf.get("improvements", [])),
         },
         # resolution_score and accuracy_score removed
-        "escalation_required": scoring.get("escalation_required", False),
-        "escalation_reason":   scoring.get("escalation_reason"),
+        "escalation_required": policy_escalation,
+        "escalation_reason":   scoring.get("escalation_reason") if policy_escalation else None,
         "conversation_link":   state["call"].conversation_link,
         "bank_validation":  bank,
         "location_validation": location,
@@ -2251,6 +2348,12 @@ async def integrity_check(state: AgentState) -> dict:
     """
     call_id = state["call"].call_id
     result = state["result"]
+    matched_flags = matched_regulation_flags(
+        [flag.model_dump() for flag in result.compliance_flags]
+    )
+    result = result.model_copy(update={
+        "compliance_flags": [ComplianceFlag.model_validate(flag) for flag in matched_flags],
+    })
 
     if result.escalation_required and result.overall_assessment != "escalate":
         logger.warning(
@@ -2280,7 +2383,9 @@ async def integrity_check(state: AgentState) -> dict:
         result = result.model_copy(update={"escalation_required": True})
 
     has_critical_eligibility_error = any(
-        flag.severity == "critical" and "C2C_030" in flag.description
+        flag.severity == "critical"
+        and flag.comment == "Described wrong Information"
+        and "eligib" in flag.description.casefold()
         for flag in result.compliance_flags
     )
     if has_critical_eligibility_error:
@@ -2298,6 +2403,24 @@ async def integrity_check(state: AgentState) -> dict:
                 ),
             }
         )
+
+    # The regulation catalog is the final authority after every correction.
+    policy_assessment, policy_escalation, policy_classification = policy_outcome(
+        [flag.model_dump() for flag in result.compliance_flags],
+        result.overall_assessment,
+        result.escalation_required,
+    )
+    result = result.model_copy(update={
+        "overall_assessment": policy_assessment,
+        "escalation_required": policy_escalation,
+        "escalation_reason": result.escalation_reason if policy_escalation else None,
+        "agent_performance": result.agent_performance.model_copy(update={
+            "agent_classification": policy_classification,
+            "profiling_comment": (
+                result.agent_performance.profiling_comment if result.compliance_flags else None
+            ),
+        }),
+    })
 
     return {
         "result": result,

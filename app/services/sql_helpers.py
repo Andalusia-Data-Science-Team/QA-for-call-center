@@ -139,6 +139,7 @@ def _call_level_params(
 def update_escalation_row(
     call_id: str,
     *,
+    analysis_version: Optional[int] = None,
     escalated: Optional[bool] = None,
     qa_reviewed: Optional[bool] = None,
     qa_review_comment: object = _UNSET,
@@ -147,6 +148,9 @@ def update_escalation_row(
     coaching_status: object = _UNSET,
     flag_description: Optional[str] = None,
     transcript_excerpt: Optional[str] = None,
+    flag_type: Optional[str] = None,
+    attribute: Optional[str] = None,
+    comment: Optional[str] = None,
     conversation_link: Optional[str] = None,
     removed_error: Optional[bool] = None,
 ) -> int:
@@ -155,19 +159,40 @@ def update_escalation_row(
     with engine.begin() as conn:
         params: dict[str, object] = {"call_id": call_id}
         where_clauses = ["Call_ID = :call_id"]
+        if analysis_version is not None:
+            where_clauses.append("Analysis_Version = :analysis_version")
+            params["analysis_version"] = analysis_version
         if flag_description is not None:
             where_clauses.append("COALESCE(Flag_Description, '') = :flag_description")
             params["flag_description"] = flag_description
         if transcript_excerpt is not None:
             where_clauses.append("COALESCE(Transcript_Excerpt, '') = :transcript_excerpt")
             params["transcript_excerpt"] = transcript_excerpt
-
+        if flag_type is not None:
+            where_clauses.append("Compliance_Flag_Type = :flag_type")
+            params["flag_type"] = flag_type
+        checking_regulation = flag_type is not None or attribute is not None or comment is not None
+        selected_columns = (
+            "ID, Compliance_Flag_Type, [Attribute], [Comment], Flag_Description"
+            if checking_regulation else "ID"
+        )
         select_sql = sa_text(
-            f"SELECT TOP 1 ID FROM [DWH].[AI].[Call_QA_Results] WHERE {' AND '.join(where_clauses)} ORDER BY Created_at DESC, ID DESC"
+            f"SELECT TOP 1 {selected_columns} FROM [DWH].[AI].[Call_QA_Results] WHERE {' AND '.join(where_clauses)} ORDER BY Created_at DESC, ID DESC"
         )
         row = conn.execute(select_sql, params).fetchone()
         if row is None:
             return 0
+        if checking_regulation:
+            from app.services.regulation_catalog import canonicalize_flag
+
+            stored = canonicalize_flag({
+                "type": row[1], "attribute": row[2], "comment": row[3],
+                "description": row[4],
+            })
+            if (stored["type"], stored["attribute"], stored["comment"]) != (
+                flag_type, attribute, comment
+            ):
+                return 0
 
         values: dict[str, object] = {}
         if escalated is not None:
@@ -288,6 +313,8 @@ def insert_qa_result(
                     # Hardcoded — severity is never produced by the LLM.
                     "Severity":             "critical",
                     "Violation":            flag.type,
+                    "Attribute":            flag.attribute,
+                    "Comment":              flag.comment,
                     "Flag_Description":     flag.description,
                     "Transcript_Excerpt":   flag.transcript_excerpt,
                 })
@@ -298,6 +325,8 @@ def insert_qa_result(
                 "Compliance_Flag_Type": None,
                 "Severity":             None,
                 "Violation":            None,
+                "Attribute":            None,
+                "Comment":              None,
                 "Flag_Description":     None,
                 "Transcript_Excerpt":   None,
             }]

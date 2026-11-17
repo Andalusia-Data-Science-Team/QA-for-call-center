@@ -31,7 +31,13 @@ def test_conversation_id_lookup_uses_internal_limit_and_ignores_default_filters(
         def close(self):
             pass
 
-    call = SimpleNamespace(call_id="10248B91-A9CB-F111-BF5B-000D3AA9DC2F", conversation_link=None, agent_email=None)
+    call = SimpleNamespace(
+        call_id="10248B91-A9CB-F111-BF5B-000D3AA9DC2F",
+        conversation_link=None, agent_email=None,
+        call_date="2026-10-21", call_duration_seconds=125,
+        Patient_Phone="0501234567", department="Customer Care",
+        channel="WhatsApp", business_unit="AHJ", archive_datetime=None,
+    )
     monkeypatch.setattr(CM_DB_Handler, "CMDatabaseHandler", FakeHandler)
     monkeypatch.setattr(Chat_Retriever, "df_to_batch", lambda df: SimpleNamespace(calls=[call]))
 
@@ -59,6 +65,15 @@ def test_conversation_id_lookup_uses_internal_limit_and_ignores_default_filters(
         "ChatLimit": 1000,
     }]
     assert call.agent_email == "owner@example.com"
+    assert response.json()["call_metadata"][call.call_id] == {
+        "call_date": "2026-10-21",
+        "call_duration_seconds": 125,
+        "customer_phone_number": "0501234567",
+        "department": "Customer Care",
+        "channel_name": "WhatsApp",
+        "business_unit": "AHJ",
+        "archive_datetime": None,
+    }
 
 
 def test_agent_date_search_keeps_requested_chat_limit(monkeypatch):

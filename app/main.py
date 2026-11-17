@@ -2,6 +2,7 @@ import json                          # ← was missing; needed by upload_analyze
 import time
 import logging
 import urllib.parse
+from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from decimal import Decimal
@@ -9,8 +10,8 @@ from pathlib import Path
 from typing import Optional
 from uuid import UUID
  
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query, Form, status
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query, Form, status, Body
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, StreamingResponse
 # StaticFiles removed — it was imported but never used
 from fastapi.templating import Jinja2Templates
  
@@ -20,6 +21,8 @@ from app.agent import QAAgent
 from app.services.llm_client import LLMClient
 from app.services.sql_helpers import DatabaseWritePermissionError, update_escalation_row
 from app.services.log_parser import LogParser
+from app.services.qa_results_export import build_customer_care_workbook
+from app.services.regulation_catalog import canonicalize_flag, deduplicate_regulation_flags, policy_outcome, regulation_items
 from app.config import settings
  
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -50,6 +53,11 @@ app = FastAPI(
 )
  
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+def _regulation_pairs():
+    return sorted({(item["type"], item["attribute"], item["comment"])
+                   for item in regulation_items()})
  
 USER_STORE = {
     "leader": {"password": "leaderpass", "role": "team_leader"},
@@ -126,12 +134,16 @@ async def qa_dashboard_page(request: Request):
  
 @app.get("/agents-dashboard", response_class=HTMLResponse)
 async def agents_dashboard_page(request: Request):
-    return templates.TemplateResponse(request, "agents-dashboard.html")
+    return templates.TemplateResponse(request, "agents-dashboard.html", {
+        "regulation_pairs": _regulation_pairs(),
+    })
  
  
 @app.get("/qa-supervisor", response_class=HTMLResponse)
 async def qa_supervisor_page(request: Request):
-    return templates.TemplateResponse(request, "qa-supervisor.html")
+    return templates.TemplateResponse(request, "qa-supervisor.html", {
+        "regulation_pairs": _regulation_pairs(),
+    })
 
 
 @app.get("/logs-dashboard", response_class=HTMLResponse)
@@ -141,7 +153,9 @@ async def logs_dashboard_page(request: Request):
 
 @app.get("/qa-results-dashboard", response_class=HTMLResponse)
 async def qa_results_dashboard_page(request: Request):
-    return templates.TemplateResponse(request, "qa-results-dashboard.html")
+    return templates.TemplateResponse(request, "qa-results-dashboard.html", {
+        "regulation_pairs": _regulation_pairs(),
+    })
  
  
 # ── Agent email list ──────────────────────────────────────────────────────────
@@ -149,6 +163,7 @@ async def qa_results_dashboard_page(request: Request):
 @app.post("/escalations")
 async def create_escalation(payload: dict):
     call_id = payload.get("call_id")
+    analysis_version = payload.get("analysis_version")
     flag_description = payload.get("flag_description")
     transcript_excerpt = payload.get("transcript_excerpt")
     supervisor_name = payload.get("supervisor_name")
@@ -156,10 +171,16 @@ async def create_escalation(payload: dict):
     conversation_link = payload.get("conversation_link")
     if not call_id:
         raise HTTPException(status_code=400, detail="call_id is required")
+    flag_type = payload.get("flag_type")
+    attribute = payload.get("attribute")
+    comment = payload.get("comment")
+    if (flag_type, attribute, comment) not in _regulation_pairs():
+        raise HTTPException(status_code=400, detail="Escalation must match a regulation attribute and comment")
  
     try:
         updated = update_escalation_row(
             call_id,
+            analysis_version=analysis_version,
             escalated=True,
             qa_reviewed=False,
             qa_review_comment=None,
@@ -168,6 +189,9 @@ async def create_escalation(payload: dict):
             coaching_status=None,
             flag_description=flag_description,
             transcript_excerpt=transcript_excerpt,
+            flag_type=flag_type,
+            attribute=attribute,
+            comment=comment,
             conversation_link=conversation_link,
         )
     except DatabaseWritePermissionError as exc:
@@ -180,6 +204,7 @@ async def create_escalation(payload: dict):
 @app.post("/escalations/review")
 async def review_escalation(payload: dict):
     call_id = payload.get("call_id")
+    analysis_version = payload.get("analysis_version")
     review_comment = payload.get("review_comment")
     if not call_id:
         raise HTTPException(status_code=400, detail="call_id is required")
@@ -187,6 +212,7 @@ async def review_escalation(payload: dict):
     try:
         updated = update_escalation_row(
             call_id,
+            analysis_version=analysis_version,
             qa_reviewed=True,
             qa_review_comment=review_comment if review_comment is not None else "",
             coaching_status="Pending",
@@ -201,6 +227,7 @@ async def review_escalation(payload: dict):
 @app.post("/escalations/dismiss")
 async def dismiss_escalation(payload: dict):
     call_id = payload.get("call_id")
+    analysis_version = payload.get("analysis_version")
     flag_description = payload.get("flag_description")
     transcript_excerpt = payload.get("transcript_excerpt")
     if not call_id:
@@ -211,6 +238,7 @@ async def dismiss_escalation(payload: dict):
     try:
         updated = update_escalation_row(
             call_id,
+            analysis_version=analysis_version,
             qa_reviewed=True,
             qa_review_comment=None,
             coaching_status=None,
@@ -230,6 +258,7 @@ async def reopen_escalation(payload: dict):
     """Undo a supervisor's "Remove Error": clear Removed_Error on the
     violation's row. Removing it again sets the flag back to 1."""
     call_id = payload.get("call_id")
+    analysis_version = payload.get("analysis_version")
     flag_description = payload.get("flag_description")
     transcript_excerpt = payload.get("transcript_excerpt")
     if not call_id:
@@ -238,6 +267,7 @@ async def reopen_escalation(payload: dict):
     try:
         updated = update_escalation_row(
             call_id,
+            analysis_version=analysis_version,
             flag_description=flag_description,
             transcript_excerpt=transcript_excerpt,
             removed_error=False,
@@ -387,7 +417,21 @@ async def retrieve_and_analyze(
         "errors":       sum(1 for r in results if r.overall_assessment == "error"),
     }
     logger.info("retrieve-and-analyze done | summary=%s", summary)
-    return BatchQAAnalysisResult(results=list(results), summary=summary)
+    call_metadata = {
+        call.call_id: {
+            "call_date": call.call_date,
+            "call_duration_seconds": call.call_duration_seconds,
+            "customer_phone_number": call.Patient_Phone,
+            "department": call.department,
+            "channel_name": call.channel,
+            "business_unit": call.business_unit,
+            "archive_datetime": call.archive_datetime,
+        }
+        for call in batch.calls
+    }
+    return BatchQAAnalysisResult(
+        results=list(results), summary=summary, call_metadata=call_metadata,
+    )
  
  
 # ── Single / batch analysis endpoints ────────────────────────────────────────
@@ -560,9 +604,22 @@ async def get_date_range_summary(
 
 # ── Stored QA results (DWH.AI.Call_QA_Results) ───────────────────────────────
 
+@app.post("/api/qa-results/export")
+def export_qa_results(displayed_results: list[dict] = Body(...)):
+    """Download the currently displayed, already filtered call snapshot."""
+    if len(displayed_results) > 1000:
+        raise HTTPException(status_code=422, detail="At most 1000 displayed calls can be exported")
+    workbook = build_customer_care_workbook(displayed_results)
+    return StreamingResponse(
+        BytesIO(workbook),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="customer-care-qa-results.xlsx"'},
+    )
+
 @app.get("/api/qa-results")
 async def get_qa_results(
     agent_name:           Optional[str] = Query(None, description="Filter by agent name (partial match)"),
+    customer_phone_number: Optional[str] = Query(None, description="Filter by customer phone number (partial match)"),
     date_from:            Optional[str] = Query(None, description="Call date from (YYYY-MM-DD)"),
     date_to:              Optional[str] = Query(None, description="Call date to (YYYY-MM-DD)"),
     overall_assessment:   Optional[str] = Query(None, description="pass | needs_review | escalate | error"),
@@ -573,7 +630,7 @@ async def get_qa_results(
 ):
     """
     Query [DWH].[AI].[Call_QA_Results] using the QA_DB credentials,
-    with optional filters on agent name, call date range,
+    with optional filters on agent name, customer phone number, call date range,
     overall assessment, and agent classification.
     """
     from sqlalchemy import create_engine, text as sa_text
@@ -605,6 +662,9 @@ async def get_qa_results(
     if agent_name:
         clauses.append("Agent_Name LIKE :agent_name")
         bind["agent_name"] = f"%{agent_name}%"
+    if customer_phone_number:
+        clauses.append("Customer_Phone_Number LIKE :customer_phone_number")
+        bind["customer_phone_number"] = f"%{customer_phone_number.strip()}%"
     if date_from:
         clauses.append("CAST(Call_Date AS DATE) >= :date_from")
         bind["date_from"] = date_from
@@ -664,22 +724,25 @@ async def get_qa_results(
             out[k.lower()] = v
         return out
 
-    # ── group rows into calls, collecting compliance flags ──
+    # ── group rows into call versions, collecting compliance flags ──
     calls: dict = {}
     order: list = []
     for row in rows:
         r = clean(row)
         cid = r.get("call_id")
-        if cid not in calls:
-            calls[cid] = {k: v for k, v in r.items()
+        version_key = (cid, r.get("analysis_version"))
+        if version_key not in calls:
+            calls[version_key] = {k: v for k, v in r.items()
                           if k not in ("compliance_flag_type", "severity", "violation",
-                                       "flag_description", "transcript_excerpt")}
-            calls[cid]["compliance_flags"] = []
-            order.append(cid)
+                                       "attribute", "comment", "flag_description", "transcript_excerpt")}
+            calls[version_key]["compliance_flags"] = []
+            order.append(version_key)
         flag = {
             "type":               r.get("compliance_flag_type"),
             "severity":           r.get("severity"),
             "violation":          r.get("violation"),
+            "attribute":          r.get("attribute"),
+            "comment":            r.get("comment"),
             "description":        r.get("flag_description"),
             "transcript_excerpt": r.get("transcript_excerpt"),
             # Review state is per violation row, not per call.
@@ -691,12 +754,29 @@ async def get_qa_results(
         }
         # only add rows that actually carry a flag
         if flag["type"] or flag["description"]:
-            calls[cid]["compliance_flags"].append(flag)
+            canonical = canonicalize_flag(flag)
+            if canonical["attribute"] and canonical["comment"]:
+                calls[version_key]["compliance_flags"].append(canonical)
+
+    for call in calls.values():
+        call["compliance_flags"] = deduplicate_regulation_flags(call["compliance_flags"])
+        assessment, escalated, classification = policy_outcome(
+            call["compliance_flags"],
+            call.get("overall_assessment") or "pass",
+            bool(call.get("escalation_required")),
+        )
+        call["overall_assessment"] = assessment
+        call["escalation_required"] = escalated
+        call["escalation_reason"] = call.get("escalation_reason") if escalated else None
+        call["agent_classification"] = classification
+        if not call["compliance_flags"]:
+            call["profiling_comment"] = None
 
     # Summary reflects EVERY matching call, not just the displayed page —
     # the record list is truncated to `limit` below, but the metrics must
     # not silently drop the rest (the SQL already fetched all matching rows).
-    all_calls = [calls[cid] for cid in order]
+    all_calls = [calls[version_key] for version_key in order
+                 if not (qa_reviewed or removed_error) or calls[version_key]["compliance_flags"]]
 
     def count(a):
         return sum(1 for r in all_calls if r.get("overall_assessment") == a)

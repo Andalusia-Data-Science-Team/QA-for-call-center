@@ -19,6 +19,55 @@ from app.services.get_patient import (
 
 logger = logging.getLogger(__name__)
 
+_MISSING_PROFILE_ATTRIBUTE = "Provide complete accurate and relevant information"
+_MISSING_PROFILE_COMMENT = "Described Inaccurate, Incomplete Information-None Medical"
+
+
+def normalize_patient_profile_evaluation(data: dict) -> dict:
+    """Keep every unasked required MPI field in a single policy finding.
+
+    The model may enumerate missing fields yet return ``pass`` and no flag.
+    A single finding preserves all field names through policy-item deduplication.
+    """
+    result = dict(data)
+    missing_fields = result.get("missing_fields") or []
+    flags = list(result.get("compliance_flags") or [])
+    unasked = []
+    for field in missing_fields:
+        if not isinstance(field, dict) or field.get("agent_asked") is not False:
+            continue
+        name = str(field.get("field_name") or "").strip()
+        if name and name not in unasked:
+            unasked.append(name)
+
+    if not unasked:
+        return result
+
+    # The profile node uses C2C_021 for an unasked required field. Replace
+    # duplicate versions with one description naming every missing field.
+    def is_missing_field_flag(flag: object) -> bool:
+        return (isinstance(flag, dict) and flag.get("type") == "C2C"
+                and (flag.get("comment") == _MISSING_PROFILE_COMMENT
+                     or "C2C_021" in str(flag.get("description") or "")))
+
+    existing = next((flag for flag in flags if is_missing_field_flag(flag)), None)
+    flags = [flag for flag in flags if not is_missing_field_flag(flag)]
+    description = (
+        "C2C_021: Required MPI field(s) " + ", ".join(unasked)
+        + " are missing, and the agent did not ask the patient for them."
+    )
+    flags.append({
+        "type": "C2C",
+        "attribute": _MISSING_PROFILE_ATTRIBUTE,
+        "comment": _MISSING_PROFILE_COMMENT,
+        "description": description,
+        "transcript_excerpt": (existing or {}).get("transcript_excerpt") or "N/A",
+    })
+    result["compliance_flags"] = flags
+    if result.get("validation_status") in {"pass", "complete", None}:
+        result["validation_status"] = "incomplete"
+    return result
+
 # MPI environment for each branch, keyed by its LEAD_BU_CODE. MPI has no
 # separate LCH, CHT, AFW, MKR or ADC environment; every code in a branch's
 # equivalence group uses that branch's environment.
@@ -44,6 +93,27 @@ def mpi_env_for_bu(business_unit: str | None) -> str | None:
 def _trace(_state: AgentState, node: str) -> list[str]:
     """Helper to return a single-item list for the node_trace reducer."""
     return [node]
+
+
+def _login_for_env(env: str) -> str:
+    """Log in with the configured service and NTLM credentials, then cache the token."""
+    token = login(
+        env,
+        os.getenv("MPI_SERVICE_USERNAME", "AiModule"),
+        os.getenv("MPI_SERVICE_PASSWORD", "123456"),
+        ntlm_username=os.getenv("MPI_NTLM_USERNAME"),
+        ntlm_password=os.getenv("MPI_NTLM_PASSWORD"),
+    )
+    os.environ[f"MPI_AUTH_TOKEN_{env}"] = token
+    return token
+
+
+def _token_expired_response(response: Any) -> bool:
+    # The MPI gateway returns 422 with this body when its auth token expires.
+    return response.status_code == 401 or (
+        response.status_code == 422
+        and "token expire" in response.text.casefold()
+    )
 
 
 async def fetch_patient_profile(state: AgentState) -> dict:
@@ -121,13 +191,17 @@ async def fetch_patient_profile(state: AgentState) -> dict:
         # Get authentication token for the environment
         token = get_token_for_env(env)
         if not token:
-            # Try to login if token not available
-            username = os.getenv("MPI_SERVICE_USERNAME", "AiModule")
-            password = os.getenv("MPI_SERVICE_PASSWORD", "123456")
-            token = login(env, username, password)
+            token = _login_for_env(env)
         
         # Fetch patient profile
         response = get_patient(env, iqama_number, token=token)
+        if _token_expired_response(response):
+            logger.info(
+                "fetch_patient_profile | call_id=%s env=%s token_expired=refreshing",
+                call.call_id, env,
+            )
+            token = _login_for_env(env)
+            response = get_patient(env, iqama_number, token=token)
         
         if response.status_code != 200:
             logger.warning(
@@ -291,7 +365,9 @@ async def validate_patient_profile(
     if err:
         return err
     
-    # Normalize the result
+    # Normalize the result: an unasked required field is a violation even if
+    # the LLM incorrectly labels the same evaluation as a pass.
+    data = normalize_patient_profile_evaluation(data)
     validation_status = data.get("validation_status", "error")
     missing_fields = data.get("missing_fields", [])
     profile_updates = data.get("profile_updates", [])

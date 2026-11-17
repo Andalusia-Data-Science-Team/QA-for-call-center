@@ -9,7 +9,7 @@ is extracted and formatted as tight structured text.  Fields that add no
 analytical value are dropped:
   ✗  version, last_updated, effective_date, source, category, note
   ✗  YAML keys / indentation / hyphens
-  ✗  "Other" catch-all violation items (implied, not useful)
+  ✓  Exact regulation item IDs and names for structured flag labels
   ✗  Repeated severity labels already conveyed by the pillar type header
 
 Typical savings vs raw YAML: 40–55 % fewer tokens per file.
@@ -157,7 +157,7 @@ class CriteriaLoader:
     def compliance_pillars(self) -> str:
         """
         Return a compact compliance-pillar checklist from regulations.yaml.
-        Strips all ids, type repetitions, and 'Other' items.
+        Keep exact attribute names and item labels for structured flag output.
         """
         data = _load_yaml("policies/regulations/compliance_regulations.yaml")
         pillars = data.get("pillars", {})
@@ -171,11 +171,8 @@ class CriteriaLoader:
         }
         for pillar_key, pillar in pillars.items():
             ptype = pillar.get("severity", "NC")
-            violations = [
-                item["violation"]
-                for item in pillar.get("items", [])
-                if item.get("violation", "Other") != "Other"
-            ]
+            violations = [f"{item['id']}: {item['violation']}"
+                          for item in pillar.get("items", []) if item.get("violation")]
             if violations:
                 groups.setdefault(ptype, []).append((pillar.get("original_name", pillar_key), violations))
 
@@ -194,16 +191,19 @@ class CriteriaLoader:
                 lines.append(f"\n### {pillar_name}")
                 lines.append(_list_bullets(violations))
         return "\n".join(lines)
-    
+
     # ── 3. Reservation pillars ─────────────────────────────────────────────
 
     def reservation_pillars(self) -> str:
         """
         Return a compact reservation-pillar checklist from regulations.yaml.
-        Strips all ids, type repetitions, and 'Other' items.
+        Keep exact attribute names and item labels for structured flag output.
         """
         data = _load_yaml("policies/regulations/reservation_regulations.yaml")
-        pillars = data.get("pillars", {})
+        pillars = data.get("pillars")
+        if pillars is None:
+            pillars = {key: value for key, value in data.items()
+                       if isinstance(value, dict) and isinstance(value.get("items"), list)}
         if not pillars:
             return "# RESERVATION PILLARS\n(none loaded)"
 
@@ -214,11 +214,8 @@ class CriteriaLoader:
         }
         for pillar_key, pillar in pillars.items():
             ptype = pillar.get("severity", "NC")
-            violations = [
-                item["violation"]
-                for item in pillar.get("items", [])
-                if item.get("violation", "Other") != "Other"
-            ]
+            violations = [f"{item['id']}: {item['violation']}"
+                          for item in pillar.get("items", []) if item.get("violation")]
             if violations:
                 groups.setdefault(ptype, []).append((pillar.get("original_name", pillar_key), violations))
 
@@ -243,8 +240,8 @@ class CriteriaLoader:
     def offer_pillars(self) -> str:
         """
         Return a compact offer-recommendation pillar checklist from
-        offer_regulations.yaml.  Strips ids, type repetitions, and 'Other'
-        items.  Also appends the evaluation-guidance section so the LLM knows
+        offer_regulations.yaml. Keep exact attribute and item labels.
+        Also append the evaluation-guidance section so the LLM knows
         exactly when to penalise and when not to.
         """
         data = _load_yaml("policies/regulations/offer_regulations.yaml")
@@ -259,11 +256,8 @@ class CriteriaLoader:
         }
         for pillar_key, pillar in pillars.items():
             ptype = pillar.get("severity", "NC")
-            violations = [
-                item["violation"]
-                for item in pillar.get("items", [])
-                if item.get("violation", "Other") != "Other"
-            ]
+            violations = [f"{item['id']}: {item['violation']}"
+                          for item in pillar.get("items", []) if item.get("violation")]
             if violations:
                 groups.setdefault(ptype, []).append(
                     (pillar.get("original_name", pillar_key), violations)

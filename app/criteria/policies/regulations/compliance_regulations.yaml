@@ -128,10 +128,6 @@ pillars:
         violation: "Didn't check knowledge resources"
         severity: "End User Critical"
         type: "C2C"
-      - id: "C2C_030"
-        violation: "Provided an incorrect patient eligibility outcome"
-        severity: "End User Critical"
-        type: "C2C"
 
   Avoids_the_customer:
     original_name: "Avoids the customer"
@@ -143,7 +139,7 @@ pillars:
         severity: "End User Critical"
         type: "C2C"
       - id: "C2C_032"
-        violation: "Released / Closed / Avoid the call intentionally"
+        violation: "Released / Closed / Aviod the call intentionaly"
         severity: "End User Critical"
         type: "C2C"
       - id: "C2C_033"

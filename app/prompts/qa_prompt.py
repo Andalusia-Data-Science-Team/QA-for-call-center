@@ -9,7 +9,7 @@ Design philosophy
 • The previous single build_user_prompt() has been SPLIT into four focused
   builders, one per evaluation node:
 
-    build_behavioral_prompt()   → professionalism, tone, empathy, red flags
+    build_behavioral_prompt()   → behavior-relevant regulation attributes, tone, empathy, red flags
     build_compliance_prompt()   → 15 compliance pillars, flag C2Com/C2C/C2B/NC
     build_script_prompt()       → greeting/closing script adherence
     build_scoring_prompt()      → aggregate scores + overall_assessment
@@ -39,10 +39,11 @@ Your task is to evaluate agent-patient call transcripts and produce a structured
 1. EVIDENCE-BASED: Base every finding strictly on observable transcript content. Quote directly; never speculate.
 2. PATIENT SAFETY FIRST: Inaccurate medical/appointment/medication information is a patient safety risk — flag it.
 3. PROPORTIONATE: Distinguish critical violations from minor imperfections using the definitions below.
-4. DEFINED SCOPE: Mention only the most critical severe violations. Report 0 to 4 violations at maximum. Do NOT over-evaluate.
+4. DEFINED SCOPE: Report directly supported policy violations, including NC items, up to 4 at maximum. Do NOT over-evaluate.
 5. DEVELOPMENTAL: Balance corrective feedback with recognition of positive agent behaviors.
 6. STRUCTURED OUTPUT: Return ONLY a valid JSON object matching the schema provided. No prose, no markdown fences.
-
+7. Do not generate attribute or comment text — use the exact text from the YAML policy when flagging a violation.
+8. The Non Critical pillars (NC) are still violations and must be counted in the overall assessment. Do not ignore them.
 ## CRITICAL VIOLATION DEFINITION  (apply strictly)
 - critical   → Direct patient safety risk: wrong medication name/dose, wrong doctor, dangerous misinformation,
                explicit patient aggression ignored, or a vulnerable patient actively harmed.
@@ -84,8 +85,8 @@ Be realistic, not overly harsh.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NODE A — Behavioral Evaluation Prompt
-#   Focus: professionalism, tone, empathy, active listening, prohibited
-#          behaviors, red-flag phrases.
+#   Focus: behavior-relevant regulation attributes, professionalism, empathy,
+#          active listening, prohibited behaviors, and red-flag phrases.
 #   Output fields: behavioral_flags (subset of compliance_flags), strengths,
 #                  improvements, professionalism_score.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,16 +94,50 @@ Be realistic, not overly harsh.
 def build_behavioral_prompt(
     call: CallTranscript,
     behavioral_criteria: str = "",
+    regulation_catalog: str = "",
 ) -> str:
     return f"""\
 Evaluate the agent's BEHAVIORAL performance in the call below.
-Focus exclusively on: tone, professionalism, empathy, active listening, prohibited phrases, and red-flag language.
-Do NOT evaluate compliance pillars, script adherence, or scoring weights here.
-If there is no response from the patient agent can use the script to greet and close the call. 
+Focus on observable behavior: professionalism, empathy, active listening, personalization, call control,
+hold handling, and greeting/closing. Review all behavior-relevant attributes in the COMPLIANCE REGULATIONS
+reference below. Give the four priority attributes extra scrutiny, while still evaluating other attributes
+when their behavior is directly observable. Do NOT evaluate non-behavioral compliance requirements, exact
+script wording, or scoring weights here; those belong to their dedicated nodes.
+If the patient does not respond, the agent may still greet and close. Assess only what the transcript shows;
+do not assume a behavior occurred or was omitted when the relevant part is unavailable.
 
 ## CRITICAL VIOLATION REMINDER
-- critical   → patient safety risk ONLY (wrong drug, wrong dose, aggression ignored).
-- NOT a violation: callback promises, hold times, prior team failures reported by the patient.
+- Do not treat a missing patient name as critical by itself. Use the listed regulation item and transcript evidence.
+- Repeating a question before the patient answers can show impatience flag at as Not Patient NC flag; distinguish that from a harmless
+  disfluency or one reasonable follow-up after silence.
+- Aggression is a violation only when the agent responds with aggressive or unprofessional behavior, or ignores
+  a clear safety concern within this behavioral scope.
+
+## PRIORITY BEHAVIOR ATTRIBUTES — GIVE THESE EXTRA SCRUTINY
+These are priority areas, not an exclusive list. Review the other regulation attributes too when they are
+relevant to observable behavior. Evaluate each only when the transcript contains enough evidence:
+- Professional_Personalization: asking for and correctly using the patient's name, appropriate form of address,
+  empathy, and allowing the patient to explain their concern.
+  Check NC_001 separately: in a complete two-way conversation, if no agent explicitly asks the patient for
+  their name, flag type "NC", attribute "Professional Personalization", comment "Didn’t ask for customer name".
+  Asking for an ID number is not asking for a name. A name appearing later in an appointment confirmation
+  or system record does not establish that the agent asked for it. Cite an agent turn where identifying
+  information was requested or the appointment was confirmed, and explain the missing name question.
+  Do not infer this omission when the relevant conversation is missing or truncated.
+- Controls_the_call_well: staying attentive, patient, organized, and guiding the conversation without overriding
+  the patient's relevant concern.
+  Check NC_022 ("Not Patient") when the agent repeatedly sends the same question in separate turns without
+  an intervening patient answer, or keeps pressing for information while the patient is still responding to
+  an earlier request. For example, two consecutive "كاش ام تامين؟" messages with no patient turn between
+  them support type "NC", attribute "Controls the call well", comment "Not Patient". Quote the repeated
+  agent turns as evidence. Do not use NC_013 ("Using repetitive words") for the same behavior, and do not
+  flag a single clarification, a patient-requested repetition, or a follow-up after documented silence.
+- Follows_the_correct_hold_protocol: when a hold occurs, check permission, explanation of the reason, return thanks,
+  and whether the hold duration follows the listed criteria. Do not flag when no hold occurred.
+- Uses_of_appropriate_Greeting_and_Closing: assess whether the greeting/closing is present, clear, appropriate,
+  and complete. If the transcript is truncated or the relevant part is absent, do not assume it was omitted.
+Use the exact attribute heading and violation text from the supplied regulation reference. Do not force a finding
+for every attribute; report only supported violations and record compliant behavior as strengths.
 
 DEFINED SCOPE: Report 0 to 2 violations at maximum. Do NOT flag normal service interactions as violations.
 
@@ -120,6 +155,11 @@ BEHAVIORAL STANDARDS  (evaluate strictly against these)
 ════════════════════════════════════════════════════════════
 {behavioral_criteria or "(not loaded)"}
 
+COMPLIANCE REGULATIONS — REVIEW FOR BEHAVIOR-RELEVANT CRITERIA
+The full catalog is provided. Use exact item IDs, attribute headings, and violation text for any supported
+behavioral finding; prioritize the four areas above without ignoring other behavior-relevant attributes.
+{regulation_catalog or "(not loaded)"}
+
 ════════════════════════════════════════════════════════════
 TRANSCRIPT
 ════════════════════════════════════════════════════════════
@@ -133,6 +173,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "behavioral_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact regulation attribute heading when matched, otherwise null>",
+      "comment": "<exact item violation text when matched, otherwise null>",
       "description": "<1-2 sentences citing the specific behavioral standard violated>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -160,7 +202,15 @@ def build_compliance_prompt(
     return f"""\
 Evaluate the call below against the official COMPLIANCE PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
-Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
+For each violation, use the YAML attribute's exact heading as "attribute" and
+the selected item's exact violation text as "comment". Never invent a policy item.
+Do NOT evaluate behavioral tone, script adherence, or scoring weights here. Professional Personalization
+is a listed NC compliance pillar: check NC_001 when the complete conversation shows no agent asking for
+the patient's name. An ID request or a name copied into a booking confirmation does not satisfy that item.
+Controls the call well is also an NC pillar: check NC_022 ("Not Patient") when the agent repeatedly asks
+the same question in separate turns without a patient answer, or presses for another answer before the patient
+can finish responding. Use the exact attribute "Controls the call well" and comment "Not Patient"; do not
+substitute NC_013 for repeated unanswered questions. A single reasonable follow-up is not enough.
 
 ## CRITICAL VIOLATION REMINDER — apply before flagging anything as critical
 - critical   → patient safety risk ONLY: wrong medication name/dosage stated, wrong doctor assigned,
@@ -172,7 +222,7 @@ Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
 {eligibility_context or "No conclusive eligibility result is available; do not infer or flag eligibility accuracy."}
 When a conclusive eligibility result is provided above, compare it with explicit eligibility statements by the agent.
 If the agent told the patient the opposite eligibility outcome, flag exactly one critical C2C violation under
-"Provide complete accurate and relevant information" / `C2C_030`.
+"Provide complete accurate and relevant information" / `C2C_023` / "Described wrong Information".
 Do not flag uncertainty, a pending-check statement, or an eligibility conclusion made without a conclusive
 reference result.
 
@@ -220,6 +270,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the policy>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "<1-2 sentences referencing the exact pillar name and id>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -245,6 +297,8 @@ def build_reservation_prompt(
     return f"""\
 Evaluate the call below against the official RESERVATION PILLARS only.
 Flag every violation by its exact pillar name and type (C2Com / C2C / C2B / NC).
+For each violation, use the YAML attribute's exact heading as "attribute" and
+the selected item's exact violation text as "comment". Never invent a policy item.
 Check the appointment details extracted from the transcript against the hospital's reservation database.
 Do NOT evaluate behavioral tone, script adherence, or scoring weights here.
 
@@ -317,6 +371,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "reservation_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the policy>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "<1-2 sentences referencing the exact pillar name>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -336,16 +392,28 @@ If no violation exists, reservation_flags must be an EMPTY LIST [].
 def build_script_prompt(
     call: CallTranscript,
     script_templates: str = "",
+    regulation_catalog: str = "",
 ) -> str:
     return f"""\
 Evaluate the agent's adherence to the APPROVED SCRIPT TEMPLATES in the call below.
 Do not strictly enforce the exact scripts provided; instead, assess whether the conversation aligns with their intended purpose and conveys the expected concepts.
 Do NOT evaluate compliance pillars, behavioral tone, or scoring weights here.
+Flag missed required script steps as violations. Use the exact attribute and comment
+from the REGULATION CATALOG for every flag, not a stage name or script sentence
+from the templates. If the agent did not use the approved greeting or closing,
+use the applicable NC regulation item.
 If there is no response from the patient agent can use the script to greet and close the call.
+
+For a booking or rescheduling call, DCC script step 7 requires the agent to
+confirm the registered mobile number. If the agent completes or confirms the
+booking without that verification, flag it as type "C2B", attribute
+"Displays positive company image", comment "Didn't Commit to call script"
+(C2B_015). Name the missed mobile verification in the description. Do not
+flag an inquiry with no booking attempt or a transcript missing that portion.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
-════════════════════════════════════════════════════════════
+═════════════════════════════════════════
 Call ID   : {call.call_id}
 Agent     : {call.agent_name}
 Date      : {call.call_date}
@@ -356,6 +424,11 @@ Department: {call.department}
 APPROVED SCRIPT TEMPLATES  (reference for script adherence)
 ════════════════════════════════════════════════════════════
 {script_templates or "(not loaded)"}
+
+════════════════════════════════════════════════════════════
+REGULATION CATALOG — use these labels for violation cards
+════════════════════════════════════════════════════════════
+{regulation_catalog or "(not loaded)"}
 
 ════════════════════════════════════════════════════════════
 TRANSCRIPT
@@ -370,6 +443,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "script_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the regulation catalog>",
+      "comment": "<exact item violation text from that regulation attribute>",
       "description": "<1-2 sentences — state which script element was missed>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -432,6 +507,9 @@ def build_scoring_prompt(
     return f"""\
 You are producing the FINAL scoring and overall assessment for a call that has already been
 evaluated in three separate passes. Your job is to:
+  Only count a violation when its pillar, attribute, and comment match an existing
+  regulation YAML item. Diagnostic findings without that match are not violations
+  and must not trigger escalation or lower the agent classification.
   1. Review the sub-evaluation results provided below.
   2. Apply the scoring weights to produce the final dimension scores.
   3. Determine the overall_assessment ("pass" / "needs_review" / "escalate").
@@ -808,6 +886,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the policy>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "<1-2 sentences — reference the pillar name if a violation>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -884,6 +964,8 @@ AVAILABLE CRM OFFERS
     return f"""\
 Evaluate whether the agent correctly identified and presented a relevant promotional
 offer to the patient during the call below.
+For each violation, use the YAML attribute's exact heading as "attribute" and
+the selected item's exact violation text as "comment". Never invent a policy item.
 
 ## YOUR TASK
 1. Read the transcript and determine whether the call type warrants an offer check
@@ -947,6 +1029,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "offer_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the policy>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "<1-2 sentences referencing the exact pillar name and outcome>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A' when no mention in transcript>"
     }}
@@ -1069,6 +1153,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "service_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the policy>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "<1-2 concise sentences; do not use raw line breaks.>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
     }}
@@ -1194,6 +1280,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "package_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the policy>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "<1-2 sentences referencing the exact outcome and the violation.>",
       "transcript_excerpt": "<verbatim excerpt or 'N/A'>"
     }}
@@ -1739,6 +1827,8 @@ def build_user_prompt(
     """
     return f"""\
 Analyze the following call transcript and return a JSON quality report.
+For regulation-backed flags, use the exact attribute heading and item violation
+text from the regulation catalog. Do not invent policy labels.
 Agent Classification is calculated based on the following criteria:
 A	-> No C2C,C2B,C2COM and NC violation Per Transaction	
 B	-> Less than 2 NC violations Per Transaction	
@@ -1792,6 +1882,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading when matched, otherwise null>",
+      "comment": "<exact item violation text when matched, otherwise null>",
       "description": "<1-2 sentences — reference the pillar name if a violation>",
       "transcript_excerpt": "<verbatim excerpt>"
     }}
@@ -1994,12 +2086,38 @@ VALIDATION RULES
    "Waiting List" when the agent stated that the doctor will not accept waiting list but patient insists to come,
    "Overbooked" when the agent stated that the booking is on waiting list)
    . Do not confuse the requested objective with outcome.
-6. A CRM field required for an applicable check but null/blank is a mismatch.
-7. Return one field_check per field. Every mismatch must produce a C2B
+6. Only when new_lastcallresult is Inquiry only, validate new_inquiryonlyreason
+   against the patient's primary inquiry in the chat. Always return a
+   field_check for new_inquiryonlyreason in that case, even when it matches.
+   Use the patient's questions as evidence; an agent's incidental recommendation
+   or the service included in an offer does not change an offer inquiry into a
+   service inquiry. For example, asking about a maternity offer means
+   "Asking about Offers", not "Inquiry about services". When the patient asks
+   about a package, use the closest available reason: "Inquire about price" for
+   its cost, "Inquiry about services" for its contents or availability, and
+   "Asking about Offers" when asking about a promotion. Compare the recorded
+   value by meaning, allowing harmless case and spacing differences. The
+   expected value must be one of these exact CRM choices:
+   Asking about Offers; BUs working hours; Confirming my booked appointment
+   with the doctor; Follow up on a previously refund request; Inquire about
+   doctor; Inquire about price; Inquire about schedule; Inquire medical message;
+   Inquiry about installment plans; Inquiry about insurance eligibility;
+   Inquiry about services; Inquiry about status of a previously submitted
+   request; Inquiry about the mobile application – website; Inquiry about the
+   online consultation; inquiry about the operation appointment; Inquiry about
+   the reason of contacting him; Inquiry about unavailable service; Inquiry
+   regarding medical reports / licenses etc.; Inquiry related to the emergency
+   department; Job opportunities; Lab and rad results; Location; Mobile App
+   Technical Issue; Negative Comment from CST; Other; Patient visiting hours
+   inquiry; Personal issue / inquiry; Positive Comment from CST; Request to
+   call the doctor. If new_lastcallresult is not Inquiry only, do not evaluate
+   new_inquiryonlyreason or flag it.
+7. A CRM field required for an applicable check but null/blank is a mismatch.
+8. Return one field_check per field. Every mismatch must produce a C2B
    flag. Use a concise transcript excerpt supporting the expected value, or "N/A"
    when the expectation comes only from authoritative metadata/database evidence.
-8. Return no positive flags. Limit crm_leads_flags to the first 4 mismatches.
-9. A mobilephone of 0555555550 is the placeholder for a non-Saudi number; the
+9. Return no positive flags. Limit crm_leads_flags to the first 4 mismatches.
+10. A mobilephone of 0555555550 is the placeholder for a non-Saudi number; the
    patient's real number is in new_notes and is checked separately. Do not
    flag mobilephone or new_notes.
 
@@ -2038,6 +2156,8 @@ Return ONLY valid JSON with this shape:
   "crm_leads_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the policy>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "CRM lead mismatch: <field and concise reason>",
       "transcript_excerpt": "<verbatim excerpt or N/A>"
     }}
@@ -2193,16 +2313,25 @@ Use these existing compliance rules from the regulations:
   → Use when agent failed to acknowledge patient's profile update request
 
 ## VALIDATION RULES
-1. If a **critical** required field is missing/null in MPI AND agent never asked for it → C2C_021 flag
-   - Critical fields: Name (EnFirstName/ArFirstName), MainPhone, DateOfBirth, Gender
-   - Important but less critical: MaritalStatus, Nationality, IdentificationType
+1. If ANY required field is missing/null in MPI AND the agent never asked for it → C2C_021 flag.
+   This includes both critical and important fields; do not silently pass an
+   unasked MaritalStatus, Nationality, or IdentificationType gap.
+   - Critical fields: first/second/third name components, MainPhone / Phones, DateOfBirth, Gender
+   - Important fields: MaritalStatus, Nationality, IdentificationType
+   - For each name component, either its English or Arabic value satisfies it.
+   - For phone, either MainPhone or a usable Phones value satisfies it.
+   - List EVERY missing required component in missing_fields, even if the agent
+     asked for it. Set agent_asked for each one from the transcript.
+   - If multiple required fields are unasked, name ALL of them in one C2C_021
+     finding so no field disappears when duplicate policy flags are merged.
 2. If patient mentioned profile update AND agent never acknowledged → C2C_028 flag
 3. Profile updates include: name correction, phone change, marital status change, nationality update
 4. Agent acknowledgment phrases: "سأقوم بتحديث", "سيتم التعديل", "تم التسجيل", "هنحدث البيانات"
 5. Do NOT flag if patient explicitly said they don't want to provide optional info
 6. Do NOT flag if agent tried to collect but patient refused or call dropped
 7. **Special case**: If MainPhone is null but Phones field has value, only flag if agent didn't ask at all
-8. **Name handling**: If EITHER EnFirstName OR ArFirstName is present, name is considered complete
+8. **Name handling**: For each first, second, and third name component, either
+   English or Arabic value is sufficient. Check the three components separately.
 
 ════════════════════════════════════════════════════════════
 CALL METADATA
@@ -2236,7 +2365,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "validation_status": "<complete | incomplete | profile_updates_not_acknowledged | pass>",
   "missing_fields": [
     {{
-      "field_name": "<EnFirstName | ArFirstName | MainPhone | Phones | DateOfBirth | Gender | MaritalStatus | Nationality | IdentificationType>",
+      "field_name": "<EnFirstName/ArFirstName | EnSecondName/ArSecondName | EnThirdName/ArThirdName | MainPhone/Phones | DateOfBirth | Gender | MaritalStatus | Nationality | IdentificationType>",
       "field_value": "<current value in MPI or null>",
       "agent_asked": <true | false>,
       "criticality": "<critical | important>",
@@ -2254,6 +2383,8 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
   "compliance_flags": [
     {{
       "type": "<C2Com | C2C | C2B | NC>",
+      "attribute": "<exact attribute heading from the regulation catalog>",
+      "comment": "<exact item violation text from that attribute>",
       "description": "<C2C_021 | C2C_023 | C2C_028>: <1-2 sentences explaining the violation>",
       "transcript_excerpt": "<verbatim excerpt showing the failure>"
     }}
@@ -2262,7 +2393,7 @@ OUTPUT SCHEMA  — return ONLY this JSON, no markdown fences
 
 IMPORTANT: 
 - validation_status = "complete" when all required fields present AND agent handled properly
-- validation_status = "incomplete" when missing fields AND agent didn't ask
+- validation_status = "incomplete" when any required field (critical or important) is missing AND agent didn't ask
 - validation_status = "profile_updates_not_acknowledged" when patient mentioned updates but agent didn't acknowledge
 - validation_status = "pass" when all checks passed
 - compliance_flags must be EMPTY [] when validation_status = "pass"

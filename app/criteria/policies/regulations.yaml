@@ -181,7 +181,7 @@ pillars:
         severity: "End User Critical"
         type: "C2C"
       - id: "C2C_032"
-        violation: "Released / Closed / Avoid the call intentionally"
+        violation: "Released / Closed / Aviod the call intentionaly"
         severity: "End User Critical"
         type: "C2C"
       - id: "C2C_033"

@@ -186,6 +186,7 @@
             flex-wrap: wrap;
             align-items: center;
         }
+        .policy-label { padding: 4px 10px; border-radius: 12px; background: #edf2f7; color: #2d3748; font-size: .78rem; line-height: 1.45; max-width: 100%; overflow-wrap: anywhere; }
         .v-badge {
             padding: 4px 11px;
             border-radius: 12px;
@@ -196,10 +197,6 @@
         .v-type-c2b   { background: #e8f5e9; color: #1b5e20; }
         .v-type-c2com { background: #fff3e0; color: #e65100; }
         .v-type-nc    { background: #e3f2fd; color: #0d47a1; }
-        .v-sev-critical  { background: #fed7d7; color: #742a2a; }
-        .v-sev-moderate  { background: #fef5e7; color: #b7791f; }
-        .v-sev-minor     { background: #fef9c3; color: #92400e; }
-        .v-sev-positive  { background: #d4edda; color: #155724; }
         .violation-desc { font-size: .9rem; color: #2d3748; line-height: 1.5; margin-bottom: 10px; }
         .excerpt-box {
             background: white;
@@ -437,13 +434,23 @@
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
+<script type="application/json" id="regulationPairs">{{ regulation_pairs | tojson }}</script>
 <script>
 const ESCALATION_KEY = 'qa_escalations';
 let _currentFilter   = 'all';
+const REGULATION_PAIRS = new Set(JSON.parse(document.getElementById('regulationPairs').textContent)
+    .map(([type, attribute, comment]) => JSON.stringify([type, attribute, comment])));
+
+function matchesRegulation(flag) {
+    return !!flag && REGULATION_PAIRS.has(JSON.stringify([flag.type, flag.attribute, flag.comment]));
+}
 
 /* ── localStorage helpers ── */
 function loadAll() {
-    try { return JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]'); }
+    try {
+        const saved = JSON.parse(localStorage.getItem(ESCALATION_KEY) || '[]');
+        return Array.isArray(saved) ? saved.filter(item => matchesRegulation(item.flag)) : [];
+    }
     catch (_) { return []; }
 }
 function saveAll(items) {
@@ -515,6 +522,13 @@ function flagValueHTML(value, cls = '') {
     const long = value.length > FLAG_CLAMP_CHARS;
     return `<dd class="${cls}"><div dir="auto" class="${long ? 'flag-clamp' : ''}">${esc(value)}</div>${
         long ? '<button type="button" class="flag-more" onclick="toggleFlagClamp(this)">Show more</button>' : ''}</dd>`;
+}
+
+function policyLabelsHTML(f) {
+    return [['Attribute', f.attribute], ['Comment', f.comment]]
+        .filter(([, value]) => value != null && String(value).trim())
+        .map(([label, value]) => `<span class="policy-label"><strong>${label}:</strong> ${esc(String(value))}</span>`)
+        .join('');
 }
 
 function flagBodyHTML(f) {
@@ -605,9 +619,6 @@ function setFilter(f, btn) {
 /* ── Badge helpers ── */
 function typeBadgeClass(t) {
     return 'v-type-' + (t||'nc').toLowerCase();
-}
-function sevBadgeClass(s) {
-    return 'v-sev-' + (s||'minor').toLowerCase();
 }
 function chipClass(status) {
     return { pending:'chip-pending', reviewed:'chip-reviewed', dismissed:'chip-dismissed' }[status] || 'chip-pending';
@@ -730,7 +741,7 @@ function cardHTML(e) {
             <div class="violation-block">
                 <div class="violation-badges">
                     <span class="v-badge ${typeBadgeClass(f.type)}">${esc(f.type || '—')}</span>
-                    <span class="v-badge ${sevBadgeClass(f.severity)}">${esc(f.severity || '—')}</span>
+                    ${policyLabelsHTML(f)}
                 </div>
                 ${flagBodyHTML(f)}
             </div>
@@ -787,7 +798,11 @@ async function confirmReview(id) {
         const res = await fetch('/escalations/review', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ call_id: item.call_id, review_comment: note || '' }),
+            body: JSON.stringify({
+                call_id: item.call_id,
+                analysis_version: item.analysis_version ?? null,
+                review_comment: note || '',
+            }),
         });
         if (!res.ok) {
             const message = await readErrorMessage(res);
@@ -834,6 +849,7 @@ async function dismissItem(id) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 call_id:            item.call_id,
+                analysis_version:  item.analysis_version ?? null,
                 flag_description:   item.flag?.description ?? '',
                 transcript_excerpt: item.flag?.transcript_excerpt ?? '',
             }),
@@ -870,6 +886,7 @@ async function reopenItem(id) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     call_id:            item.call_id,
+                    analysis_version:  item.analysis_version ?? null,
                     flag_description:   item.flag?.description ?? '',
                     transcript_excerpt: item.flag?.transcript_excerpt ?? '',
                 }),
@@ -914,7 +931,7 @@ function exportCSV() {
     const cols = [
         'id','escalated_at','call_id','agent_name','call_date',
         'overall_assessment','agent_classification','professionalism_score',
-        'profiling_comment','flag_type','flag_severity','flag_description',
+        'profiling_comment','flag_type','flag_severity','flag_attribute','flag_comment','flag_description',
         'flag_excerpt','status','reviewed_at','review_note',
     ];
     const rows = items.map(e => [
@@ -923,6 +940,7 @@ function exportCSV() {
         e.professionalism_score != null ? Math.round(e.professionalism_score * 100) + '%' : '',
         e.profiling_comment || '',
         (e.flag||{}).type || '', (e.flag||{}).severity || '',
+        (e.flag||{}).attribute || '', (e.flag||{}).comment || '',
         (e.flag||{}).description || '', (e.flag||{}).transcript_excerpt || '',
         e.status, e.reviewed_at || '', e.review_note || '',
     ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','));

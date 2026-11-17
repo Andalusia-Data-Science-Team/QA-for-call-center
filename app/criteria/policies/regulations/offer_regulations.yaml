@@ -5,75 +5,8 @@ source: "Andalusia QA Offer Evaluation Policy"
 department: "general"
 category: "offer_regulations"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OFFER RECOMMENDATION EVALUATION PILLARS
-#
-# Purpose: Evaluate whether the call-center agent proactively checked for and
-#          presented relevant CRM promotional offers to the patient.
-#
-# Possible agent outcomes (evaluated by the LLM using transcript evidence):
-#   SUITABLE_OFFER_RECOMMENDED   — Agent found and presented the correct offer.
-#   UNRELATED_OFFER_RECOMMENDED  — Agent mentioned an offer that does not match
-#                                  the patient's specialty / service request.
-#   OFFER_SKIPPED                — A suitable offer existed but the agent did not
-#                                  mention it (or clearly skipped it).
-#   NO_OFFER_AVAILABLE           — No active CRM offer existed for this specialty;
-#                                  agent is not penalised.
-#   OFFER_NOT_APPLICABLE         — The call type (complaint, info only, emergency
-#                                  etc.) does not warrant an offer check.
-# ─────────────────────────────────────────────────────────────────────────────
-
-pillars:
-
-  Offer_Recommendation_Quality:
-    original_name: "Offer Recommendation Quality"
-    severity: "C2B"
-    description: >
-      The agent must proactively check for and present any active promotional
-      offer that matches the patient's specialty and service request during
-      booking or inquiry calls. Failing to do so, or presenting an unrelated
-      offer, is a business-critical deviation.
-    items:
-
-      - id: "C2B_OFF_001"
-        violation: "Agent skipped offer recommendation — a suitable active offer existed for the patient's specialty but was not mentioned"
-        severity: "Critical to Business"
-        type: "C2B"
-        outcome: "OFFER_SKIPPED"
-
-      - id: "C2B_OFF_002"
-        violation: "Agent recommended an unrelated offer — the offer presented does not match the patient's specialty, service, or gender"
-        severity: "Critical to Business"
-        type: "C2B"
-        outcome: "UNRELATED_OFFER_RECOMMENDED"
-
-      - id: "C2B_OFF_003"
-        violation: "Agent presented the offer incorrectly — price, discount, validity date, or specialty details were communicated inaccurately"
-        severity: "Critical to Business"
-        type: "C2B"
-        outcome: "OFFER_MISREPRESENTED"
-
-  Offer_Handling_Process:
-    original_name: "Offer Handling Process"
-    severity: "NC"
-    description: >
-      Even when an offer is found and correctly matched, the agent must follow
-      the standard presentation flow: state the offer name, price before/after
-      discount, expiry date, and ask the patient whether they wish to book with
-      the offer.
-    items:
-
-      - id: "NC_OFF_001"
-        violation: "Agent mentioned the offer but did not state the discounted price or expiry date"
-        severity: "Non-Critical"
-        type: "NC"
-        outcome: "INCOMPLETE_OFFER_PRESENTATION"
-
-      - id: "NC_OFF_002"
-        violation: "Agent did not ask the patient whether they want to book with the offer"
-        severity: "Non-Critical"
-        type: "NC"
-        outcome: "MISSING_OFFER_CONFIRMATION_ASK"
+# The supplied Regulations.xlsx has no offer attributes or comments.
+pillars: {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EVALUATION GUIDANCE FOR THE QA ANALYST (LLM)

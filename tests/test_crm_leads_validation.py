@@ -209,6 +209,32 @@ def test_sanabel_booking_branch_overrides_incidental_hospital_mention():
         assert '"new_clinicbu": "AFW"' in prompt
 
 
+def test_parenthesized_sanabel_booking_overrides_initial_hospital_selection():
+    from app.models.input import CallTranscript
+    from app.agent.patient_profile_nodes import mpi_env_for_bu
+
+    rows = [
+        _cm_row("Relation", "Patient", "مستشفى اندلسية جدة", "2026-10-18 17:41:04"),
+        _cm_row("User", "Agent Name", "العنوان: شارع السنابل العام - حي السنابل", "2026-10-18 17:42:04"),
+        _cm_row("User", "Agent Name", "موعدك يـوم ( الثلاثاء ) بتاريخ ( 10 ) نوفمبر بفرع ( سنابل  ) بعيادة ( سنابل )", "2026-10-18 17:43:04"),
+    ]
+    call = CallTranscript.from_cm_rows(rows)
+    assert call.business_unit == "SNB"
+    assert mpi_env_for_bu(call.business_unit) == "SNB"
+
+
+def test_confirmed_sanabel_booking_overrides_earlier_tag1_business_unit():
+    from app.models.input import CallTranscript
+
+    call = CallTranscript(
+        call_id="call-1", agent_name="Agent", Patient_Phone="500000000",
+        call_date="2026-10-18", call_duration_seconds=60,
+        department="Medical Concierge", business_unit="AHJ",
+        transcript="Patient: مستشفى اندلسية جدة\nAgent: تم تأكيد حجزك بفرع ( سنابل )",
+    )
+    assert call.business_unit == "SNB"
+
+
 def test_patient_bu_tag_overrides_agent_list_of_branch_locations():
     from app.models.input import CallTranscript
 
